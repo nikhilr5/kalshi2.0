@@ -1,0 +1,5 @@
+__pycache__/
+*.csv
+*.png
+.DS_Store
+*.html
