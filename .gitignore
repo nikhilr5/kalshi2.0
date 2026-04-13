@@ -3,3 +3,5 @@ __pycache__/
 *.png
 .DS_Store
 *.html
+*.db
+backtesting/marketdata/

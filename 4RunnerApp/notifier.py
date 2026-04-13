@@ -62,7 +62,7 @@ Quantity: {quantity}
 Order ID: {order_id}
 Total Value: ${price * quantity:.2f}
 
-— Kalshi Bracket Trader
+— 4RunnerApp
 """
 
     try:

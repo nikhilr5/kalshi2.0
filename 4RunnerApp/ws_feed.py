@@ -44,10 +44,43 @@ class KalshiWsFeed:
 
     def start(self, tickers: list[str]):
         """Start websocket connection on a background daemon thread."""
-        self._tickers = tickers
+        self._tickers = list(tickers)
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+
+    def subscribe_tickers(self, new_tickers: list[str]):
+        """Subscribe to additional tickers on the existing connection."""
+        if not new_tickers or not self._running or not self._loop:
+            return
+        added = []
+        for ticker in new_tickers:
+            if ticker not in self.books:
+                self.books[ticker] = {"yes_levels": {}, "no_levels": {}}
+                self._tickers.append(ticker)
+                added.append(ticker)
+        if added:
+            self._loop.call_soon_threadsafe(
+                lambda t=added: asyncio.ensure_future(self._send_subscribe(t))
+            )
+
+    async def _send_subscribe(self, tickers: list[str]):
+        """Send subscribe command for additional tickers."""
+        if not self.ws:
+            return
+        msg = {
+            "id": self.msg_id,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": tickers,
+            },
+        }
+        self.msg_id += 1
+        try:
+            await self.ws.send(json.dumps(msg))
+        except Exception:
+            pass
 
     def stop(self):
         """Gracefully stop the websocket. Safe to call from any thread.
@@ -203,16 +236,19 @@ class KalshiWsFeed:
 
         # Best YES bid: highest yes price with quantity > 0
         yes_bid = max(yes_levels.keys()) if yes_levels else 0.0
+        bid_size = int(yes_levels.get(yes_bid, 0)) if yes_bid > 0 else 0
 
         # Best YES ask: derived from best NO bid
         if no_levels:
             best_no_bid = max(no_levels.keys())
             yes_ask = round(1.0 - best_no_bid, 2)
+            ask_size = int(no_levels.get(best_no_bid, 0))
         else:
             yes_ask = 0.0
+            ask_size = 0
 
         # Fire callback to GUI (runs on WS thread, GUI picks up via dirty flag)
         try:
-            self.on_update(ticker, yes_bid, yes_ask)
+            self.on_update(ticker, yes_bid, yes_ask, bid_size, ask_size)
         except Exception:
             pass

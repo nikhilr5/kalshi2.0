@@ -79,18 +79,58 @@ class KalshiAPI:
         resp.raise_for_status()
         return resp.json()
 
+    # --- Orderbook ---
+
+    def get_orderbook(self, ticker: str, depth: int = 1) -> dict:
+        """Fetch the orderbook for a single market.
+
+        Returns {"yes": [(price, qty), ...], "no": [(price, qty), ...]}
+        with prices as floats in dollar terms.
+        """
+        data = self._get(f"/markets/{ticker}/orderbook", {"depth": depth})
+        book = data.get("orderbook_fp", data.get("orderbook", {}))
+
+        def parse_levels(raw):
+            return [(float(p), float(q)) for p, q in (raw or [])]
+
+        return {
+            "yes": parse_levels(book.get("yes_dollars", book.get("yes_dollars_fp", []))),
+            "no": parse_levels(book.get("no_dollars", book.get("no_dollars_fp", []))),
+        }
+
     # --- Market Discovery ---
 
     def get_markets_for_event(self, event_ticker: str) -> list:
         params = {"event_ticker": event_ticker, "limit": 200}
         return self._get("/markets", params).get("markets", [])
 
+    def get_markets(self, series_ticker: str = None, status: str = None) -> list:
+        """Get markets with optional filters. Paginates automatically."""
+        markets = []
+        cursor = None
+        while True:
+            params = {"limit": 200}
+            if series_ticker:
+                params["series_ticker"] = series_ticker
+            if status:
+                params["status"] = status
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get("/markets", params)
+            markets.extend(data.get("markets", []))
+            cursor = data.get("cursor")
+            if not cursor or not data.get("markets"):
+                break
+        return markets
+
     # --- Orders ---
 
     def create_order(self, ticker: str, side: str, action: str,
-                     price_dollars: str, count: int) -> dict:
+                     price_dollars: str, count: int,
+                     time_in_force: str = "good_till_canceled") -> dict:
         """Place a limit order.
         side='yes', action='sell' → sell YES at yes_price_dollars.
+        time_in_force: 'good_till_canceled', 'immediate_or_cancel', or 'fill_or_kill'.
         """
         body = {
             "ticker": ticker,
@@ -100,9 +140,13 @@ class KalshiAPI:
             "count": count,
             "client_order_id": str(uuid.uuid4()),
             "type": "limit",
-            "time_in_force": "good_till_canceled",
+            "time_in_force": time_in_force,
         }
         return self._post("/portfolio/orders", body)
+
+    def get_order(self, order_id: str) -> dict:
+        """Fetch a single order by ID."""
+        return self._get(f"/portfolio/orders/{order_id}")
 
     def cancel_order(self, order_id: str) -> dict:
         return self._delete(f"/portfolio/orders/{order_id}")

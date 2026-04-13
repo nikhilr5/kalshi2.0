@@ -40,6 +40,36 @@ def discover_weekly_events(api: KalshiAPI, series: str = "KXBTC", weeks_ahead: i
     return events
 
 
+def discover_events_for_series(api: KalshiAPI, series_ticker: str) -> list:
+    """Discover all active bracket events for a series via the markets API.
+
+    Uses the /markets endpoint with series_ticker filter, which works for any
+    series (KXBTC, KXETH, KXSOL, etc.) without hardcoding date formats.
+    """
+    markets = api.get_markets(series_ticker=series_ticker, status="open")
+    brackets = [m for m in markets if "-B" in m["ticker"]]
+
+    # Group by event_ticker
+    events_map: dict[str, dict] = {}
+    for m in brackets:
+        et = m.get("event_ticker", "")
+        if not et:
+            continue
+        if et not in events_map:
+            events_map[et] = {
+                "event_ticker": et,
+                "close_time": m.get("close_time", ""),
+                "markets": [],
+                "num_brackets": 0,
+            }
+        events_map[et]["markets"].append(m)
+
+    for ev in events_map.values():
+        ev["num_brackets"] = len(ev["markets"])
+
+    return sorted(events_map.values(), key=lambda e: e.get("close_time", ""))
+
+
 def parse_strike(ticker: str) -> float:
     for prefix in ["-B", "-T"]:
         if prefix in ticker:

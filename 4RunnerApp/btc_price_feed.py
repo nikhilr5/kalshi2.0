@@ -1,13 +1,13 @@
 """
-Live BTC/USD spot price via CoinCap websocket.
+Live crypto spot price via Coinbase websocket.
 
-Free, no API key required. Connects to wss://ws.coincap.io/prices?assets=bitcoin
-and fires a callback with the latest BTC price on every update (~1-2 seconds).
+Free, no API key required. Connects to Coinbase WS feed
+and fires a callback with the latest price on every update (~1-2 seconds).
 
 Runs on a background daemon thread with its own asyncio event loop.
 
 Usage:
-    feed = BtcPriceFeed(on_price_callback)
+    feed = CryptoPriceFeed(on_price_callback, product_id="BTC-USD")
     feed.start()
     # callback fires as: on_price(price_float)
     feed.stop()
@@ -20,12 +20,26 @@ import websockets
 from collections.abc import Callable
 
 
-class BtcPriceFeed:
+class CryptoPriceFeed:
 
     WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
+    def __init__(self, on_price: Callable, product_id: str = "BTC-USD"):
+        """
+        Args:
+            on_price: callback(price: float) fired on every price update
+            product_id: Coinbase product ID, e.g. "BTC-USD", "ETH-USD", "SOL-USD"
+        """
+        self.on_price = on_price
+        self.product_id = product_id
+        self.ws = None
+        self._thread = None
+        self._loop = None
+        self._running = False
+        self.last_price = 0.0
+
     async def _connect_and_listen(self):
-        """Connect to Coinbase and stream BTC prices."""
+        """Connect to Coinbase and stream prices."""
         while self._running:
             try:
                 self.ws = await websockets.connect(
@@ -34,21 +48,18 @@ class BtcPriceFeed:
                     ping_timeout=10,
                 )
 
-                # Subscribe to BTC-USD ticker
                 subscribe = {
                     "type": "subscribe",
-                    "product_ids": ["BTC-USD"],
+                    "product_ids": [self.product_id],
                     "channels": ["ticker"]
                 }
                 await self.ws.send(json.dumps(subscribe))
 
-                # Message loop
                 async for message in self.ws:
                     if not self._running:
                         break
 
                     data = json.loads(message)
-                    # Coinbase sends: {"type": "ticker", "price": "71883.09", ...}
                     if data.get("type") == "ticker" and "price" in data:
                         price = float(data["price"])
                         self.last_price = price
@@ -60,7 +71,7 @@ class BtcPriceFeed:
             except websockets.ConnectionClosed:
                 pass
             except Exception as e:
-                print(f"[BTC] Error: {e}")
+                print(f"[Price:{self.product_id}] Error: {e}")
             finally:
                 try:
                     if self.ws:
@@ -68,24 +79,11 @@ class BtcPriceFeed:
                 except Exception:
                     pass
 
-            # Reconnect after 3 seconds if still running
             if self._running:
                 await asyncio.sleep(3)
 
-    def __init__(self, on_price: Callable):
-        """
-        Args:
-            on_price: callback(price: float) fired on every BTC price update
-        """
-        self.on_price = on_price
-        self.ws = None
-        self._thread = None
-        self._loop = None
-        self._running = False
-        self.last_price = 0.0
-
     def start(self):
-        """Start the BTC price feed on a background thread."""
+        """Start the price feed on a background thread."""
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
