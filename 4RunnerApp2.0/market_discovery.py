@@ -42,13 +42,13 @@ def discover_weekly_events(api: KalshiAPI, series: str = "KXBTC", weeks_ahead: i
 
 
 def discover_events_for_series(api: KalshiAPI, series_ticker: str) -> list:
-    """Discover all active bracket events for a series via the markets API.
+    """Discover all active bracket/above-below events for a series via the markets API.
 
     Uses the /markets endpoint with series_ticker filter, which works for any
-    series (KXBTC, KXETH, KXSOL, etc.) without hardcoding date formats.
+    series (KXBTC, KXBTCD, KXETH, etc.) without hardcoding date formats.
     """
     markets = api.get_markets(series_ticker=series_ticker, status="open")
-    # Include both bracket (-B) and tail (-T) markets
+    # Include bracket (-B) and tail/above-below (-T) markets
     relevant = [m for m in markets if "-B" in m["ticker"] or "-T" in m["ticker"]]
 
     # Group by event_ticker
@@ -67,12 +67,13 @@ def discover_events_for_series(api: KalshiAPI, series_ticker: str) -> list:
         events_map[et]["markets"].append(m)
 
     for ev in events_map.values():
-        ev["num_brackets"] = len([m for m in ev["markets"] if "-B" in m["ticker"]])
+        ev["num_brackets"] = len(ev["markets"])
 
     return sorted(events_map.values(), key=lambda e: e.get("close_time", ""))
 
 
 def parse_strike(ticker: str) -> float:
+    """Extract strike from ticker. Returns the raw value (e.g. 83799.99)."""
     for prefix in ["-B", "-T"]:
         if prefix in ticker:
             try:
@@ -80,3 +81,13 @@ def parse_strike(ticker: str) -> float:
             except ValueError:
                 return 0.0
     return 0.0
+
+
+def display_strike(raw_strike: float) -> float:
+    """Convert raw ticker strike to display strike.
+
+    KXBTCD tickers use e.g. 83799.99 to mean "$83,800 or above".
+    Round up to nearest dollar for display.
+    """
+    import math
+    return math.ceil(raw_strike)

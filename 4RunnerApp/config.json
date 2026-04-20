@@ -3,6 +3,6 @@
   "size": "50",
   "auto_cancel_hrs": "2",
   "vol_pct": "30",
-  "vol_mode": 0,
-  "series_index": 0
+  "vol_mode": 2,
+  "series_index": 1
 }

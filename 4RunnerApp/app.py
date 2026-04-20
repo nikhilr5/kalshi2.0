@@ -33,6 +33,7 @@ from market_discovery import discover_weekly_events, discover_events_for_series,
 from ws_feed import KalshiWsFeed
 from btc_price_feed import CryptoPriceFeed
 from vol_smile import VolSmile
+from deribit_vol import DeribitBracketPricer, find_deribit_expiry
 
 
 # =============================================================================
@@ -235,6 +236,11 @@ class TradingApp(QMainWindow):
         # Vol smile — calibrated from market prices
         self.vol_smile = VolSmile()
 
+        # Deribit bracket pricer — uses option-implied density
+        self.deribit_pricer = DeribitBracketPricer()
+        self._deribit_worker = None
+        self._above_below_strikes = []  # strikes for Above/Below view
+
         # Persistent worker references
         self._pending_refresh = False
         self._discover_worker = None
@@ -296,10 +302,14 @@ class TradingApp(QMainWindow):
         self.auto_refresh_timer.timeout.connect(self._auto_refresh)
         self.auto_refresh_timer.start(300000)
 
-        # Recalibrate vol smile every 30 seconds (uses live market mid-prices)
+        # Recalibrate vol smile / Deribit every 30s (smile) or 60s (Deribit)
         self.smile_timer = QTimer()
         self.smile_timer.timeout.connect(self._calibrate_smile)
         self.smile_timer.start(30000)
+
+        self.deribit_timer = QTimer()
+        self.deribit_timer.timeout.connect(self._calibrate_deribit)
+        self.deribit_timer.start(60000)  # Deribit refreshes every 60s
 
     # =========================================================================
     # UI
@@ -355,10 +365,20 @@ class TradingApp(QMainWindow):
         row1.addWidget(self.auto_cancel_input)
 
         row1.addSpacing(15)
+        row1.addWidget(QLabel("View:"))
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItem("Brackets")
+        self.view_mode_combo.addItem("Above/Below")
+        self.view_mode_combo.setMaximumWidth(100)
+        self.view_mode_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+        row1.addWidget(self.view_mode_combo)
+
+        row1.addSpacing(15)
         row1.addWidget(QLabel("Vol:"))
         self.vol_mode_combo = QComboBox()
         self.vol_mode_combo.addItem("Manual")
         self.vol_mode_combo.addItem("Smile")
+        self.vol_mode_combo.addItem("Deribit")
         self.vol_mode_combo.setMaximumWidth(80)
         self.vol_mode_combo.currentIndexChanged.connect(self._on_vol_mode_changed)
         row1.addWidget(self.vol_mode_combo)
@@ -658,6 +678,11 @@ class TradingApp(QMainWindow):
         self.status_label.setText(f"WS connected: {len(tickers)} tickers")
         self._refresh_portfolio()
 
+        # Re-fetch Deribit data for the new event's expiry
+        if self.vol_mode_combo.currentIndex() == 2:
+            self.deribit_pricer._ready = False  # invalidate old data
+            self._calibrate_deribit()
+
     def _on_size_changed(self, text):
         try:
             size = int(text)
@@ -821,6 +846,33 @@ class TradingApp(QMainWindow):
 
     def _rebuild_table(self):
         contracts = list(self.order_mgr.contracts.values())
+
+        if self._is_above_below_view():
+            # Above/Below view: one row per strike showing P(above K)
+            # Build strike list from bracket contracts
+            strikes = sorted(set(
+                parse_strike(c.ticker) for c in contracts
+                if parse_strike(c.ticker) > 0
+            ))
+            self._above_below_strikes = strikes
+            self.table.setRowCount(len(strikes))
+            for row, strike in enumerate(strikes):
+                self.table.setItem(row, 0, QTableWidgetItem(
+                    f"Above ${strike:,.0f}"
+                ))
+                for col in (1, 2, 3, 4):
+                    self.table.setItem(row, col, QTableWidgetItem("--"))
+                # No sell/buy buttons in above/below view (no tradeable market)
+                lbl = QTableWidgetItem("--")
+                self.table.setItem(row, 5, lbl)
+                self.table.setCellWidget(row, 5, None)
+                self.table.setItem(row, 6, QTableWidgetItem("--"))
+                self.table.setCellWidget(row, 6, None)
+                for col in range(7, 13):
+                    self.table.setItem(row, col, QTableWidgetItem("--"))
+            return
+
+        self._above_below_strikes = []
         self.table.setRowCount(len(contracts))
         for row, state in enumerate(contracts):
             self.table.setItem(row, 0, QTableWidgetItem(
@@ -852,6 +904,11 @@ class TradingApp(QMainWindow):
                 self.table.setItem(row, col, QTableWidgetItem("--"))
 
     def _update_table(self):
+        # Above/Below view — separate update path
+        if self._is_above_below_view():
+            self._update_table_above_below()
+            return
+
         edge = self._get_edge()
         flat_sigma = self._get_vol()
         use_smile = self._use_smile()
@@ -889,16 +946,34 @@ class TradingApp(QMainWindow):
             # Vol & Theo
             k_low = strikes[row]
             k_high = strikes[row + 1] if row + 1 < len(strikes) else None
-            if use_smile and k_low > 0:
+            use_deribit = self._use_deribit()
+            is_tail = "-T" in state.ticker
+            is_above = is_tail and "above" in state.yes_sub_title.lower()
+            is_below = is_tail and "below" in state.yes_sub_title.lower()
+
+            if use_deribit:
+                # Deribit mode — use appropriate method per market type
+                sigma = 0.0  # not applicable
+                if is_above:
+                    theo = self.deribit_pricer.prob_above(k_low)
+                elif is_below:
+                    theo = self.deribit_pricer.prob_below(k_low)
+                else:
+                    theo = self.deribit_pricer.bracket_theo(k_low, k_high)
+            elif use_smile and k_low > 0:
                 mid_k = (k_low + k_high) / 2.0 if (k_high and k_high > 0) else k_low
                 sigma = self.vol_smile.vol_at(mid_k)
+                theo = _bracket_theo(spot, k_low, k_high, T, sigma)
             else:
                 sigma = flat_sigma
+                theo = _bracket_theo(spot, k_low, k_high, T, sigma)
 
             # Col 3: Vol
             item = self.table.item(row, 3)
             if item:
-                if sigma > 0 and spot > 0 and T > 0:
+                if use_deribit:
+                    item.setText("Drbt")
+                elif sigma > 0 and spot > 0 and T > 0:
                     item.setText(f"{sigma:.0%}")
                 else:
                     item.setText("--")
@@ -906,8 +981,9 @@ class TradingApp(QMainWindow):
             # Col 4: Theo
             item = self.table.item(row, 4)
             if item:
-                theo = _bracket_theo(spot, k_low, k_high, T, sigma)
-                if theo > 0 and spot > 0 and T > 0:
+                if use_deribit and theo > 0:
+                    item.setText(f"${theo:.2f}")
+                elif theo > 0 and spot > 0 and T > 0:
                     item.setText(f"${theo:.2f}")
                 else:
                     item.setText("--")
@@ -1005,6 +1081,79 @@ class TradingApp(QMainWindow):
                     item.setText("RESTING")
                     item.setForeground(QColor("#f59e0b"))
                 else:
+                    item.setText("--")
+                    item.setForeground(QColor("#5a6270"))
+
+    def _update_table_above_below(self):
+        """Update table in Above/Below view mode.
+
+        Shows P(above K) for each strike using Deribit first derivative.
+        Also shows P(below K) = 1 - P(above K) in the Vol column.
+        """
+        strikes = getattr(self, '_above_below_strikes', [])
+        use_deribit = self._use_deribit()
+        spot = self.btc_price
+
+        for row, strike in enumerate(strikes):
+            if row >= self.table.rowCount():
+                break
+
+            # Col 0: label (already set in rebuild)
+
+            # Col 1: show P(above) in dollars
+            item = self.table.item(row, 1)
+            if item:
+                if use_deribit:
+                    prob = self.deribit_pricer.prob_above(strike)
+                    item.setText(f"${prob:.2f}")
+                    if spot > 0 and spot > strike:
+                        item.setForeground(QColor("#22c55e"))
+                    else:
+                        item.setForeground(QColor("#ef4444"))
+                else:
+                    item.setText("--")
+                    item.setForeground(QColor("#5a6270"))
+
+            # Col 2: show P(below) in dollars
+            item = self.table.item(row, 2)
+            if item:
+                if use_deribit:
+                    prob_below = self.deribit_pricer.prob_below(strike)
+                    item.setText(f"${prob_below:.2f}")
+                    if spot > 0 and spot < strike:
+                        item.setForeground(QColor("#22c55e"))
+                    else:
+                        item.setForeground(QColor("#ef4444"))
+                else:
+                    item.setText("--")
+                    item.setForeground(QColor("#5a6270"))
+
+            # Col 3: Vol — show distance from spot
+            item = self.table.item(row, 3)
+            if item:
+                if spot > 0:
+                    pct = (strike - spot) / spot * 100
+                    item.setText(f"{pct:+.1f}%")
+                    item.setForeground(QColor("#c8cdd5"))
+                else:
+                    item.setText("--")
+
+            # Col 4: Theo — P(above) as dollar value
+            item = self.table.item(row, 4)
+            if item:
+                if use_deribit:
+                    prob = self.deribit_pricer.prob_above(strike)
+                    item.setText(f"${prob:.2f}")
+                    item.setForeground(QColor("#22c55e") if prob > 0.5
+                                       else QColor("#ef4444"))
+                else:
+                    item.setText("--")
+                    item.setForeground(QColor("#5a6270"))
+
+            # Remaining columns: clear
+            for col in range(5, 13):
+                item = self.table.item(row, col)
+                if item:
                     item.setText("--")
                     item.setForeground(QColor("#5a6270"))
 
@@ -1310,15 +1459,19 @@ class TradingApp(QMainWindow):
     # =========================================================================
 
     def _on_vol_mode_changed(self, index):
-        """Toggle between manual vol input and smile-calibrated vol."""
+        """Toggle between manual vol, smile-calibrated vol, and Deribit density."""
         if index == 0:
             # Manual mode — enable the text input
             self.vol_input.setEnabled(True)
             self.smile_label.setText("")
-        else:
+        elif index == 1:
             # Smile mode — disable text input, calibrate immediately
             self.vol_input.setEnabled(False)
             self._calibrate_smile()
+        elif index == 2:
+            # Deribit mode — disable text input, fetch option chain
+            self.vol_input.setEnabled(False)
+            self._calibrate_deribit()
         self._table_dirty = True
 
     def _calibrate_smile(self):
@@ -1418,9 +1571,89 @@ class TradingApp(QMainWindow):
             self.smile_label.setText(f"fit failed ({self.vol_smile.n_points}pts)")
         self._table_dirty = True
 
+    def _on_view_mode_changed(self, index):
+        """Switch between Brackets and Above/Below view."""
+        self._rebuild_table()
+        self._mark_dirty()
+
+    def _is_above_below_view(self) -> bool:
+        return self.view_mode_combo.currentIndex() == 1
+
     def _use_smile(self) -> bool:
         """Whether to use smile vols instead of manual vol."""
         return self.vol_mode_combo.currentIndex() == 1 and self.vol_smile.calibrated
+
+    # =========================================================================
+    # Deribit Density Pricing
+    # =========================================================================
+
+    def _use_deribit(self) -> bool:
+        """Whether to use Deribit option-implied density for theo."""
+        return self.vol_mode_combo.currentIndex() == 2 and self.deribit_pricer.ready
+
+    def _calibrate_deribit(self):
+        """Fetch Deribit option chain and build density. Runs in background."""
+        if self.vol_mode_combo.currentIndex() != 2:
+            return
+
+        if not self.current_event:
+            self.smile_label.setText("no event")
+            return
+
+        # Map Kalshi series to Deribit currency (BTC, ETH)
+        from deribit_vol import KALSHI_TO_DERIBIT_CURRENCY
+        series_ticker = self._current_series()
+        deribit_currency = KALSHI_TO_DERIBIT_CURRENCY.get(series_ticker)
+        if not deribit_currency:
+            self.smile_label.setText(f"no Deribit for {series_ticker}")
+            return
+
+        # Update the pricer's currency
+        self.deribit_pricer.currency = deribit_currency
+
+        # Find the matching Deribit expiry for this Kalshi event
+        close_time = self.current_event.get("close_time", "")
+        expiry_str = find_deribit_expiry(close_time, currency=deribit_currency)
+        if not expiry_str:
+            self.smile_label.setText("no expiry match")
+            return
+
+        # Don't stack workers
+        if self._deribit_worker and self._deribit_worker.isRunning():
+            return
+
+        self.smile_label.setText(f"fetching {deribit_currency} {expiry_str}...")
+
+        self._deribit_worker = OrderWorker(self._fetch_deribit_data, expiry_str)
+        self._deribit_worker.finished.connect(self._on_deribit_data)
+        self._deribit_worker.error.connect(
+            lambda e: self.smile_label.setText(f"err: {e}")
+        )
+        self._deribit_worker.start()
+
+    def _fetch_deribit_data(self, expiry_str: str) -> str:
+        """Fetch option chain from Deribit. Runs in background thread."""
+        ok = self.deribit_pricer.fetch_options(expiry_str)
+        if ok:
+            return expiry_str
+        else:
+            raise RuntimeError(f"Failed to build density for {expiry_str}")
+
+    def _on_deribit_data(self, expiry_str: str):
+        """Deribit data arrived — update UI."""
+        if self.vol_mode_combo.currentIndex() != 2:
+            return
+
+        if self.deribit_pricer.ready:
+            lo, hi = self.deribit_pricer.strike_range
+            self.smile_label.setText(
+                f"{expiry_str} {self.deribit_pricer.n_options}opts "
+                f"[{lo/1000:.0f}k-{hi/1000:.0f}k]"
+            )
+        else:
+            self.smile_label.setText("density failed")
+
+        self._table_dirty = True
 
     # =========================================================================
     # Helpers

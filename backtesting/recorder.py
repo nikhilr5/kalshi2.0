@@ -1,467 +1,546 @@
 """
-Kalshi Market Data Recorder
+Market data + trade recorder for Kalshi KXBTCD above/below markets.
 
-Records live orderbook snapshots and BTC spot price to SQLite databases.
-Creates a new database file each day: market_data_2026-04-12.db
+Records:
+    1. Every fill (trade) on your account with market context at fill time
+    2. Periodic snapshots (every 5s) of Kalshi bid/ask + computed theo
+       for all markets within 8% OTM
 
-Features:
-    - Multi-series support: record KXBTC, KXGOLDMON, etc. simultaneously
-    - Auto-rediscovery: finds new weekly events every N hours
-    - Daily file rotation: new DB file at midnight, no restart needed
-    - Skip empty books: only records tickers with a bid or ask
-    - BTC spot price: recorded every 1 second
-    - Orderbook snapshots: configurable interval (default 5s)
+Stores to SQLite (marketdata/recorder.db) and can export to Parquet.
 
 Usage:
-    python3 recorder.py
-    python3 recorder.py --series KXBTC KXGOLDMON --dir data/
-    python3 recorder.py --interval 10 --rediscover 2 --weeks 3
-
-Ctrl+C to stop gracefully.
+    python recorder.py                  # record live data
+    python recorder.py --export 2026-04-17  # export a day to parquet
 """
 
-import argparse
-import os
-import signal
-import sqlite3
-import time
-import threading
-from datetime import datetime, date
 import sys
-sys.path.insert(0, "/Users/nikhilr5/Desktop/Kalshi2.0/4RunnerApp")
+import signal
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Add 4RunnerApp2.0 to path for shared modules
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "4RunnerApp2.0"))
 
 from kalshi_api import KalshiAPI
+from market_discovery import discover_events_for_series, parse_strike, display_strike
+from btc_price_feed import CryptoPriceFeed
 from ws_feed import KalshiWsFeed
-from btc_price_feed import BtcPriceFeed
-from market_discovery import discover_weekly_events, parse_strike
+from deribit_vol import (
+    DeribitBracketPricer, DeribitWsFeed, find_deribit_expiry,
+    KALSHI_TO_DERIBIT_CURRENCY,
+)
+from db import RecorderDB
 
 
-# =============================================================================
-# Database Manager (with daily rotation)
-# =============================================================================
-
-class MarketDatabase:
-    """SQLite database with automatic daily file rotation."""
-
-    def __init__(self, db_dir: str = "."):
-        self.db_dir = db_dir
-        self._lock = threading.Lock()
-        self.conn = None
-        self.current_date = None
-
-        os.makedirs(db_dir, exist_ok=True)
-        self._rotate_if_needed()
-
-    def _db_path_for_date(self, d: date) -> str:
-        return os.path.join(self.db_dir, f"market_data_{d.isoformat()}.db")
-
-    def _rotate_if_needed(self):
-        """Check if we need a new database file for today."""
-        today = date.today()
-        if today == self.current_date:
-            return
-
-        with self._lock:
-            # Close old connection
-            if self.conn:
-                self.conn.close()
-                print(f"[DB] Closed {self._db_path_for_date(self.current_date)}")
-
-            # Open new connection for today
-            self.current_date = today
-            db_path = self._db_path_for_date(today)
-            self.conn = sqlite3.connect(db_path, check_same_thread=False)
-            self._create_tables()
-            print(f"[DB] Opened {db_path}")
-
-    def _create_tables(self):
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS orderbook (
-                timestamp TEXT NOT NULL,
-                series TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                event_ticker TEXT NOT NULL,
-                yes_sub_title TEXT,
-                yes_bid REAL,
-                yes_ask REAL,
-                btc_price REAL,
-                strike REAL
-            );
-
-            CREATE TABLE IF NOT EXISTS btc_price (
-                timestamp TEXT NOT NULL,
-                price REAL NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_ob_ticker_time
-                ON orderbook(ticker, timestamp);
-
-            CREATE INDEX IF NOT EXISTS idx_ob_event_time
-                ON orderbook(event_ticker, timestamp);
-
-            CREATE INDEX IF NOT EXISTS idx_ob_series_time
-                ON orderbook(series, timestamp);
-
-            CREATE INDEX IF NOT EXISTS idx_btc_time
-                ON btc_price(timestamp);
-        """)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.commit()
-
-    def insert_orderbook_batch(self, rows: list):
-        """Insert batch: (timestamp, series, ticker, event, subtitle, bid, ask, btc, strike)"""
-        if not rows:
-            return
-        self._rotate_if_needed()
-        with self._lock:
-            self.conn.executemany(
-                "INSERT INTO orderbook VALUES (?,?,?,?,?,?,?,?,?)", rows
-            )
-            self.conn.commit()
-
-    def insert_btc_price(self, timestamp: str, price: float):
-        self._rotate_if_needed()
-        with self._lock:
-            self.conn.execute(
-                "INSERT INTO btc_price VALUES (?,?)", (timestamp, price)
-            )
-            self.conn.commit()
-
-    def get_row_counts(self) -> dict:
-        self._rotate_if_needed()
-        with self._lock:
-            ob = self.conn.execute("SELECT COUNT(*) FROM orderbook").fetchone()[0]
-            btc = self.conn.execute("SELECT COUNT(*) FROM btc_price").fetchone()[0]
-        return {"orderbook": ob, "btc_price": btc}
-
-    def get_series_counts(self) -> dict:
-        """Row counts broken down by series."""
-        self._rotate_if_needed()
-        with self._lock:
-            rows = self.conn.execute(
-                "SELECT series, COUNT(*) FROM orderbook GROUP BY series"
-            ).fetchall()
-        return {r[0]: r[1] for r in rows}
-
-    def close(self):
-        with self._lock:
-            if self.conn:
-                self.conn.close()
-        print("[DB] Closed")
+SERIES_LIST = ["KXBTCD", "KXBTC"]  # daily + weekly above/below
+COINBASE_PRODUCT = "BTC-USD"
+DERIBIT_CURRENCY = "BTC"
+OTM_FILTER_PCT = 8.0
+SNAPSHOT_INTERVAL = 5  # seconds
 
 
-# =============================================================================
-# Recorder
-# =============================================================================
+class Recorder:
 
-class MarketRecorder:
-    """Coordinates websocket feeds, event discovery, and database recording."""
-
-    def __init__(self, series_list: list, db_dir: str = ".",
-                 snapshot_interval: int = 5, weeks_ahead: int = 2,
-                 rediscover_hours: float = 4):
-        """
-        Args:
-            series_list: list of series tickers e.g. ["KXBTC", "KXGOLDMON"]
-            db_dir: directory for database files
-            snapshot_interval: seconds between orderbook snapshots
-            weeks_ahead: how many weeks of events to discover
-            rediscover_hours: hours between event rediscovery checks
-        """
+    def __init__(self):
         self.api = KalshiAPI()
-        self.db = MarketDatabase(db_dir)
-        self.series_list = series_list
-        self.snapshot_interval = snapshot_interval
-        self.weeks_ahead = weeks_ahead
-        self.rediscover_hours = rediscover_hours
+        self.db = RecorderDB()
 
-        # Live data state
-        self.btc_price = 0.0
-        self.orderbooks: dict[str, dict] = {}   # ticker -> {yes_bid, yes_ask}
-        self.market_info: dict[str, dict] = {}   # ticker -> {series, event, subtitle, strike}
+        self.running = False
+        self.spot_price = 0.0
+        self.spot_bid = 0.0
+        self.spot_ask = 0.0
 
-        # Feeds — keep references to prevent GC
-        self.ws_feeds: list[KalshiWsFeed] = []
-        self.btc_feed = None
+        self.price_feed = None
+        self.ws_feed = None
 
-        # BTC 1-second throttle
-        self._last_btc_write = 0.0
+        # Per-expiry Deribit pricers and WS feeds
+        # {deribit_expiry_str: DeribitBracketPricer}
+        self.pricers = {}
+        # {deribit_expiry_str: DeribitWsFeed}
+        self.deribit_feeds = {}
+        # {event_close_time: deribit_expiry_str} — maps each event's close to its Deribit expiry
+        self.close_to_expiry = {}
 
-        # Thread lock for orderbook/market_info modifications
-        self._data_lock = threading.Lock()
+        # Markets we're tracking: {ticker: {display_strike, event_ticker, close_time}}
+        self.tracked = {}
 
-        # Control
-        self._running = False
+        # Kalshi book state from WS: {ticker: {yes_bid, yes_ask, bid_size, ask_size}}
+        self.book = {}
+
+        # Cached theos: {raw_strike: (bid_theo, ask_theo)}
+        self.theos = {}
+
+        self.session_id = None
+        self.event_ticker = ""
+
+    def _get_pricer(self, close_time: str):
+        """Get the DeribitBracketPricer for a given event close_time."""
+        expiry = self.close_to_expiry.get(close_time)
+        if expiry and expiry in self.pricers:
+            return self.pricers[expiry]
+        return None
+
+    def _start_deribit_for_expiry(self, close_time: str):
+        """Start a Deribit pricer + WS feed for a given event close_time if not already running."""
+        if close_time in self.close_to_expiry:
+            return  # already set up
+
+        expiry_str = find_deribit_expiry(close_time, currency=DERIBIT_CURRENCY)
+        if not expiry_str:
+            print(f"[Recorder] No Deribit expiry match for close={close_time}")
+            return
+
+        self.close_to_expiry[close_time] = expiry_str
+
+        if expiry_str in self.pricers:
+            # Already have a pricer for this Deribit expiry (shared by multiple events)
+            return
+
+        pricer = DeribitBracketPricer()
+        pricer.currency = DERIBIT_CURRENCY
+        pricer.risk_free_rate = 0.043
+        self.pricers[expiry_str] = pricer
+
+        print(f"[Recorder] Discovering Deribit {expiry_str} (for close={close_time})...")
+        instruments = pricer.discover_instruments(expiry_str)
+        if instruments:
+            feed = DeribitWsFeed(pricer, self._on_deribit_update)
+            feed.start(instruments)
+            self.deribit_feeds[expiry_str] = feed
+            print(f"[Recorder] Deribit WS started for {expiry_str}: {len(instruments)} options")
+        else:
+            print(f"[Recorder] No Deribit instruments found for {expiry_str}")
 
     def start(self):
-        """Discover events, start feeds, begin recording."""
-        self._running = True
+        self.running = True
+        signal.signal(signal.SIGINT, lambda *_: self._shutdown())
+        signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
 
-        # --- Initial discovery across all series ---
-        self._discover_all_series()
+        # Discover events across all series (daily + weekly)
+        all_markets = {}  # ticker -> info
+        for series in SERIES_LIST:
+            print(f"[Recorder] Discovering {series} events...")
+            events = discover_events_for_series(self.api, series)
+            for event in events:
+                et = event["event_ticker"]
+                close = event.get("close_time", "")
+                for m in event["markets"]:
+                    ticker = m["ticker"]
+                    raw = parse_strike(ticker)
+                    if raw > 0 and ticker not in all_markets:
+                        all_markets[ticker] = {
+                            "display_strike": display_strike(raw),
+                            "event_ticker": et,
+                            "close_time": close,
+                        }
+                print(f"[Recorder]   {et}: {len(event['markets'])} markets")
 
-        if not self.orderbooks:
-            print("[RECORDER] No tickers found across any series, exiting")
+        if not all_markets:
+            print("[Recorder] No events found")
             return
 
-        # --- Start BTC price feed ---
-        self.btc_feed = BtcPriceFeed(self._on_btc_price)
-        self.btc_feed.start()
+        # Start Coinbase feed
+        print(f"[Recorder] Starting Coinbase feed for {COINBASE_PRODUCT}...")
+        self.price_feed = CryptoPriceFeed(self._on_price, COINBASE_PRODUCT)
+        self.price_feed.start()
 
-        # --- Start snapshot thread ---
-        snapshot_thread = threading.Thread(target=self._snapshot_loop, daemon=True)
-        snapshot_thread.start()
-
-        # --- Start rediscovery thread ---
-        rediscover_thread = threading.Thread(target=self._rediscover_loop, daemon=True)
-        rediscover_thread.start()
-
-        print(f"\n[RECORDER] Orderbook snapshots every {self.snapshot_interval}s (active tickers only)")
-        print(f"[RECORDER] BTC price every 1s")
-        print(f"[RECORDER] Rediscovery every {self.rediscover_hours}h")
-        print("[RECORDER] Press Ctrl+C to stop\n")
-
-        # Keep main thread alive
-        try:
-            while self._running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-
-    def stop(self):
-        """Stop all feeds and close database."""
-        print("\n[RECORDER] Stopping...")
-        self._running = False
-
-        # Stop all websocket feeds
-        for feed in self.ws_feeds:
-            feed.stop()
-        if self.btc_feed:
-            self.btc_feed.stop()
-
-        # Final stats
-        counts = self.db.get_row_counts()
-        series_counts = self.db.get_series_counts()
-        print(f"[RECORDER] Today's totals: {counts['orderbook']:,} orderbook / "
-              f"{counts['btc_price']:,} BTC price")
-        for series, count in series_counts.items():
-            print(f"  {series}: {count:,} rows")
-
-        self.db.close()
-        print("[RECORDER] Done")
-
-    # --- Discovery ---
-
-    def _discover_all_series(self):
-        """Discover events for all series and start WS feeds."""
-        for series in self.series_list:
-            self._discover_series(series)
-
-    def _discover_series(self, series: str) -> list:
-        """Discover events for one series, register tickers, start WS feed.
-        Returns list of new tickers found."""
-        print(f"[RECORDER] Discovering {series}...")
-
-        try:
-            events = discover_weekly_events(self.api, series, self.weeks_ahead)
-        except Exception as e:
-            print(f"[RECORDER] Error discovering {series}: {e}")
-            return []
-
-        if not events:
-            print(f"[RECORDER] No events for {series}")
-            return []
-
-        # Find new tickers (not already tracked)
-        new_tickers = []
-        with self._data_lock:
-            for event in events:
-                event_ticker = event["event_ticker"]
-                brackets = [m for m in event["markets"] if "-B" in m["ticker"]]
-
-                for m in brackets:
-                    ticker = m["ticker"]
-                    if ticker not in self.orderbooks:
-                        self.market_info[ticker] = {
-                            "series": series,
-                            "event_ticker": event_ticker,
-                            "yes_sub_title": m.get("yes_sub_title", ""),
-                            "strike": parse_strike(ticker),
-                        }
-                        self.orderbooks[ticker] = {"yes_bid": 0.0, "yes_ask": 0.0}
-                        new_tickers.append(ticker)
-
-                if brackets:
-                    print(f"  {event_ticker}: {len(brackets)} brackets")
-
-        # Start a WS feed for new tickers
-        if new_tickers:
-            print(f"[RECORDER] Subscribing to {len(new_tickers)} new {series} tickers")
-            ws_feed = KalshiWsFeed(self.api, self._on_orderbook_update)
-            ws_feed.start(new_tickers)
-            self.ws_feeds.append(ws_feed)
+        # Wait for first spot price
+        print("[Recorder] Waiting for spot price...")
+        for _ in range(100):
+            if self.spot_price > 0:
+                break
+            time.sleep(0.1)
+        if self.spot_price <= 0:
+            print("[Recorder] No spot price received, using all markets")
+            self.tracked = all_markets
         else:
-            print(f"[RECORDER] No new tickers for {series}")
+            # Filter to within OTM_FILTER_PCT
+            for ticker, info in all_markets.items():
+                disp = info["display_strike"]
+                otm = abs((disp - self.spot_price) / self.spot_price * 100)
+                if otm <= OTM_FILTER_PCT:
+                    self.tracked[ticker] = info
 
-        return new_tickers
+        print(f"[Recorder] Tracking {len(self.tracked)} markets "
+              f"(within {OTM_FILTER_PCT}% OTM of ${self.spot_price:,.0f})")
 
-    def _rediscover_loop(self):
-        """Periodically check for new events across all series."""
-        while self._running:
-            # Sleep for rediscover_hours, checking _running every second
-            sleep_seconds = int(self.rediscover_hours * 3600)
-            for _ in range(sleep_seconds):
-                if not self._running:
-                    return
-                time.sleep(1)
+        # Start Kalshi WS feed
+        tickers = list(self.tracked.keys())
+        if tickers:
+            self.ws_feed = KalshiWsFeed(self.api, self._on_ws_update,
+                                         on_fill=self._on_fill)
+            self.ws_feed.start(tickers)
+            print(f"[Recorder] Kalshi WS started for {len(tickers)} tickers")
 
-            if not self._running:
-                return
+        # Start per-expiry Deribit WS feeds
+        close_times = set(info["close_time"] for info in self.tracked.values() if info["close_time"])
+        for ct in sorted(close_times):
+            self._start_deribit_for_expiry(ct)
 
-            print(f"\n[RECORDER] Periodic rediscovery ({self.rediscover_hours}h)...")
-            total_new = 0
+        # Log session
+        series_str = "+".join(SERIES_LIST)
+        event_tickers = sorted(set(info["event_ticker"] for info in self.tracked.values()))
+        self.session_id = self.db.insert_session(
+            series_str, ",".join(event_tickers), len(self.tracked),
+            SNAPSHOT_INTERVAL, OTM_FILTER_PCT,
+        )
+        print(f"[Recorder] Session {self.session_id} started")
 
-            for series in self.series_list:
-                new_tickers = self._discover_series(series)
-                total_new += len(new_tickers)
+        # Seed known fills so we don't re-record old ones
+        self._seen_fill_ids = set()
+        self._seed_known_fills()
 
-            if total_new > 0:
-                print(f"[RECORDER] Rediscovery found {total_new} new tickers total")
-            else:
-                print(f"[RECORDER] Rediscovery: no new tickers")
+        # Main snapshot loop
+        self._run_loop()
 
-            # Clean up stopped feeds
-            self.ws_feeds = [f for f in self.ws_feeds if f._running]
+    def _seed_known_fills(self):
+        """Fetch all existing fills from Kalshi and mark them as seen
+        so the poller only records new ones going forward."""
+        try:
+            fills = self.api.get_fills()
+            for f in fills:
+                fid = f.get("trade_id") or f.get("fill_id") or f.get("id", "")
+                if fid:
+                    self._seen_fill_ids.add(str(fid))
+            print(f"[Recorder] Seeded {len(self._seen_fill_ids)} existing fills")
+        except Exception as e:
+            print(f"[Recorder] Seed fills failed: {e}")
+
+    def _poll_fills(self):
+        """Poll REST API for new fills and record any we haven't seen."""
+        try:
+            fills = self.api.get_fills()
+        except Exception as e:
+            print(f"[Recorder] Fill poll failed: {e}")
+            return
+
+        spot_b = self.spot_bid if self.spot_bid > 0 else self.spot_price
+        spot_a = self.spot_ask if self.spot_ask > 0 else self.spot_price
+
+        for f in fills:
+            fid = str(f.get("trade_id") or f.get("fill_id") or f.get("id", ""))
+            if not fid or fid in self._seen_fill_ids:
+                continue
+            self._seen_fill_ids.add(fid)
+
+            ticker = f.get("ticker", "")
+            action = f.get("action", "")
+            side = f.get("side", "yes")
+            # Skip 'no' side — same trade appears as both yes and no
+            if side == "no":
+                continue
+            count = int(float(f.get("count_fp", f.get("count", 0))))
+            price = float(f.get("yes_price_dollars", 0) or f.get("yes_price", 0) or 0)
+
+            # Look up strike info
+            info = self.tracked.get(ticker, {})
+            strike = info.get("display_strike", 0.0)
+            event_ticker = info.get("event_ticker", "")
+            close = info.get("close_time", "")
+
+            # Compute theos at fill time
+            theo_bid = 0.0
+            theo_ask = 0.0
+            deribit_bid_iv = 0.0
+            deribit_ask_iv = 0.0
+            bk = self.book.get(ticker, {})
+            pricer = self._get_pricer(close)
+            if strike > 0 and pricer and pricer.options and spot_b > 0:
+                t_bid = pricer.prob_above_bid_iv(strike, spot=spot_b, kalshi_close_iso=close)
+                t_ask = pricer.prob_above_ask_iv(strike, spot=spot_a, kalshi_close_iso=close)
+                theo_bid = min(t_bid, t_ask)
+                theo_ask = max(t_bid, t_ask)
+                deribit_bid_iv = pricer._find_closest_bid_iv(strike)
+                deribit_ask_iv = pricer._find_closest_ask_iv(strike)
+
+            self.db.insert_fill(
+                ticker=ticker, action=action, side=side,
+                count=count, price=price, strike=strike,
+                event_ticker=event_ticker,
+                spot_bid=spot_b, spot_ask=spot_a,
+                theo_bid=theo_bid, theo_ask=theo_ask,
+                kalshi_yes_bid=bk.get("yes_bid", 0),
+                kalshi_yes_ask=bk.get("yes_ask", 0),
+                deribit_bid_iv=deribit_bid_iv,
+                deribit_ask_iv=deribit_ask_iv,
+            )
+            print(f"[Recorder] FILL (REST): {ticker} {action} {side} x{count} "
+                  f"@ ${price:.2f} (theo={theo_bid:.3f}/{theo_ask:.3f})")
+
+    def _run_loop(self):
+        last_snapshot = 0
+        last_refilter = 0
+        last_fill_poll = 0
+
+        while self.running:
+            time.sleep(0.5)
+            now = time.time()
+
+            # Poll fills every 5s
+            if now - last_fill_poll >= 5:
+                last_fill_poll = now
+                self._poll_fills()
+
+            # Refilter markets every 60s as spot moves
+            if now - last_refilter >= 60:
+                last_refilter = now
+                self._refilter_markets()
+
+            # Snapshot every SNAPSHOT_INTERVAL
+            if now - last_snapshot >= SNAPSHOT_INTERVAL:
+                last_snapshot = now
+                self._take_snapshot()
+
+    def _refilter_markets(self):
+        """Pick up new events/markets, drop expired ones. Handles event transitions.
+        Discovers across all series in SERIES_LIST."""
+        if self.spot_price <= 0:
+            return
+        try:
+            now = datetime.now(tz=timezone.utc)
+            new_tickers = []
+
+            for series in SERIES_LIST:
+                events = discover_events_for_series(self.api, series)
+                if not events:
+                    continue
+
+                for event in events:
+                    et = event["event_ticker"]
+                    close_str = event.get("close_time", "")
+
+                    # Skip events that closed more than 10 min ago
+                    if close_str:
+                        try:
+                            close_utc = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                            if (now - close_utc).total_seconds() > 600:
+                                continue
+                        except Exception:
+                            pass
+
+                    for m in event["markets"]:
+                        ticker = m["ticker"]
+                        if ticker in self.tracked:
+                            continue
+                        raw = parse_strike(ticker)
+                        if raw <= 0:
+                            continue
+                        disp = display_strike(raw)
+                        otm = abs((disp - self.spot_price) / self.spot_price * 100)
+                        if otm <= OTM_FILTER_PCT:
+                            self.tracked[ticker] = {
+                                "display_strike": disp,
+                                "event_ticker": et,
+                                "close_time": close_str,
+                            }
+                            new_tickers.append(ticker)
+
+            # Drop markets whose event expired > 10 min ago
+            expired = []
+            for ticker, info in self.tracked.items():
+                close_str = info.get("close_time", "")
+                if close_str:
+                    try:
+                        close_utc = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                        if (now - close_utc).total_seconds() > 600:
+                            expired.append(ticker)
+                    except Exception:
+                        pass
+            for ticker in expired:
+                del self.tracked[ticker]
+
+            if expired:
+                print(f"[Recorder] Dropped {len(expired)} expired markets")
+
+            if new_tickers and self.ws_feed:
+                self.ws_feed.subscribe_tickers(new_tickers)
+                print(f"[Recorder] Added {len(new_tickers)} new markets "
+                      f"(total: {len(self.tracked)})")
+
+            # Start Deribit feeds for any new close times
+            current_close_times = set(info["close_time"] for info in self.tracked.values() if info["close_time"])
+            for ct in sorted(current_close_times):
+                self._start_deribit_for_expiry(ct)
+
+            # Clean up close_to_expiry for expired close times
+            for ct in list(self.close_to_expiry.keys()):
+                if ct not in current_close_times:
+                    del self.close_to_expiry[ct]
+
+            # Stop Deribit feeds for expiries no longer needed
+            needed_expiries = set(self.close_to_expiry.values())
+            for exp_str in list(self.deribit_feeds.keys()):
+                if exp_str not in needed_expiries:
+                    print(f"[Recorder] Stopping Deribit WS for expired {exp_str}")
+                    self.deribit_feeds[exp_str].stop()
+                    del self.deribit_feeds[exp_str]
+                    if exp_str in self.pricers:
+                        del self.pricers[exp_str]
+
+        except Exception as e:
+            print(f"[Recorder] Refilter error: {e}")
+
+    def _take_snapshot(self):
+        """Snapshot all tracked markets with current theos."""
+        if not self.tracked:
+            return
+
+        spot_b = self.spot_bid if self.spot_bid > 0 else self.spot_price
+        spot_a = self.spot_ask if self.spot_ask > 0 else self.spot_price
+        spot_mid = (spot_b + spot_a) / 2 if spot_b > 0 and spot_a > 0 else self.spot_price
+
+        rows = []
+        for ticker, info in self.tracked.items():
+            disp = info["display_strike"]
+            close = info.get("close_time", "")
+
+            # Kalshi book
+            bk = self.book.get(ticker, {})
+            yes_bid = bk.get("yes_bid", 0)
+            yes_ask = bk.get("yes_ask", 0)
+            bid_size = bk.get("bid_size", 0)
+            ask_size = bk.get("ask_size", 0)
+
+            # Compute theo using the correct pricer for this event's expiry
+            theo_bid = 0.0
+            theo_ask = 0.0
+            deribit_bid_iv = 0.0
+            deribit_ask_iv = 0.0
+            pricer = self._get_pricer(close)
+            if pricer and pricer.options and spot_b > 0 and spot_a > 0:
+                t_bid = pricer.prob_above_bid_iv(disp, spot=spot_b, kalshi_close_iso=close)
+                t_ask = pricer.prob_above_ask_iv(disp, spot=spot_a, kalshi_close_iso=close)
+                theo_bid = t_bid
+                theo_ask = t_ask
+                deribit_bid_iv = pricer._find_closest_bid_iv(disp)
+                deribit_ask_iv = pricer._find_closest_ask_iv(disp)
+
+            self.theos[ticker] = (theo_bid, theo_ask)
+
+            otm_pct = (disp - spot_mid) / spot_mid * 100 if spot_mid > 0 else 0
+
+            rows.append({
+                "ticker": ticker,
+                "event_ticker": info.get("event_ticker", ""),
+                "strike": disp,
+                "close_time": close,
+                "kalshi_yes_bid": yes_bid,
+                "kalshi_yes_ask": yes_ask,
+                "kalshi_bid_size": bid_size,
+                "kalshi_ask_size": ask_size,
+                "spot_bid": spot_b,
+                "spot_ask": spot_a,
+                "spot_mid": spot_mid,
+                "theo_bid": theo_bid,
+                "theo_ask": theo_ask,
+                "deribit_bid_iv": deribit_bid_iv,
+                "deribit_ask_iv": deribit_ask_iv,
+                "deribit_index": pricer.index_price if pricer else 0,
+                "otm_pct": otm_pct,
+                "edge_bid": yes_bid - theo_ask if yes_bid > 0 and theo_ask > 0 else 0,
+                "edge_ask": theo_bid - yes_ask if theo_bid > 0 and yes_ask > 0 else 0,
+            })
+
+        self.db.insert_snapshots(rows)
+        print(f"[Recorder] Snapshot: {len(rows)} markets, "
+              f"spot=${spot_mid:,.2f}")
 
     # --- Callbacks ---
 
-    def _on_orderbook_update(self, ticker: str, yes_bid: float, yes_ask: float):
-        """Called from Kalshi WS thread on every orderbook delta."""
-        with self._data_lock:
-            if ticker in self.orderbooks:
-                self.orderbooks[ticker]["yes_bid"] = yes_bid
-                self.orderbooks[ticker]["yes_ask"] = yes_ask
+    def _on_price(self, price: float, bid: float = 0.0, ask: float = 0.0):
+        self.spot_price = price
+        if bid > 0:
+            self.spot_bid = bid
+        if ask > 0:
+            self.spot_ask = ask
 
-    def _on_btc_price(self, price: float):
-        """Record BTC price at most once per second."""
-        self.btc_price = price
-        now = time.time()
-        if now - self._last_btc_write >= 1.0:
-            self._last_btc_write = now
-            self.db.insert_btc_price(datetime.utcnow().isoformat(), price)
+    def _on_ws_update(self, ticker: str, yes_bid: float, yes_ask: float,
+                      bid_size: int = 0, ask_size: int = 0):
+        self.book[ticker] = {
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+        }
 
-    # --- Snapshot Loop ---
+    def _on_fill(self, ticker: str, action: str, side: str,
+                 price: float, count: int):
+        """Record every fill with market context at fill time."""
+        # Find strike info — tracked is now keyed by ticker
+        info = self.tracked.get(ticker, {})
+        strike = info.get("display_strike", 0.0)
+        event_ticker = info.get("event_ticker", "")
+        close = info.get("close_time", "")
 
-    def _snapshot_loop(self):
-        """Periodically snapshot all active orderbooks to database."""
-        last_status = time.time()
+        # Current market context
+        bk = self.book.get(ticker, {})
+        spot_b = self.spot_bid if self.spot_bid > 0 else self.spot_price
+        spot_a = self.spot_ask if self.spot_ask > 0 else self.spot_price
 
-        while self._running:
-            time.sleep(self.snapshot_interval)
-            if not self._running:
-                break
+        theo_bid = 0.0
+        theo_ask = 0.0
+        deribit_bid_iv = 0.0
+        deribit_ask_iv = 0.0
+        pricer = self._get_pricer(close)
+        if strike > 0 and pricer and pricer.options and spot_b > 0:
+            t_bid = pricer.prob_above_bid_iv(strike, spot=spot_b, kalshi_close_iso=close)
+            t_ask = pricer.prob_above_ask_iv(strike, spot=spot_a, kalshi_close_iso=close)
+            theo_bid = min(t_bid, t_ask)
+            theo_ask = max(t_bid, t_ask)
+            deribit_bid_iv = pricer._find_closest_bid_iv(strike)
+            deribit_ask_iv = pricer._find_closest_ask_iv(strike)
 
-            now = datetime.utcnow().isoformat()
+        self.db.insert_fill(
+            ticker=ticker, action=action, side=side,
+            count=count, price=price, strike=strike,
+            event_ticker=event_ticker,
+            spot_bid=spot_b, spot_ask=spot_a,
+            theo_bid=theo_bid, theo_ask=theo_ask,
+            kalshi_yes_bid=bk.get("yes_bid", 0),
+            kalshi_yes_ask=bk.get("yes_ask", 0),
+            deribit_bid_iv=deribit_bid_iv,
+            deribit_ask_iv=deribit_ask_iv,
+        )
+        print(f"[Recorder] FILL: {ticker} {action} {side} x{count} @ ${price:.2f} "
+              f"(theo={theo_bid:.3f}/{theo_ask:.3f})")
 
-            # Build batch — only tickers with a bid or ask
-            rows = []
-            with self._data_lock:
-                for ticker, book in self.orderbooks.items():
-                    # Skip empty books
-                    if book["yes_bid"] <= 0 and book["yes_ask"] <= 0:
-                        continue
+    def _on_deribit_update(self):
+        """Deribit data refreshed — theos will update on next snapshot."""
+        pass
 
-                    info = self.market_info.get(ticker, {})
-                    rows.append((
-                        now,
-                        info.get("series", ""),
-                        ticker,
-                        info.get("event_ticker", ""),
-                        info.get("yes_sub_title", ""),
-                        book["yes_bid"],
-                        book["yes_ask"],
-                        self.btc_price,
-                        info.get("strike", 0.0),
-                    ))
+    def _shutdown(self):
+        print("\n[Recorder] Shutting down...")
+        self.running = False
+        if self.price_feed:
+            self.price_feed.stop()
+        if self.ws_feed:
+            self.ws_feed.stop()
+        for exp_str, feed in self.deribit_feeds.items():
+            feed.stop()
+        self.deribit_feeds.clear()
+        self.pricers.clear()
+        if self.session_id:
+            self.db.end_session(self.session_id)
+        self.db.close()
+        print("[Recorder] Done")
 
-            if rows:
-                self.db.insert_orderbook_batch(rows)
-
-            # Status every 60 seconds
-            current_time = time.time()
-            if current_time - last_status >= 60:
-                counts = self.db.get_row_counts()
-                total_tickers = len(self.orderbooks)
-                with self._data_lock:
-                    active = sum(1 for b in self.orderbooks.values()
-                                 if b["yes_bid"] > 0 or b["yes_ask"] > 0)
-
-                db_path = self.db._db_path_for_date(self.db.current_date)
-                try:
-                    db_size = os.path.getsize(db_path) / (1024 * 1024)
-                except OSError:
-                    db_size = 0
-
-                series_str = ", ".join(self.series_list)
-                print(
-                    f"[{datetime.now().strftime('%H:%M:%S')}] "
-                    f"BTC: ${self.btc_price:,.2f} | "
-                    f"Active: {active}/{total_tickers} | "
-                    f"Series: {series_str} | "
-                    f"Rows: {counts['orderbook']:,} ob / {counts['btc_price']:,} btc | "
-                    f"Size: {db_size:.1f}MB"
-                )
-                last_status = current_time
-
-
-# =============================================================================
-# Entry Point
-# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Kalshi Market Data Recorder")
-    parser.add_argument(
-        "--series", type=str, nargs="+", default=["KXBTC"],
-        help="Series tickers to record (default: KXBTC). Example: --series KXBTC KXGOLDMON"
-    )
-    parser.add_argument(
-        "--interval", type=int, default=5,
-        help="Seconds between orderbook snapshots (default: 5)"
-    )
-    parser.add_argument(
-        "--dir", type=str, default="marketdata/",
-        help="Directory for database files (default: marketdata/)"
-    )
-    parser.add_argument(
-        "--weeks", type=int, default=2,
-        help="Weeks ahead to discover events (default: 2)"
-    )
-    parser.add_argument(
-        "--rediscover", type=float, default=4,
-        help="Hours between event rediscovery (default: 4)"
-    )
+    import argparse
+    parser = argparse.ArgumentParser(description="Kalshi market recorder")
+    parser.add_argument("--export", metavar="DATE",
+                        help="Export a day to parquet (YYYY-MM-DD)")
     args = parser.parse_args()
 
-    print(f"[RECORDER] Series: {args.series}")
-    print(f"[RECORDER] Snapshot interval: {args.interval}s")
-    print(f"[RECORDER] Rediscovery interval: {args.rediscover}h")
-    print(f"[RECORDER] DB directory: {args.dir}")
-    print()
+    if args.export:
+        db = RecorderDB()
+        db.export_parquet("fills", args.export)
+        db.export_parquet("market_snapshots", args.export)
+        db.close()
+        return
 
-    recorder = MarketRecorder(
-        series_list=args.series,
-        db_dir=args.dir,
-        snapshot_interval=args.interval,
-        weeks_ahead=args.weeks,
-        rediscover_hours=args.rediscover,
-    )
-
-    # Graceful Ctrl+C
-    def sigint_handler(*_):
-        recorder.stop()
-        exit(0)
-
-    signal.signal(signal.SIGINT, sigint_handler)
+    recorder = Recorder()
     recorder.start()
 
 

@@ -5,3 +5,4 @@ __pycache__/
 *.html
 *.db
 backtesting/marketdata/
+marketdata/

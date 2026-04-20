@@ -1,0 +1,6 @@
+[
+  {"ticker": "KXBTCD", "name": "Bitcoin",  "coinbase_product": "BTC-USD"},
+  {"ticker": "KXETHD", "name": "Ethereum", "coinbase_product": "ETH-USD"},
+  {"ticker": "KXSOLD", "name": "Solana",   "coinbase_product": "SOL-USD"},
+  {"ticker": "KXDOGED","name": "Doge",     "coinbase_product": "DOGE-USD"}
+]

@@ -1,0 +1,7 @@
+{
+  "base_bid": 0.0,
+  "base_ask": 4.0,
+  "atm_pct": 0.7,
+  "scale": 2.0,
+  "interval": 120
+}
