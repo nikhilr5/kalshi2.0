@@ -49,7 +49,7 @@ from btc_price_feed import CryptoPriceFeed
 from ws_feed import KalshiWsFeed
 from deribit_vol import (
     DeribitBracketPricer, DeribitWsFeed, find_deribit_expiry,
-    KALSHI_TO_DERIBIT_CURRENCY,
+    list_deribit_expiries, KALSHI_TO_DERIBIT_CURRENCY,
 )
 from strategy import Strategy
 
@@ -174,13 +174,44 @@ class DeribitDiscoverWorker(QThread):
 # IV Smile Window
 # =============================================================================
 
-class IVSmileWindow(QWidget):
-    """Separate window showing the Deribit IV smile chart."""
+def implied_vol_from_prob(prob: float, S: float, K: float, T: float,
+                          r: float = 0.043) -> float:
+    """Back out implied volatility from a binary option probability.
 
-    def __init__(self, pricer):
+    Given P(S>K) = N(d2), solve for sigma using bisection.
+    Returns IV as decimal (e.g. 0.65 for 65%), or 0 if unsolvable.
+    """
+    import math
+    if T <= 0 or S <= 0 or K <= 0 or prob <= 0.01 or prob >= 0.99:
+        return 0.0
+    log_sk = math.log(S / K)
+
+    def bs_prob(sigma):
+        sqrt_T = math.sqrt(T)
+        d2 = (log_sk + (r - 0.5 * sigma * sigma) * T) / (sigma * sqrt_T)
+        return 0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0)))
+
+    lo, hi = 0.01, 5.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        p = bs_prob(mid)
+        if p > prob:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-6:
+            break
+    return (lo + hi) / 2
+
+
+class IVSmileWindow(QWidget):
+    """Separate window showing the Deribit IV smile + Kalshi implied IV chart."""
+
+    def __init__(self, pricer, app_ref):
         super().__init__()
         self.pricer = pricer
-        self.setWindowTitle("Deribit IV Smile")
+        self.app_ref = app_ref  # reference to main KalshiApp for market data
+        self.setWindowTitle("IV Smile")
         self.resize(700, 450)
         self.setStyleSheet("background:#0b0f19;")
 
@@ -203,21 +234,68 @@ class IVSmileWindow(QWidget):
         ax = self.ax
         ax.clear()
 
+        # --- Deribit IV smile ---
         opts = self.pricer.options
-        strikes = [o.strike for o in opts if o.mark_iv > 0]
-        ivs = [o.mark_iv * 100.0 for o in opts if o.mark_iv > 0]
+        db_strikes = [o.strike for o in opts if o.mark_iv > 0]
+        db_ivs = [o.mark_iv * 100.0 for o in opts if o.mark_iv > 0]
 
-        if strikes:
-            ax.plot(strikes, ivs, color="#facc15", linewidth=1.5, marker="o",
-                    markersize=4, markerfacecolor="#facc15")
+        if db_strikes:
+            ax.plot(db_strikes, db_ivs, color="#facc15", linewidth=1.5, marker="o",
+                    markersize=4, markerfacecolor="#facc15", label="Deribit IV")
 
-            # Mark the spot price
-            spot = self.pricer.index_price
-            if spot > 0:
-                ax.axvline(spot, color="#ef4444", linestyle="--",
-                           linewidth=1, alpha=0.7, label=f"Spot ${spot:,.0f}")
-                ax.legend(facecolor="#141923", edgecolor="#1e2736",
-                          labelcolor="#c8cdd5", fontsize=9)
+        # --- Kalshi implied IV ---
+        app = self.app_ref
+        spot = app.spot_bid if app.spot_bid > 0 else app.spot_price
+        close_time = ""
+        if app.current_event:
+            close_time = app.current_event.get("close_time", "")
+
+        T = 0.0
+        if close_time:
+            try:
+                close_utc = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                now_utc = datetime.now(tz=timezone.utc)
+                T = max((close_utc - now_utc).total_seconds() / (365.25 * 24 * 3600), 0.0)
+            except Exception:
+                pass
+
+        if spot > 0 and T > 0:
+            kalshi_bid_strikes = []
+            kalshi_bid_ivs = []
+            kalshi_ask_strikes = []
+            kalshi_ask_ivs = []
+            for raw, disp in zip(app.all_strikes, app.all_display_strikes):
+                data = app.market_data.get(raw, {})
+                yes_bid = data.get("yes_bid", 0)
+                yes_ask = data.get("yes_ask", 0)
+                if yes_bid > 0.01 and yes_bid < 0.99:
+                    iv = implied_vol_from_prob(yes_bid, spot, disp, T)
+                    if iv > 0:
+                        kalshi_bid_strikes.append(disp)
+                        kalshi_bid_ivs.append(iv * 100.0)
+                if yes_ask > 0.01 and yes_ask < 0.99:
+                    iv = implied_vol_from_prob(yes_ask, spot, disp, T)
+                    if iv > 0:
+                        kalshi_ask_strikes.append(disp)
+                        kalshi_ask_ivs.append(iv * 100.0)
+
+            if kalshi_bid_strikes:
+                ax.plot(kalshi_bid_strikes, kalshi_bid_ivs, color="#22c55e",
+                        linewidth=1.5, marker="s", markersize=3,
+                        markerfacecolor="#22c55e", alpha=0.8, label="Kalshi Bid IV")
+            if kalshi_ask_strikes:
+                ax.plot(kalshi_ask_strikes, kalshi_ask_ivs, color="#ef4444",
+                        linewidth=1.5, marker="s", markersize=3,
+                        markerfacecolor="#ef4444", alpha=0.8, label="Kalshi Ask IV")
+
+        # Mark the spot price
+        spot_idx = self.pricer.index_price
+        if spot_idx > 0:
+            ax.axvline(spot_idx, color="#ef4444", linestyle="--",
+                       linewidth=1, alpha=0.4)
+
+        ax.legend(facecolor="#141923", edgecolor="#1e2736",
+                  labelcolor="#c8cdd5", fontsize=9, loc="upper right")
 
         ax.set_xlabel("Strike", color="#5a6270", fontsize=10)
         ax.set_ylabel("IV (%)", color="#5a6270", fontsize=10)
@@ -327,11 +405,20 @@ class AboveBelowApp(QMainWindow):
         self.resize(1000, 700)
 
         self.api = KalshiAPI()
+        self.api.on_rate_limit = self._on_rate_limit
+        self._rate_limit_remaining = None
+        self._rate_limit_total = None
+        self._rate_limit_hit_time = 0
         self.pricer = DeribitBracketPricer()
         self.pricer.risk_free_rate = 0.043  # ~4.3% annualised (T-bill rate)
+        self.weekly_pricer = DeribitBracketPricer()
+        self.weekly_pricer.risk_free_rate = 0.043
         self._deribit_discover_worker = None
+        self._weekly_discover_worker = None
         self._discover_worker = None
         self.deribit_ws = None      # DeribitWsFeed
+        self.weekly_deribit_ws = None  # Weekly DeribitWsFeed
+        self._weekly_expiry_str = None
         self.iv_window = None       # IVSmileWindow
 
         self.events = []
@@ -354,6 +441,7 @@ class AboveBelowApp(QMainWindow):
         self._stashed_market_data = {}  # event_ticker -> {raw_strike: market_data}
         self._stashed_events = {}       # event_ticker -> event dict (for close_time)
         self._fill_flash = {}           # raw_strike -> monotonic timestamp of last fill
+        self._portfolio_history = []    # [(datetime_utc, portfolio_dollars)]
         self._pnl_baseline: dict[float, float] = {}  # raw_strike -> PnL at app start
 
         # OTM% filter — only show strikes within this range
@@ -498,6 +586,17 @@ class AboveBelowApp(QMainWindow):
         self.iv_btn.clicked.connect(self._open_iv_window)
         top.addWidget(self.iv_btn)
 
+        top.addSpacing(5)
+        self.portfolio_btn = QPushButton("Portfolio")
+        self.portfolio_btn.setMaximumWidth(80)
+        self.portfolio_btn.setStyleSheet(
+            "QPushButton{background:#1e2736;color:#c8cdd5;border:1px solid #2d3a4d;"
+            "border-radius:3px;padding:4px 8px;}"
+            "QPushButton:hover{background:#2d3a4d;}"
+        )
+        self.portfolio_btn.clicked.connect(self._open_portfolio_window)
+        top.addWidget(self.portfolio_btn)
+
         layout.addLayout(top)
 
         # --- Second row: Auto Edge + Deribit status ---
@@ -538,9 +637,33 @@ class AboveBelowApp(QMainWindow):
         self._auto_edge_timer.timeout.connect(self._recompute_auto_edges)
 
         row2.addSpacing(15)
+        row2.addWidget(QLabel("IV Source:"))
+        self.iv_source_combo = QComboBox()
+        self.iv_source_combo.addItems(["Auto", "Weekly"])
+        self.iv_source_combo.setMaximumWidth(80)
+        self.iv_source_combo.setStyleSheet(
+            "QComboBox{background:#141923;color:#c8cdd5;"
+            "border:1px solid #1e2736;border-radius:3px;padding:2px 4px;}"
+        )
+        self.iv_source_combo.currentTextChanged.connect(self._on_iv_source_changed)
+        row2.addWidget(self.iv_source_combo)
+
+        row2.addSpacing(10)
         self.deribit_label = QLabel("")
         self.deribit_label.setStyleSheet("color:#5a6270;font-size:11px;")
         row2.addWidget(self.deribit_label)
+
+        row2.addSpacing(10)
+        self.deribit_age_label = QLabel("")
+        self.deribit_age_label.setStyleSheet("color:#5a6270;font-size:11px;")
+        row2.addWidget(self.deribit_age_label)
+        self._last_deribit_update = None
+
+        row2.addSpacing(10)
+        self.rate_limit_label = QLabel("")
+        self.rate_limit_label.setStyleSheet("color:#5a6270;font-size:11px;")
+        self.rate_limit_label.hide()
+        row2.addWidget(self.rate_limit_label)
 
         row2.addStretch()
 
@@ -551,7 +674,7 @@ class AboveBelowApp(QMainWindow):
         self.table.setColumnCount(15)
         self.table.setHorizontalHeaderLabels([
             "Strike", "OTM%", "Yes Bid", "Yes Ask", "Theo", "Edge",
-            "Deribit IV", "Position", "Δ", "γ", "ν", "Order", "PnL", "", "",
+            "Deribit IV", "Position", "Δ", "γ", "ν", "θ", "Order", "PnL", "", "",
         ])
         header = self.table.horizontalHeader()
         # All columns interactive (user-resizable), with sensible defaults
@@ -1006,6 +1129,14 @@ class AboveBelowApp(QMainWindow):
         # Trigger immediate REST refresh to recompute PnL from all fills
         self._refresh_positions()
 
+        # Play fill sound
+        try:
+            import subprocess
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
         print(f"[App Fill] {ticker} {action} {side} x{count} "
               f"@ ${price:.2f}  pos={pos}")
 
@@ -1037,6 +1168,7 @@ class AboveBelowApp(QMainWindow):
             portfolio_value_cents = data.get("portfolio_value", 0)
             balance_dollars = self._balance_cents / 100
             portfolio_dollars = (self._balance_cents + portfolio_value_cents) / 100
+            self._portfolio_history.append((datetime.now(tz=timezone.utc), portfolio_dollars))
             self.balance_label.setText(f"${balance_dollars:,.2f}")
 
             # Track portfolio baseline for session change %
@@ -1053,8 +1185,47 @@ class AboveBelowApp(QMainWindow):
             pass
 
     # =========================================================================
+    # Rate Limit
+    # =========================================================================
+
+    def _on_rate_limit(self, remaining, limit, reset_ts, endpoint=""):
+        """Called from API on every response with rate limit headers."""
+        self._rate_limit_remaining = remaining
+        self._rate_limit_total = limit
+        if remaining == 0:
+            self._rate_limit_hit_time = time.time()
+            self._rate_limit_endpoint = endpoint
+
+    def _update_rate_limit_label(self):
+        """Update the rate limit warning label. Called from table tick."""
+        # Show if we got a 429 in the last 10 seconds
+        if self._rate_limit_hit_time > 0:
+            elapsed = time.time() - self._rate_limit_hit_time
+            if elapsed < 10:
+                ep = getattr(self, "_rate_limit_endpoint", "")
+                txt = f"RATE LIMITED ({ep})" if ep else "RATE LIMITED"
+                self.rate_limit_label.setText(txt)
+                self.rate_limit_label.setStyleSheet(
+                    "color:#ef4444;font-size:12px;font-weight:bold;")
+                self.rate_limit_label.show()
+                return
+            else:
+                self._rate_limit_hit_time = 0
+
+        self.rate_limit_label.hide()
+
+    # =========================================================================
     # Deribit
     # =========================================================================
+
+    def _on_iv_source_changed(self, text: str):
+        """User changed IV source dropdown."""
+        print(f"[App] IV source changed to: {text}")
+        if text == "Weekly" and not self.weekly_deribit_ws:
+            self._fetch_weekly_deribit()
+        self._update_deribit_status_label()
+        self._recompute_and_trade()
+        self._ui_dirty = True
 
     def _fetch_deribit(self):
         """Discover Deribit instruments, then start WS feed."""
@@ -1073,6 +1244,7 @@ class AboveBelowApp(QMainWindow):
             return
 
         self.pricer.currency = currency
+        self.weekly_pricer.currency = currency
 
         close_time = self.current_event.get("close_time", "")
         expiry_str = find_deribit_expiry(close_time, currency=currency)
@@ -1090,6 +1262,91 @@ class AboveBelowApp(QMainWindow):
             lambda e: self.deribit_label.setText(f"Error: {e}")
         )
         self._deribit_discover_worker.start()
+
+        # Also start the weekly feed if IV source is set to Weekly
+        if self.iv_source_combo.currentText() == "Weekly":
+            self._fetch_weekly_deribit()
+
+    def _fetch_weekly_deribit(self):
+        """Discover and connect to the weekly (nearest Friday) Deribit expiry."""
+        series = self._current_series_ticker()
+        currency = KALSHI_TO_DERIBIT_CURRENCY.get(series)
+        if not currency:
+            return
+
+        if self._weekly_discover_worker and self._weekly_discover_worker.isRunning():
+            return
+
+        # Find all available expiries and pick the nearest weekly (Friday)
+        try:
+            available = list_deribit_expiries(currency)
+        except Exception as e:
+            print(f"[App] Failed to list Deribit expiries: {e}")
+            return
+
+        from datetime import timedelta
+        _months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+
+        now = datetime.now(tz=timezone.utc).date()
+        best = None
+        best_date = None
+        for exp_str in available:
+            try:
+                for m_name, m_num in _months.items():
+                    idx = exp_str.find(m_name)
+                    if idx > 0:
+                        d = int(exp_str[:idx])
+                        y = 2000 + int(exp_str[idx + 3:])
+                        exp_date = datetime(y, m_num, d).date()
+                        # Weekly = closest upcoming Friday (weekday 4)
+                        if exp_date.weekday() != 4:
+                            break
+                        if exp_date >= now:
+                            if best_date is None or exp_date < best_date:
+                                best = exp_str
+                                best_date = exp_date
+                        break
+            except Exception:
+                continue
+
+        if not best:
+            print("[App] No weekly Deribit expiry found")
+            return
+
+        # Don't restart if already connected to this expiry
+        if best == self._weekly_expiry_str and self.weekly_deribit_ws:
+            return
+
+        self._weekly_expiry_str = best
+        print(f"[App] Discovering weekly Deribit expiry: {best}")
+
+        if self.weekly_deribit_ws:
+            self.weekly_deribit_ws.stop()
+            self.weekly_deribit_ws = None
+
+        self._weekly_discover_worker = DeribitDiscoverWorker(self.weekly_pricer, best)
+        self._weekly_discover_worker.finished.connect(self._on_weekly_instruments_discovered)
+        self._weekly_discover_worker.error.connect(
+            lambda e: print(f"[App] Weekly Deribit error: {e}")
+        )
+        self._weekly_discover_worker.start()
+
+    def _on_weekly_instruments_discovered(self, expiry_str: str, instruments: list):
+        """Weekly instruments found — start WS feed."""
+        print(f"[App] Weekly Deribit {expiry_str}: {len(instruments)} options")
+        self.weekly_deribit_ws = DeribitWsFeed(
+            self.weekly_pricer, self._on_weekly_deribit_update
+        )
+        self.weekly_deribit_ws.start(instruments)
+
+    def _on_weekly_deribit_update(self):
+        """Weekly Deribit data refreshed — recompute if using weekly IVs."""
+        if self.iv_source_combo.currentText() == "Weekly":
+            self._last_deribit_update = time.monotonic()
+            self._recompute_and_trade()
+            self._ui_dirty = True
+            self._update_deribit_status_label()
 
     def _on_instruments_discovered(self, expiry_str: str, instruments: list):
         """Instruments found via REST — now start WS feed for live prices."""
@@ -1151,13 +1408,20 @@ class AboveBelowApp(QMainWindow):
 
     def _on_deribit_update(self):
         """Called by DeribitWsFeed after each density rebuild."""
+        self._last_deribit_update = time.monotonic()
         self._recompute_and_trade()
         self._ui_dirty = True
-        if self.pricer.ready:
-            lo, hi = self.pricer.strike_range
+        self._update_deribit_status_label()
+
+    def _update_deribit_status_label(self):
+        """Update the deribit info label based on active IV source."""
+        p = self._get_iv_pricer()
+        if p.ready:
+            lo, hi = p.strike_range
+            source = "weekly" if p is self.weekly_pricer else "daily"
             self.deribit_label.setText(
-                f"{self.pricer.expiry_str}  {self.pricer.n_options} opts  "
-                f"[${lo:,.0f} - ${hi:,.0f}]  (live)"
+                f"{p.expiry_str}  {p.n_options} opts  "
+                f"[${lo:,.0f} - ${hi:,.0f}]  ({source}, live)"
             )
         else:
             self.deribit_label.setText("Density failed")
@@ -1188,11 +1452,12 @@ class AboveBelowApp(QMainWindow):
 
         Returns (bid_iv_pct, ask_iv_pct, strike) or (None, None, None).
         """
-        if not self.pricer.options:
+        iv_p = self._get_iv_pricer()
+        if not iv_p.options:
             return None, None, None
         best_opt = None
         best_dist = float("inf")
-        for opt in self.pricer.options:
+        for opt in iv_p.options:
             if opt.bid_iv > 0 or opt.ask_iv > 0:
                 dist = abs(opt.strike - K)
                 if dist < best_dist:
@@ -1211,10 +1476,144 @@ class AboveBelowApp(QMainWindow):
     def _open_iv_window(self):
         """Open (or bring to front) the IV smile graph window."""
         if self.iv_window is None or not self.iv_window.isVisible():
-            self.iv_window = IVSmileWindow(self.pricer)
+            self.iv_window = IVSmileWindow(self._get_iv_pricer(), self)
         self.iv_window.show()
         self.iv_window.raise_()
         self.iv_window.update_chart()
+
+    def _open_portfolio_window(self):
+        """Open a window showing historical portfolio value (balance + positions)."""
+        import zoneinfo
+        ct = zoneinfo.ZoneInfo("America/Chicago")
+        start_date = datetime(2026, 4, 7, tzinfo=timezone.utc)
+
+        try:
+            bal_data = self.api.get_balance()
+            current_balance = bal_data.get("balance", 0) / 100
+            current_portfolio_value = bal_data.get("portfolio_value", 0) / 100
+            current_total = current_balance + current_portfolio_value
+        except Exception as e:
+            print(f"[App] Failed to fetch balance for portfolio: {e}")
+            return
+
+        try:
+            all_fills = self.api.get_fills()
+        except Exception as e:
+            print(f"[App] Failed to fetch fills for portfolio: {e}")
+            return
+
+        if not all_fills:
+            return
+
+        # Sort fills by time
+        fills_sorted = sorted(all_fills, key=lambda f: f.get("created_time", ""))
+
+        # Compute cumulative PnL using FIFO and track net cash flow from trades
+        # Portfolio value = starting_capital + cumulative_pnl + unrealized_value
+        # We reconstruct: starting_capital = current_total - total_pnl_since_start
+        run_pos = {}
+        avg_entry = {}
+        cumulative_pnl = 0.0
+        net_cost = 0.0  # net cash spent on open positions
+
+        # Track daily: {date_str: (cumulative_pnl, net_cost_of_open_positions)}
+        daily_snapshot = {}
+
+        for f in fills_sorted:
+            t = f.get("ticker", "")
+            created = f.get("created_time", "")
+            if not created:
+                continue
+            try:
+                fill_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if fill_dt < start_date:
+                continue
+
+            action = f.get("action", "")
+            count = int(float(f.get("count_fp", 0) or 0))
+            yes_price = float(f.get("yes_price_dollars", 0) or 0)
+            if count == 0 or yes_price == 0:
+                continue
+
+            if t not in run_pos:
+                run_pos[t] = 0
+                avg_entry[t] = 0.0
+
+            prev = run_pos[t]
+            delta = count if action == "buy" else -count
+            new = prev + delta
+
+            if prev == 0:
+                avg_entry[t] = yes_price
+            elif (prev > 0 and delta > 0) or (prev < 0 and delta < 0):
+                total_cost = avg_entry[t] * abs(prev) + yes_price * abs(delta)
+                avg_entry[t] = total_cost / abs(new) if new != 0 else 0
+            else:
+                closed = min(abs(delta), abs(prev))
+                if prev > 0:
+                    cumulative_pnl += (yes_price - avg_entry[t]) * closed
+                else:
+                    cumulative_pnl += (avg_entry[t] - yes_price) * closed
+                if new == 0:
+                    avg_entry[t] = 0.0
+                elif (prev > 0 and new < 0) or (prev < 0 and new > 0):
+                    avg_entry[t] = yes_price
+
+            run_pos[t] = new
+
+            day_str = fill_dt.astimezone(ct).strftime("%Y-%m-%d")
+            daily_snapshot[day_str] = cumulative_pnl
+
+        if not daily_snapshot:
+            return
+
+        # starting_capital = current_total - total cumulative PnL (realized) - unrealized
+        # Since we don't know historical unrealized, approximate:
+        # portfolio_value_on_day ≈ starting_capital + pnl_as_of_day
+        total_realized = cumulative_pnl
+        starting_capital = current_total - total_realized - current_portfolio_value
+
+        dates = sorted(daily_snapshot.keys())
+        values = [starting_capital + daily_snapshot[d] for d in dates]
+        date_objs = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
+
+        # Add today's actual value as the last point
+        today_str = datetime.now(tz=ct).strftime("%Y-%m-%d")
+        if not dates or dates[-1] != today_str:
+            date_objs.append(datetime.strptime(today_str, "%Y-%m-%d"))
+            values.append(current_total)
+
+        win = QMainWindow(self)
+        win.setWindowTitle("Portfolio Value")
+        win.resize(700, 400)
+        win.setStyleSheet("background:#0d1117;")
+
+        fig = Figure(figsize=(7, 4), facecolor="#0d1117")
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#141923")
+
+        ax.scatter(date_objs, values, c="#3b82f6", s=50, zorder=5)
+        ax.plot(date_objs, values, color="#5a6270", linewidth=0.8, alpha=0.5, zorder=1)
+
+        ax.set_title(f"Portfolio: ${values[-1]:,.2f}" if values else "No data",
+                     color="#c8cdd5", fontsize=12)
+        ax.set_ylabel("Portfolio Value ($)", color="#5a6270", fontsize=10)
+        ax.set_xlabel("Date (CT)", color="#5a6270", fontsize=10)
+        ax.tick_params(colors="#5a6270", labelsize=9)
+        ax.grid(True, color="#1e2736", alpha=0.5)
+
+        for spine in ax.spines.values():
+            spine.set_color("#1e2736")
+
+        fig.autofmt_xdate()
+        fig.tight_layout()
+
+        canvas = FigureCanvas(fig)
+        win.setCentralWidget(canvas)
+        win.show()
+        self._portfolio_window = win
 
     # =========================================================================
     # Table
@@ -1224,10 +1623,10 @@ class AboveBelowApp(QMainWindow):
         self.table.setRowCount(len(self.strikes))
         for row, (raw, disp) in enumerate(zip(self.strikes, self.display_strikes)):
             self.table.setItem(row, 0, QTableWidgetItem(f"${disp:,.0f}"))
-            for col in range(1, 13):
+            for col in range(1, 14):
                 self.table.setItem(row, col, QTableWidgetItem("--"))
 
-            # Toggle button (col 13)
+            # Toggle button (col 14)
             strat = self.strategies.get(raw)
             btn = QPushButton("ON" if strat and strat.active else "OFF")
             btn.setStyleSheet(
@@ -1240,9 +1639,9 @@ class AboveBelowApp(QMainWindow):
                  "QPushButton:hover{background:#2d3a4d;}")
             )
             btn.clicked.connect(lambda checked, rs=raw: self._toggle_strategy(rs))
-            self.table.setCellWidget(row, 13, btn)
+            self.table.setCellWidget(row, 14, btn)
 
-            # Flatten button (col 14)
+            # Flatten button (col 15)
             flat_btn = QPushButton("FLAT")
             flat_btn.setStyleSheet(
                 "QPushButton{background:#1e2736;color:#facc15;border:1px solid #2d3a4d;"
@@ -1250,12 +1649,23 @@ class AboveBelowApp(QMainWindow):
                 "QPushButton:hover{background:#2d3a4d;border-color:#facc15;}"
             )
             flat_btn.clicked.connect(lambda checked, rs=raw: self._flatten_position(rs))
-            self.table.setCellWidget(row, 14, flat_btn)
+            self.table.setCellWidget(row, 15, flat_btn)
 
     _filter_tick = 0
 
     def _update_table(self):
         self._update_countdowns()
+        self._update_rate_limit_label()
+        # Update Deribit age
+        if self._last_deribit_update is not None:
+            age = time.monotonic() - self._last_deribit_update
+            if age < 60:
+                self.deribit_age_label.setText(f"IV: {age:.0f}s ago")
+                self.deribit_age_label.setStyleSheet(
+                    "color:#22c55e;font-size:11px;" if age < 10 else "color:#5a6270;font-size:11px;")
+            else:
+                self.deribit_age_label.setText(f"IV: {age/60:.1f}m ago")
+                self.deribit_age_label.setStyleSheet("color:#ef4444;font-size:11px;")
         # Update spot display
         if self.spot_price > 0:
             self.spot_label.setText(f"${self.spot_price:,.2f}")
@@ -1385,11 +1795,11 @@ class AboveBelowApp(QMainWindow):
             # Delta — col 8: position delta (dP/dSpot * position)
             self._display_greeks(row, raw_strike, disp, data)
 
-            # Order — col 11 (show both sides, highlight flatten orders)
+            # Order — col 12 (show both sides, highlight flatten orders)
             self._display_orders(row, strat, raw_strike)
 
-            # PnL — col 12: total PnL (session PnL)
-            item = self.table.item(row, 12)
+            # PnL — col 13: total PnL (session PnL)
+            item = self.table.item(row, 13)
             if item:
                 realized = strat.realized_pnl if strat else data.get("realized_pnl", 0)
                 pos = strat.position if strat else data.get("position", 0)
@@ -1480,17 +1890,18 @@ class AboveBelowApp(QMainWindow):
 
     def _display_greeks(self, row: int, raw_strike: float,
                         disp_strike: float, data: dict):
-        """Update the Greek columns: col 8 (Δ), col 9 (γ), col 10 (ν).
+        """Update the Greek columns: col 8 (Δ), col 9 (γ), col 10 (ν), col 11 (θ).
 
         Delta = position * dP/dSpot  — $ change per $1 spot move.
         Gamma = position * d²P/dS²  — how fast delta changes per $1 move.
         Vega  = position * dP/dσ    — $ change per 1% IV move.
+        Theta = position * dP/dT    — $ change per hour of time decay.
         """
         strat = self.strategies.get(raw_strike)
         pos = strat.position if strat else data.get("position", 0)
 
         dim = QColor("#5a6270")
-        items = [self.table.item(row, c) for c in (8, 9, 10)]
+        items = [self.table.item(row, c) for c in (8, 9, 10, 11)]
 
         if pos == 0 or not self.pricer.options or self.spot_price <= 0:
             for it in items:
@@ -1506,12 +1917,14 @@ class AboveBelowApp(QMainWindow):
         # Delta & gamma: bump spot ±$1
         bump = 1.0
         try:
-            p_mid = self.pricer.prob_above_bid_iv(
-                disp_strike, spot=self.spot_price, kalshi_close_iso=close_time)
-            p_up = self.pricer.prob_above_bid_iv(
-                disp_strike, spot=self.spot_price + bump, kalshi_close_iso=close_time)
-            p_dn = self.pricer.prob_above_bid_iv(
-                disp_strike, spot=self.spot_price - bump, kalshi_close_iso=close_time)
+            iv_p = self._get_iv_pricer()
+            sigma_mid = iv_p._find_closest_bid_iv(disp_strike)
+            p_mid = self.pricer.prob_above_with_iv(
+                disp_strike, sigma_mid, spot=self.spot_price, kalshi_close_iso=close_time)
+            p_up = self.pricer.prob_above_with_iv(
+                disp_strike, sigma_mid, spot=self.spot_price + bump, kalshi_close_iso=close_time)
+            p_dn = self.pricer.prob_above_with_iv(
+                disp_strike, sigma_mid, spot=self.spot_price - bump, kalshi_close_iso=close_time)
             dp_ds = (p_up - p_dn) / (2 * bump)
             d2p_ds2 = (p_up - 2 * p_mid + p_dn) / (bump ** 2)
         except Exception:
@@ -1524,7 +1937,7 @@ class AboveBelowApp(QMainWindow):
         # Vega: bump IV ±1%
         vega_per = 0.0
         try:
-            sigma = self.pricer._find_closest_bid_iv(disp_strike)
+            sigma = iv_p._find_closest_bid_iv(disp_strike)
             if sigma > 0:
                 iv_bump = 0.01
                 p_iv_up = self.pricer.prob_above_with_iv(
@@ -1537,9 +1950,29 @@ class AboveBelowApp(QMainWindow):
         except Exception:
             pass
 
+        # Theta: price change per hour of time decay
+        theta_per_hr = 0.0
+        try:
+            if sigma_mid > 0 and close_time:
+                from datetime import datetime as _dt, timezone as _tz
+                close_utc = _dt.fromisoformat(close_time.replace("Z", "+00:00"))
+                now_ts = _dt.now(tz=_tz.utc).timestamp()
+                T_sec = close_utc.timestamp() - now_ts
+                if T_sec > 3600:  # more than 1 hour left
+                    # Price 1 hour from now (shorter T)
+                    one_hour_yr = 3600 / (365.25 * 24 * 3600)
+                    T_now = T_sec / (365.25 * 24 * 3600)
+                    T_later = T_now - one_hour_yr
+                    p_later = self.pricer._bs_prob_above(
+                        self.spot_price, disp_strike, sigma_mid, T_later, self.pricer.risk_free_rate)
+                    theta_per_hr = p_later - p_mid  # negative for ATM (time decay)
+        except Exception:
+            pass
+
         pos_delta = pos * dp_ds
         pos_gamma = pos * d2p_ds2
         pos_vega = pos * vega_per * 0.01
+        pos_theta = pos * theta_per_hr
 
         # Col 8: Delta
         if items[0]:
@@ -1555,6 +1988,11 @@ class AboveBelowApp(QMainWindow):
         if items[2]:
             items[2].setText(f"{pos_vega:+.5f}")
             items[2].setForeground(QColor("#8b5cf6"))
+
+        # Col 11: Theta (per hour)
+        if items[3]:
+            items[3].setText(f"{pos_theta:+.4f}")
+            items[3].setForeground(QColor("#06b6d4"))
 
     def _display_iv(self, row: int, disp_strike: float):
         """Update the Deribit IV cell (col 6) with bid/ask IV + strike used."""
@@ -1594,7 +2032,7 @@ class AboveBelowApp(QMainWindow):
             main_lbl.setText("--")
 
         if iv_strike is not None:
-            oi = self.pricer._find_closest_oi(disp_strike)
+            oi = self._get_iv_pricer()._find_closest_oi(disp_strike)
             if oi > 0:
                 strike_lbl.setText(f"${iv_strike:,.0f} (OI:{oi:,.0f})")
             else:
@@ -1604,13 +2042,20 @@ class AboveBelowApp(QMainWindow):
 
     _ui_dirty = False
 
+    def _get_iv_pricer(self):
+        """Return the pricer to use for IV lookup based on dropdown selection."""
+        if self.iv_source_combo.currentText() == "Weekly" and self.weekly_pricer.options:
+            return self.weekly_pricer
+        return self.pricer
+
     def _recompute_and_trade(self):
         """Compute theos + feed strategies immediately. Runs on WS thread.
 
         Caches results for the UI timer to display. Tracks latency EMA
         based on actual computation frequency (not UI refresh rate).
         """
-        if not self.strikes or not self.pricer.options:
+        iv_pricer = self._get_iv_pricer()
+        if not self.strikes or not iv_pricer.options:
             return
         close_time = ""
         if self.current_event:
@@ -1623,11 +2068,14 @@ class AboveBelowApp(QMainWindow):
         now = time.monotonic()
 
         for raw_strike, disp in zip(self.strikes, self.display_strikes):
-            bid_theo = self.pricer.prob_above_bid_iv(
-                disp, spot=spot_b, kalshi_close_iso=close_time,
+            # Get IV from selected source, compute probability with Kalshi close time
+            bid_iv = iv_pricer._find_closest_bid_iv(disp)
+            ask_iv = iv_pricer._find_closest_ask_iv(disp)
+            bid_theo = self.pricer.prob_above_with_iv(
+                disp, bid_iv, spot=spot_b, kalshi_close_iso=close_time,
             )
-            ask_theo = self.pricer.prob_above_ask_iv(
-                disp, spot=spot_a, kalshi_close_iso=close_time,
+            ask_theo = self.pricer.prob_above_with_iv(
+                disp, ask_iv, spot=spot_a, kalshi_close_iso=close_time,
             )
 
             # Cache for UI
@@ -1664,11 +2112,13 @@ class AboveBelowApp(QMainWindow):
                 if not strat.active:
                     continue
                 disp = display_strike(raw_strike)
-                bid_theo = self.pricer.prob_above_bid_iv(
-                    disp, spot=spot_b, kalshi_close_iso=stash_close,
+                stash_bid_iv = iv_pricer._find_closest_bid_iv(disp)
+                stash_ask_iv = iv_pricer._find_closest_ask_iv(disp)
+                bid_theo = self.pricer.prob_above_with_iv(
+                    disp, stash_bid_iv, spot=spot_b, kalshi_close_iso=stash_close,
                 )
-                ask_theo = self.pricer.prob_above_ask_iv(
-                    disp, spot=spot_a, kalshi_close_iso=stash_close,
+                ask_theo = self.pricer.prob_above_with_iv(
+                    disp, stash_ask_iv, spot=spot_a, kalshi_close_iso=stash_close,
                 )
                 md = stashed_md.get(raw_strike)
                 if md:
@@ -1746,17 +2196,17 @@ class AboveBelowApp(QMainWindow):
 
         if not has_buy and not has_sell:
             # No orders — use plain item
-            existing = self.table.cellWidget(row, 11)
+            existing = self.table.cellWidget(row, 12)
             if existing:
-                self.table.removeCellWidget(row, 11)
-            item = self.table.item(row, 11)
+                self.table.removeCellWidget(row, 12)
+            item = self.table.item(row, 12)
             if item:
                 item.setText("--")
                 item.setForeground(QColor("#5a6270"))
             return
 
         # Build widget with colored labels per side
-        existing = self.table.cellWidget(row, 11)
+        existing = self.table.cellWidget(row, 12)
         if existing is None or existing.objectName() != "order_container":
             container = QWidget()
             container.setObjectName("order_container")
@@ -1770,8 +2220,8 @@ class AboveBelowApp(QMainWindow):
             sell_lbl.setObjectName("order_sell")
             hlay.addWidget(buy_lbl)
             hlay.addWidget(sell_lbl)
-            self.table.setCellWidget(row, 11, container)
-            item = self.table.item(row, 11)
+            self.table.setCellWidget(row, 12, container)
+            item = self.table.item(row, 12)
             if item:
                 item.setText("")
         else:
@@ -1834,16 +2284,17 @@ class AboveBelowApp(QMainWindow):
             if params is None:
                 return
             new_eb, new_ea, new_sb, new_sa, new_max, new_tol, new_fwi, new_fws = params
-            if ae_on:
-                new_eb, new_ea = eb, ea  # keep current auto edge values
 
             if strat is None:
                 data = self.market_data.get(raw_strike)
                 if not data:
                     return
+                # When auto edge is on, use 0 as placeholder — auto edge will set real values
+                init_eb = new_eb if not ae_on else 0.0
+                init_ea = new_ea if not ae_on else 0.0
                 strat = Strategy(
                     ticker=data["ticker"], strike=disp,
-                    edge_bid=new_eb, edge_ask=new_ea,
+                    edge_bid=init_eb, edge_ask=init_ea,
                     size_bid=new_sb, size_ask=new_sa,
                     max_position=new_max, api=self.api,
                     tolerance=new_tol, on_max_position=self._on_max_position,
@@ -1851,16 +2302,27 @@ class AboveBelowApp(QMainWindow):
                 strat.flatten_walk_interval = new_fwi
                 strat.flatten_walk_step = new_fws
                 self.strategies[raw_strike] = strat
+                if ae_on:
+                    self._recompute_auto_edges(force=True)
             else:
-                old_eb, old_ea = strat.edge_bid, strat.edge_ask
-                strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
-                                    new_fwi, new_fws)
-                # If edge changed and strategy is active, force reprice
-                if strat.active and (new_eb != old_eb or new_ea != old_ea):
-                    strat._cancel_sell()
-                    strat._cancel_buy()
-                    strat.current_sell_price = None
-                    strat.current_buy_price = None
+                if ae_on:
+                    # Auto edge controls edge — only update non-edge params
+                    strat.size_bid = new_sb
+                    strat.size_ask = new_sa
+                    strat.max_position = new_max
+                    strat.tolerance = new_tol
+                    strat.flatten_walk_interval = new_fwi
+                    strat.flatten_walk_step = new_fws
+                else:
+                    old_eb, old_ea = strat.edge_bid, strat.edge_ask
+                    strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
+                                        new_fwi, new_fws)
+                    # If edge changed and strategy is active, force reprice
+                    if strat.active and (new_eb != old_eb or new_ea != old_ea):
+                        strat._cancel_sell()
+                        strat._cancel_buy()
+                        strat.current_sell_price = None
+                        strat.current_buy_price = None
 
             self._save_all_strategy_params()
             print(f"[App] ${disp:,.0f} params: edge_bid={new_eb}, edge_ask={new_ea}, "
@@ -1932,8 +2394,6 @@ class AboveBelowApp(QMainWindow):
         if params is None:
             return
         new_eb, new_ea, new_sb, new_sa, new_max, new_tol, new_fwi, new_fws = params
-        if ae_on:
-            new_eb, new_ea = eb, ea
 
         for row in rows:
             if row < 0 or row >= len(self.strikes):
@@ -1946,9 +2406,11 @@ class AboveBelowApp(QMainWindow):
 
             strat = self.strategies.get(raw_strike)
             if strat is None:
+                init_eb = new_eb if not ae_on else 0.0
+                init_ea = new_ea if not ae_on else 0.0
                 strat = Strategy(
                     ticker=data["ticker"], strike=disp,
-                    edge_bid=new_eb, edge_ask=new_ea,
+                    edge_bid=init_eb, edge_ask=init_ea,
                     size_bid=new_sb, size_ask=new_sa,
                     max_position=new_max, api=self.api,
                     tolerance=new_tol, on_max_position=self._on_max_position,
@@ -1957,14 +2419,26 @@ class AboveBelowApp(QMainWindow):
                 strat.flatten_walk_step = new_fws
                 self.strategies[raw_strike] = strat
             else:
-                old_eb, old_ea = strat.edge_bid, strat.edge_ask
-                strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
-                                    new_fwi, new_fws)
-                if strat.active and (new_eb != old_eb or new_ea != old_ea):
-                    strat._cancel_sell()
-                    strat._cancel_buy()
-                    strat.current_sell_price = None
-                    strat.current_buy_price = None
+                if ae_on:
+                    # Auto edge controls edge — only update non-edge params
+                    strat.size_bid = new_sb
+                    strat.size_ask = new_sa
+                    strat.max_position = new_max
+                    strat.tolerance = new_tol
+                    strat.flatten_walk_interval = new_fwi
+                    strat.flatten_walk_step = new_fws
+                else:
+                    old_eb, old_ea = strat.edge_bid, strat.edge_ask
+                    strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
+                                        new_fwi, new_fws)
+                    if strat.active and (new_eb != old_eb or new_ea != old_ea):
+                        strat._cancel_sell()
+                        strat._cancel_buy()
+                        strat.current_sell_price = None
+                        strat.current_buy_price = None
+
+        if ae_on:
+            self._recompute_auto_edges(force=True)
 
         self._save_all_strategy_params()
         print(f"[App] Bulk params ({len(rows)} strikes): edge_bid={new_eb}, "
@@ -1998,7 +2472,7 @@ class AboveBelowApp(QMainWindow):
             if data.get("ticker") == ticker:
                 row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
                 if row >= 0:
-                    btn = self.table.cellWidget(row, 13)
+                    btn = self.table.cellWidget(row, 14)
                     if btn:
                         btn.setText("MAX")
                         btn.setStyleSheet(
@@ -2067,7 +2541,7 @@ class AboveBelowApp(QMainWindow):
         # Update button appearance
         row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
         if row >= 0:
-            btn = self.table.cellWidget(row, 13)
+            btn = self.table.cellWidget(row, 14)
             if btn:
                 if strat.active:
                     btn.setText("ON")
@@ -2188,7 +2662,7 @@ class AboveBelowApp(QMainWindow):
             # Update toggle button
             row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
             if row >= 0:
-                btn = self.table.cellWidget(row, 13)
+                btn = self.table.cellWidget(row, 14)
                 if btn:
                     btn.setText("ON")
                     btn.setStyleSheet(
@@ -2312,24 +2786,35 @@ class AboveBelowApp(QMainWindow):
                 strat.exposure = exposure
                 strat.realized_pnl = pnl
 
+    def _my_tickers(self) -> set:
+        """Return all tickers this instance manages (current + stashed events)."""
+        tickers = {d["ticker"] for d in self.market_data.values()}
+        for stashed_md in self._stashed_market_data.values():
+            tickers.update(d["ticker"] for d in stashed_md.values())
+        return tickers
+
     def _audit_orders(self):
-        """Check resting orders, cancel orphans (>2 per ticker)."""
+        """Check resting orders, cancel orphans (>2 per ticker). Only touches this instance's tickers."""
         try:
             orders = self.api.get_orders(status="resting")
             if not orders:
                 return
 
-            # Group by ticker
+            my_tickers = self._my_tickers()
+
+            # Group by ticker (only ours)
             by_ticker = {}
             for o in orders:
                 t = o.get("ticker", "unknown")
+                if t not in my_tickers:
+                    continue
                 if t not in by_ticker:
                     by_ticker[t] = []
                 by_ticker[t].append(o)
 
-            total = len(orders)
+            total = sum(len(ol) for ol in by_ticker.values())
             parts = [f"{t}: {len(ol)}" for t, ol in sorted(by_ticker.items())]
-            print(f"[Audit] {total} resting orders — {', '.join(parts)}")
+            print(f"[Audit] {total} resting orders (ours) — {', '.join(parts)}")
 
             # Build set of known strategy order IDs
             known_ids = set()
@@ -2338,19 +2823,26 @@ class AboveBelowApp(QMainWindow):
                     known_ids.add(strat.resting_sell_id)
                 if strat.resting_buy_id:
                     known_ids.add(strat.resting_buy_id)
+            for stashed in self._stashed_strategies.values():
+                for strat in stashed.values():
+                    if strat.resting_sell_id:
+                        known_ids.add(strat.resting_sell_id)
+                    if strat.resting_buy_id:
+                        known_ids.add(strat.resting_buy_id)
 
-            # Cancel any order we don't recognize
+            # Cancel any order on our tickers that we don't recognize
             orphans = 0
-            for o in orders:
-                oid = o.get("order_id", "")
-                if oid and oid not in known_ids:
-                    try:
-                        self.api.cancel_order(oid)
-                        orphans += 1
-                        print(f"[Audit] Cancelled orphan {oid} ({o.get('ticker', '')} "
-                              f"{o.get('action', '')} @ {o.get('yes_price_dollars', '')})")
-                    except Exception as e:
-                        print(f"[Audit] Failed to cancel orphan {oid}: {e}")
+            for ticker_orders in by_ticker.values():
+                for o in ticker_orders:
+                    oid = o.get("order_id", "")
+                    if oid and oid not in known_ids:
+                        try:
+                            self.api.cancel_order(oid)
+                            orphans += 1
+                            print(f"[Audit] Cancelled orphan {oid} ({o.get('ticker', '')} "
+                                  f"{o.get('action', '')} @ {o.get('yes_price_dollars', '')})")
+                        except Exception as e:
+                            print(f"[Audit] Failed to cancel orphan {oid}: {e}")
 
             if orphans:
                 print(f"[Audit] Cleaned up {orphans} orphan orders")
@@ -2365,15 +2857,23 @@ class AboveBelowApp(QMainWindow):
         self.strategies.clear()
 
     def _cancel_all_orders(self):
-        """Cancel ALL resting orders on the account. Retries until none remain."""
+        """Cancel all resting orders belonging to this instance's tickers only."""
         try:
             orders = self.api.get_orders(status="resting")
             if not orders:
                 print("[App] No resting orders to cancel")
                 return
+
+            my_tickers = self._my_tickers()
+            my_orders = [o for o in orders if o.get("ticker", "") in my_tickers]
+
+            if not my_orders:
+                print("[App] No resting orders for our tickers")
+                return
+
             cancelled = 0
             failed = 0
-            for o in orders:
+            for o in my_orders:
                 oid = o.get("order_id", "")
                 try:
                     self.api.cancel_order(oid)
@@ -2381,24 +2881,29 @@ class AboveBelowApp(QMainWindow):
                 except Exception as e:
                     failed += 1
                     print(f"[App] Cancel failed {oid}: {e}")
-            print(f"[App] Cancelled {cancelled}/{len(orders)} orders ({failed} failed)")
+            skipped = len(orders) - len(my_orders)
+            print(f"[App] Cancelled {cancelled}/{len(my_orders)} orders "
+                  f"({failed} failed, {skipped} skipped from other instances)")
 
             # Retry any that failed
             if failed > 0:
                 time.sleep(0.5)
                 remaining = self.api.get_orders(status="resting")
                 for o in remaining:
+                    if o.get("ticker", "") not in my_tickers:
+                        continue
                     oid = o.get("order_id", "")
                     try:
                         self.api.cancel_order(oid)
                         print(f"[App] Retry cancelled {oid}")
                     except Exception:
                         pass
-                final = self.api.get_orders(status="resting")
+                final = [o for o in self.api.get_orders(status="resting")
+                         if o.get("ticker", "") in my_tickers]
                 if final:
-                    print(f"[App] WARNING: {len(final)} orders still resting after retry!")
+                    print(f"[App] WARNING: {len(final)} of our orders still resting after retry!")
                 else:
-                    print("[App] All orders cancelled on retry")
+                    print("[App] All our orders cancelled on retry")
         except Exception as e:
             print(f"[App] Failed to fetch resting orders: {e}")
 
@@ -2436,6 +2941,8 @@ class AboveBelowApp(QMainWindow):
             self.ws_feed.stop()
         if self.deribit_ws:
             self.deribit_ws.stop()
+        if self.weekly_deribit_ws:
+            self.weekly_deribit_ws.stop()
 
         # 2. Stop all strategies (cancels their tracked orders)
         all_strats = list(self.strategies.values())

@@ -319,21 +319,21 @@ class Strategy:
         #   The 2c threshold covers the taker fee so we don't cross the
         #   spread only to give the profit away in fees.
         if self.kalshi_ask > 0 and new_sell < self.kalshi_ask:
-            take_price = max(new_sell, self.kalshi_bid) if self.kalshi_bid > 0 else new_sell
-            pnl_per = take_price - self.avg_entry if self.avg_entry > 0 else 0
-            if (flatten and pnl_per > 0.02
-                    and self.kalshi_bid > 0):
-                # Profitable flatten after fees — allow taking the bid
-                floor = self.kalshi_bid
-                new_sell = max(new_sell, floor)
-                print(f"[Strategy] {self.strike:,.0f} flatten sell TAKE: "
-                      f"${new_sell:.2f} (entry=${self.avg_entry:.2f}, "
-                      f"pnl/ct=${pnl_per:.2f}, bid=${floor:.2f})")
-            else:
-                new_sell = self.kalshi_ask
+            # # Taker logic disabled — always post, never take
+            # take_price = max(new_sell, self.kalshi_bid) if self.kalshi_bid > 0 else new_sell
+            # pnl_per = take_price - self.avg_entry if self.avg_entry > 0 else 0
+            # if (flatten and pnl_per > 0.02
+            #         and self.kalshi_bid > 0):
+            #     # Profitable flatten after fees — allow taking the bid
+            #     floor = self.kalshi_bid
+            #     new_sell = max(new_sell, floor)
+            #     print(f"[Strategy] {self.strike:,.0f} flatten sell TAKE: "
+            #           f"${new_sell:.2f} (entry=${self.avg_entry:.2f}, "
+            #           f"pnl/ct=${pnl_per:.2f}, bid=${floor:.2f})")
+            # else:
+            new_sell = self.kalshi_ask
 
-        # Lonely BBO (ALL orders): if we're the only one at the ask, pull back.
-        # Skip this check if we're intentionally improving the ask (below it).
+        # Lonely BBO: if we're the only one at the ask, pull back.
         if (self.resting_sell_id is not None
                 and self.current_sell_price is not None
                 and self.kalshi_ask > 0
@@ -353,7 +353,7 @@ class Strategy:
 
         if self._should_reprice_sell(new_sell):
             if self._cancel_sell():
-                self._place_sell(new_sell, size)
+                self._place_sell(new_sell, size, flatten=flatten)
 
     def _quote_buy(self, theo: float, edge: float, size: int, flatten: bool = False):
         """Compute buy price and place/reprice if needed.
@@ -398,21 +398,21 @@ class Strategy:
         #   The 2c threshold covers the taker fee so we don't cross the
         #   spread only to give the profit away in fees.
         if self.kalshi_bid > 0 and new_buy > self.kalshi_bid:
-            take_price = min(new_buy, self.kalshi_ask) if self.kalshi_ask > 0 else new_buy
-            pnl_per = self.avg_entry - take_price if self.avg_entry > 0 else 0
-            if (flatten and pnl_per > 0.02
-                    and self.kalshi_ask > 0):
-                # Profitable flatten after fees — allow taking the ask
-                ceiling = self.kalshi_ask
-                new_buy = min(new_buy, ceiling)
-                print(f"[Strategy] {self.strike:,.0f} flatten buy TAKE: "
-                      f"${new_buy:.2f} (entry=${self.avg_entry:.2f}, "
-                      f"pnl/ct=${pnl_per:.2f}, ask=${ceiling:.2f})")
-            else:
-                new_buy = self.kalshi_bid
+            # # Taker logic disabled — always post, never take
+            # take_price = min(new_buy, self.kalshi_ask) if self.kalshi_ask > 0 else new_buy
+            # pnl_per = self.avg_entry - take_price if self.avg_entry > 0 else 0
+            # if (flatten and pnl_per > 0.02
+            #         and self.kalshi_ask > 0):
+            #     # Profitable flatten after fees — allow taking the ask
+            #     ceiling = self.kalshi_ask
+            #     new_buy = min(new_buy, ceiling)
+            #     print(f"[Strategy] {self.strike:,.0f} flatten buy TAKE: "
+            #           f"${new_buy:.2f} (entry=${self.avg_entry:.2f}, "
+            #           f"pnl/ct=${pnl_per:.2f}, ask=${ceiling:.2f})")
+            # else:
+            new_buy = self.kalshi_bid
 
-        # Lonely BBO (ALL orders): if we're the only one at the bid, pull back.
-        # Skip this check if we're intentionally improving the bid (above it).
+        # Lonely BBO: if we're the only one at the bid, pull back.
         if (self.resting_buy_id is not None
                 and self.current_buy_price is not None
                 and self.kalshi_bid > 0
@@ -432,7 +432,7 @@ class Strategy:
 
         if self._should_reprice_buy(new_buy):
             if self._cancel_buy():
-                self._place_buy(new_buy, size)
+                self._place_buy(new_buy, size, flatten=flatten)
 
     def _should_reprice_sell(self, new_price: float) -> bool:
         """Check if sell order needs repricing."""
@@ -458,18 +458,20 @@ class Strategy:
             # Worsening (lowering buy) — require tolerance
             return abs(diff) >= self.tolerance
 
-    def _place_sell(self, price: float, count: int):
+    def _place_sell(self, price: float, count: int, flatten: bool = False):
         """Place a Sell Yes limit order."""
         if self.resting_sell_id is not None:
             # Safety: don't place if we still think an order is out there
             return
         try:
+            tag = "flat" if flatten else "init"
             resp = self.api.create_order(
                 ticker=self.ticker,
                 side="yes",
                 action="sell",
                 price_dollars=f"{price:.2f}",
                 count=count,
+                tag=tag,
             )
             order = resp.get("order", {})
             self.resting_sell_id = order.get("order_id")
@@ -483,18 +485,20 @@ class Strategy:
             print(f"[Strategy] {self.strike:,.0f} sell order failed: {e}")
             self.current_sell_price = price
 
-    def _place_buy(self, price: float, count: int):
+    def _place_buy(self, price: float, count: int, flatten: bool = False):
         """Place a Buy Yes limit order."""
         if self.resting_buy_id is not None:
             # Safety: don't place if we still think an order is out there
             return
         try:
+            tag = "flat" if flatten else "init"
             resp = self.api.create_order(
                 ticker=self.ticker,
                 side="yes",
                 action="buy",
                 price_dollars=f"{price:.2f}",
                 count=count,
+                tag=tag,
             )
             order = resp.get("order", {})
             self.resting_buy_id = order.get("order_id")

@@ -20,17 +20,16 @@ from dash import Dash, dcc, html, Input, Output, State
 
 DB_PATH = Path(__file__).resolve().parent.parent / "marketdata" / "recorder.db"
 REFRESH_MS = 60 * 60 * 1000  # 1 hour
-MARKOUT_INTERVALS = [5, 10, 30, 60]  # seconds
+MARKOUT_INTERVALS = [5, 30, 60, 120, 300, 600]  # seconds
 
-LEAD_LAG_INTERVALS = [5, 10, 30, 60]  # seconds
+LEAD_LAG_INTERVALS = [5, 30, 60, 120, 300, 600]  # seconds
 
 # Vertical annotation lines: (ct_datetime, label, color)
-VLINES = [
-    (datetime(2026, 4, 20, 10, 6), "Deribit IV fix", "#f59e0b"),
-]
+VLINES = []
 
 
-def compute_lead_lag(market_by_ticker_data, side="bid", intervals=LEAD_LAG_INTERVALS):
+def compute_lead_lag(market_by_ticker_data, side="bid", intervals=LEAD_LAG_INTERVALS,
+                     theo_bid_idx=4, theo_ask_idx=5):
     """Compute lead-lag correlation between theo-market signal and future market moves.
 
     Args:
@@ -45,7 +44,7 @@ def compute_lead_lag(market_by_ticker_data, side="bid", intervals=LEAD_LAG_INTER
     points = []
     for m in market_by_ticker_data:
         mkt_bid, mkt_ask = m[2], m[3]
-        tb, ta = m[4], m[5]
+        tb, ta = m[theo_bid_idx], m[theo_ask_idx]
         if side == "bid":
             mkt_price, theo_price = mkt_bid, tb
         else:
@@ -106,7 +105,8 @@ def compute_lead_lag(market_by_ticker_data, side="bid", intervals=LEAD_LAG_INTER
     return result
 
 
-def compute_edge_magnitude(market_by_ticker_data, side="bid", intervals=LEAD_LAG_INTERVALS):
+def compute_edge_magnitude(market_by_ticker_data, side="bid", intervals=LEAD_LAG_INTERVALS,
+                           theo_bid_idx=4, theo_ask_idx=5):
     """Compute average future market move conditional on spread direction.
 
     Returns {interval: {
@@ -122,7 +122,7 @@ def compute_edge_magnitude(market_by_ticker_data, side="bid", intervals=LEAD_LAG
     points = []
     for m in market_by_ticker_data:
         mkt_bid, mkt_ask = m[2], m[3]
-        tb, ta = m[4], m[5]
+        tb, ta = m[theo_bid_idx], m[theo_ask_idx]
         if side == "bid":
             mkt_price, theo_price = mkt_bid, tb
         else:
@@ -204,7 +204,8 @@ def load_event_data(event):
     conn = sqlite3.connect(str(DB_PATH))
 
     fills = conn.execute("""
-        SELECT ts, ticker, action, side, count, price
+        SELECT ts, ticker, action, side, count, price, client_order_id,
+               COALESCE(fee, 0) as fee
         FROM fills
         WHERE event_ticker LIKE ? OR ticker LIKE ?
         ORDER BY id
@@ -219,7 +220,9 @@ def load_event_data(event):
 
     market = conn.execute("""
         SELECT ts, ticker, kalshi_yes_bid, kalshi_yes_ask, theo_bid, theo_ask,
-               deribit_bid_iv, deribit_ask_iv
+               deribit_bid_iv, deribit_ask_iv,
+               theo_bid_weekly, theo_ask_weekly,
+               deribit_bid_iv_weekly, deribit_ask_iv_weekly
         FROM market_snapshots
         WHERE ticker LIKE ?
         ORDER BY ts
@@ -243,7 +246,9 @@ def compute_pnl_series(fill_list, strike_filter=None):
     state = {}
     pnl_points = {}
 
-    for ts_str, ticker, action, side, count, price in fill_list:
+    for row in fill_list:
+        ts_str, ticker, action, side, count, price = row[:6]
+        fee = float(row[7]) if len(row) > 7 else 0.0
         if strike_filter and not ticker.endswith(f"-T{strike_filter}"):
             continue
 
@@ -256,6 +261,9 @@ def compute_pnl_series(fill_list, strike_filter=None):
         if ticker not in state:
             state[ticker] = {"position": 0, "queue": deque(), "realized_pnl": 0.0}
         s = state[ticker]
+
+        # Subtract fee from PnL
+        s["realized_pnl"] -= fee
 
         if (action == "buy" and side == "yes") or (action == "sell" and side == "no"):
             direction = 1
@@ -292,15 +300,28 @@ def compute_pnl_series(fill_list, strike_filter=None):
 
 
 def build_market_by_ticker(market_data):
-    """Build {ticker: [(utc_ts_seconds, ct_dt, bid, ask, theo_bid, theo_ask, deribit_bid_iv, deribit_ask_iv), ...]}."""
+    """Build {ticker: [(utc_ts_seconds, ct_dt, bid, ask, theo_bid, theo_ask,
+                        deribit_bid_iv, deribit_ask_iv,
+                        theo_bid_weekly, theo_ask_weekly,
+                        deribit_bid_iv_weekly, deribit_ask_iv_weekly), ...]}."""
     result = {}
-    for ts_str, ticker, bid, ask, theo_bid, theo_ask, db_bid_iv, db_ask_iv in market_data:
+    for row in market_data:
+        ts_str, ticker = row[0], row[1]
+        bid, ask = row[2] or 0, row[3] or 0
+        theo_bid, theo_ask = row[4] or 0, row[5] or 0
+        db_bid_iv, db_ask_iv = row[6] or 0, row[7] or 0
+        theo_bid_w = row[8] or 0 if len(row) > 8 else 0
+        theo_ask_w = row[9] or 0 if len(row) > 9 else 0
+        db_bid_iv_w = row[10] or 0 if len(row) > 10 else 0
+        db_ask_iv_w = row[11] or 0 if len(row) > 11 else 0
         dt_utc = parse_ts(ts_str)
         dt_ct = to_ct(dt_utc)
         utc_s = dt_utc.timestamp()
         if ticker not in result:
             result[ticker] = []
-        result[ticker].append((utc_s, dt_ct, bid or 0, ask or 0, theo_bid or 0, theo_ask or 0, db_bid_iv or 0, db_ask_iv or 0))
+        result[ticker].append((utc_s, dt_ct, bid, ask, theo_bid, theo_ask,
+                               db_bid_iv, db_ask_iv,
+                               theo_bid_w, theo_ask_w, db_bid_iv_w, db_ask_iv_w))
     return result
 
 
@@ -329,7 +350,8 @@ def compute_markouts(fills, market_by_ticker, event, strike_filter,
 
     result = {iv: [] for iv in intervals}
 
-    for ts_str, ticker, action, side, count, price in filtered:
+    for row in filtered:
+        ts_str, ticker, action, side, count, price = row[:6]
         dt_utc = parse_ts(ts_str)
         fill_utc_s = dt_utc.timestamp()
         fill_ct = to_ct(dt_utc)
@@ -383,7 +405,8 @@ def compute_markouts(fills, market_by_ticker, event, strike_filter,
 
 def get_strike_trade_counts(fills):
     counts = {}
-    for _, ticker, _, _, _, _ in fills:
+    for row in fills:
+        _, ticker = row[0], row[1]
         strike = ticker.split("-T")[1] if "-T" in ticker else ""
         if strike:
             counts[strike] = counts.get(strike, 0) + 1
@@ -391,31 +414,46 @@ def get_strike_trade_counts(fills):
 
 
 def tag_init_flatten(fills):
-    """Tag each fill as 'init' or 'flatten' based on position tracking.
+    """Tag each fill as 'init' or 'flatten'.
 
-    A fill that increases absolute position is 'init'.
-    A fill that decreases absolute position is 'flatten'.
+    Uses client_order_id prefix ('init_' or 'flat_') when available.
+    Falls back to position tracking: increases absolute position = 'init',
+    decreases = 'flatten'.
     Returns list of tags parallel to fills.
     """
     position = {}  # ticker -> net position
     tags = []
-    for ts_str, ticker, action, side, count, price in fills:
+    for row in fills:
+        ts_str, ticker, action, side, count, price = row[:6]
+        client_order_id = row[6] if len(row) > 6 else None
+
+        # Use client_order_id tag if available
+        if client_order_id and client_order_id.startswith("init_"):
+            tag = "init"
+        elif client_order_id and client_order_id.startswith("flat_"):
+            tag = "flatten"
+        else:
+            # Fallback: infer from position change
+            if count == 0:
+                count = 1
+            if (action == "buy" and side == "yes") or (action == "sell" and side == "no"):
+                direction = 1
+            else:
+                direction = -1
+            prev_pos = position.get(ticker, 0)
+            new_pos = prev_pos + direction * count
+            tag = "init" if abs(new_pos) > abs(prev_pos) else "flatten"
+
+        # Track position regardless of tagging method
         if count == 0:
             count = 1
         if (action == "buy" and side == "yes") or (action == "sell" and side == "no"):
             direction = 1
         else:
             direction = -1
+        position[ticker] = position.get(ticker, 0) + direction * count
 
-        prev_pos = position.get(ticker, 0)
-        new_pos = prev_pos + direction * count
-
-        if abs(new_pos) > abs(prev_pos):
-            tags.append("init")
-        else:
-            tags.append("flatten")
-
-        position[ticker] = new_pos
+        tags.append(tag)
     return tags
 
 
@@ -426,9 +464,11 @@ STRIKE_COLORS = [
 
 MARKOUT_COLORS = {
     5: "#3b82f6",   # blue
-    10: "#a855f7",  # purple
     30: "#ec4899",  # pink
     60: "#f59e0b",  # amber
+    120: "#14b8a6", # teal
+    300: "#22c55e", # green
+    600: "#a855f7", # purple
 }
 
 app = Dash(__name__)
@@ -458,6 +498,18 @@ app.layout = html.Div(
                 value=[],
                 style={"color": "#c8cdd5", "fontSize": "13px"},
                 inputStyle={"marginRight": "5px"},
+            ),
+            html.Span("", style={"width": "20px"}),
+            html.Label("Theo:", style={"color": "#c8cdd5", "marginRight": "6px", "fontSize": "13px"}),
+            dcc.RadioItems(
+                id="theo-source",
+                options=[
+                    {"label": " Daily IV", "value": "daily"},
+                    {"label": " Weekly IV", "value": "weekly"},
+                ],
+                value="daily",
+                style={"color": "#c8cdd5", "fontSize": "13px", "display": "flex", "gap": "12px"},
+                inputStyle={"marginRight": "4px"},
             ),
             html.Span(id="last-refresh",
                        style={"color": "#5a6270", "fontSize": "11px",
@@ -565,9 +617,10 @@ def load_event(event, _n):
      Output("fill-graph", "style")],
     [Input("strike-dropdown", "value"),
      Input("data-store", "data"),
-     Input("init-only-check", "value")],
+     Input("init-only-check", "value"),
+     Input("theo-source", "value")],
 )
-def update_graph(selected_strike, data, init_only_check):
+def update_graph(selected_strike, data, init_only_check, theo_source):
     if not data:
         fig = go.Figure()
         fig.update_layout(
@@ -588,6 +641,13 @@ def update_graph(selected_strike, data, init_only_check):
     market_data = data["market"]
     market_by_ticker = build_market_by_ticker(market_data)
 
+    # Theo column indices based on source selection
+    use_weekly = (theo_source == "weekly")
+    _tb = 8 if use_weekly else 4   # theo_bid index
+    _ta = 9 if use_weekly else 5   # theo_ask index
+    _ib = 10 if use_weekly else 6  # deribit_bid_iv index
+    _ia = 11 if use_weekly else 7  # deribit_ask_iv index
+
     init_only = "init" in (init_only_check or [])
 
     # Tag fills as init/flatten and filter if checkbox is checked
@@ -601,25 +661,35 @@ def update_graph(selected_strike, data, init_only_check):
     single_strike = selected_strike and selected_strike != "ALL"
 
     if single_strike:
-        # 11 rows: market+fills, PnL, 4x markouts, market vs theo, deribit IV, theo-bid spread, theo-ask spread, spot
-        n_rows = 11
+        # 13 rows: market+fills, PnL, 6x markouts, market vs theo, deribit IV, theo-bid spread, theo-ask spread, spot
+        n_markouts = len(MARKOUT_INTERVALS)
+        markout_titles = []
+        for iv in MARKOUT_INTERVALS:
+            markout_titles.append(f"Markout {iv}s" if iv < 60 else f"Markout {iv // 60}m")
+        n_rows = 7 + n_markouts  # fills, pnl, markouts, mkt vs theo, deribit IV, bid spread, ask spread, spot
+        markout_heights = [0.04] * n_markouts
+        row_heights = [0.12, 0.04] + markout_heights + [0.12, 0.10, 0.10, 0.10, 0.12]
+        # Normalize
+        total = sum(row_heights)
+        row_heights = [h / total for h in row_heights]
+        iv_label = "Weekly" if use_weekly else "Daily"
         fig = make_subplots(
             rows=n_rows, cols=1,
             shared_xaxes=True,
             vertical_spacing=0.02,
-            row_heights=[0.13, 0.05, 0.05, 0.05, 0.05, 0.05, 0.13, 0.12, 0.12, 0.12, 0.13],
+            row_heights=row_heights,
             subplot_titles=[
                 f"Market & Fills — ${float(selected_strike):,.0f}",
                 "Cumulative PnL",
-                "Markout 5s", "Markout 10s", "Markout 30s", "Markout 1m",
-                f"Market vs Theo — ${float(selected_strike):,.0f}",
-                f"Deribit IV — ${float(selected_strike):,.0f}",
-                f"Theo Bid − Market Bid (¢) — ${float(selected_strike):,.0f}",
-                f"Theo Ask − Market Ask (¢) — ${float(selected_strike):,.0f}",
+                *markout_titles,
+                f"Market vs Theo ({iv_label} IV) — ${float(selected_strike):,.0f}",
+                f"Deribit {iv_label} IV — ${float(selected_strike):,.0f}",
+                f"Theo Bid − Market Bid (¢) ({iv_label}) — ${float(selected_strike):,.0f}",
+                f"Theo Ask − Market Ask (¢) ({iv_label}) — ${float(selected_strike):,.0f}",
                 "Spot (BTC)",
             ],
         )
-        graph_height = "2900px"
+        graph_height = "3400px"
     else:
         n_rows = 2
         fig = make_subplots(
@@ -642,7 +712,8 @@ def update_graph(selected_strike, data, init_only_check):
     buy_times, buy_prices, buy_texts = [], [], []
     sell_times, sell_prices, sell_texts = [], [], []
 
-    for ts_str, ticker, action, side, count, price in filtered:
+    for row in filtered:
+        ts_str, ticker, action, side, count, price = row[:6]
         dt = to_ct(parse_ts(ts_str))
         strike = ticker.split("-T")[1] if "-T" in ticker else ""
         label = f"${float(strike):,.0f}" if strike else ticker
@@ -715,9 +786,10 @@ def update_graph(selected_strike, data, init_only_check):
                 # Color markers by sign: green positive, red negative
                 colors = ["#22c55e" if v >= 0 else "#ef4444" for v in values]
 
+                iv_label = f"{iv}s" if iv < 60 else f"{iv // 60}m"
                 fig.add_trace(go.Bar(
                     x=times, y=values,
-                    name=f"{iv}s Markout",
+                    name=f"{iv_label} Markout",
                     marker=dict(color=colors, opacity=1.0,
                                 line=dict(width=1, color=colors)),
                     text=hovers, hoverinfo="text",
@@ -752,28 +824,35 @@ def update_graph(selected_strike, data, init_only_check):
                           line_color="#5a6270", line_width=0.5)
             fig.update_yaxes(title_text="¢", gridcolor="#1e2736", row=row, col=1)
 
-        # Market vs Theo on row 7
+        # Dynamic row offsets after markouts
+        _r_mkt_theo = 3 + n_markouts      # market vs theo
+        _r_iv = _r_mkt_theo + 1            # deribit IV
+        _r_bid_spread = _r_iv + 1          # theo bid - mkt bid
+        _r_ask_spread = _r_bid_spread + 1  # theo ask - mkt ask
+        _r_spot = _r_ask_spread + 1        # spot
+
+        # Market vs Theo
         ticker_key_theo = f"{event}-T{selected_strike}"
         mkt_theo = market_by_ticker.get(ticker_key_theo, [])
         if mkt_theo:
             mkt_times_ct = [m[1] for m in mkt_theo]
             mkt_bids = [m[2] for m in mkt_theo]
             mkt_asks = [m[3] for m in mkt_theo]
-            theo_bids = [m[4] for m in mkt_theo]
-            theo_asks = [m[5] for m in mkt_theo]
+            theo_bids = [m[_tb] for m in mkt_theo]
+            theo_asks = [m[_ta] for m in mkt_theo]
 
             fig.add_trace(go.Scatter(
                 x=mkt_times_ct, y=mkt_bids,
                 mode="lines", name="Market Bid",
                 line=dict(color="#2e7d32", width=1.5), opacity=0.6,
                 legendgroup="mkt_theo",
-            ), row=7, col=1)
+            ), row=_r_mkt_theo, col=1)
             fig.add_trace(go.Scatter(
                 x=mkt_times_ct, y=mkt_asks,
                 mode="lines", name="Market Ask",
                 line=dict(color="#c62828", width=1.5), opacity=0.6,
                 legendgroup="mkt_theo",
-            ), row=7, col=1)
+            ), row=_r_mkt_theo, col=1)
 
             theo_bid_t = [(t, b) for t, b in zip(mkt_times_ct, theo_bids) if b > 0]
             theo_ask_t = [(t, a) for t, a in zip(mkt_times_ct, theo_asks) if a > 0]
@@ -785,7 +864,7 @@ def update_graph(selected_strike, data, init_only_check):
                     mode="lines", name="Theo Bid",
                     line=dict(color="#66bb6a", width=2, dash="dash"),
                     legendgroup="mkt_theo",
-                ), row=7, col=1)
+                ), row=_r_mkt_theo, col=1)
             if theo_ask_t:
                 fig.add_trace(go.Scatter(
                     x=[p[0] for p in theo_ask_t],
@@ -793,7 +872,7 @@ def update_graph(selected_strike, data, init_only_check):
                     mode="lines", name="Theo Ask",
                     line=dict(color="#ef5350", width=2, dash="dash"),
                     legendgroup="mkt_theo",
-                ), row=7, col=1)
+                ), row=_r_mkt_theo, col=1)
 
         # Fills on row 7
         if buy_times:
@@ -803,7 +882,7 @@ def update_graph(selected_strike, data, init_only_check):
                             line=dict(width=1, color="#ffffff")),
                 text=buy_texts, hoverinfo="text",
                 showlegend=False, legendgroup="mkt_theo",
-            ), row=7, col=1)
+            ), row=_r_mkt_theo, col=1)
         if sell_times:
             fig.add_trace(go.Scatter(
                 x=sell_times, y=sell_prices, mode="markers", name="Sell",
@@ -811,17 +890,17 @@ def update_graph(selected_strike, data, init_only_check):
                             line=dict(width=1, color="#ffffff")),
                 text=sell_texts, hoverinfo="text",
                 showlegend=False, legendgroup="mkt_theo",
-            ), row=7, col=1)
+            ), row=_r_mkt_theo, col=1)
 
-        fig.update_yaxes(title_text="Price ($)", gridcolor="#1e2736", row=7, col=1)
+        fig.update_yaxes(title_text="Price ($)", gridcolor="#1e2736", row=_r_mkt_theo, col=1)
 
         # Deribit IV on row 8
         ticker_key_iv = f"{event}-T{selected_strike}"
         mkt_iv = market_by_ticker.get(ticker_key_iv, [])
         if mkt_iv:
             iv_times = [m[1] for m in mkt_iv]
-            bid_ivs = [m[6] * 100 for m in mkt_iv]  # convert to percentage
-            ask_ivs = [m[7] * 100 for m in mkt_iv]
+            bid_ivs = [m[_ib] * 100 for m in mkt_iv]  # convert to percentage
+            ask_ivs = [m[_ia] * 100 for m in mkt_iv]
 
             # Filter out zero values for cleaner plot
             bid_iv_pts = [(t, v) for t, v in zip(iv_times, bid_ivs) if v > 0]
@@ -833,16 +912,16 @@ def update_graph(selected_strike, data, init_only_check):
                     y=[p[1] for p in bid_iv_pts],
                     mode="lines", name="Deribit Bid IV",
                     line=dict(color="#22c55e", width=1.5),
-                ), row=8, col=1)
+                ), row=_r_iv, col=1)
             if ask_iv_pts:
                 fig.add_trace(go.Scatter(
                     x=[p[0] for p in ask_iv_pts],
                     y=[p[1] for p in ask_iv_pts],
                     mode="lines", name="Deribit Ask IV",
                     line=dict(color="#ef4444", width=1.5),
-                ), row=8, col=1)
+                ), row=_r_iv, col=1)
 
-        fig.update_yaxes(title_text="IV (%)", gridcolor="#1e2736", row=8, col=1)
+        fig.update_yaxes(title_text="IV (%)", gridcolor="#1e2736", row=_r_iv, col=1)
 
         # Theo Bid − Market Bid on row 9
         ticker_key_spread = f"{event}-T{selected_strike}"
@@ -852,7 +931,7 @@ def update_graph(selected_strike, data, init_only_check):
             ask_spread_times, ask_spread_vals = [], []
             for m in mkt_spread:
                 mkt_bid, mkt_ask = m[2], m[3]
-                tb, ta = m[4], m[5]
+                tb, ta = m[_tb], m[_ta]
                 if mkt_bid > 0 and tb > 0:
                     bid_spread_times.append(m[1])
                     bid_spread_vals.append((tb - mkt_bid) * 100)
@@ -865,7 +944,7 @@ def update_graph(selected_strike, data, init_only_check):
                     x=bid_spread_times, y=bid_spread_vals,
                     mode="lines", name="Theo Bid − Mkt Bid",
                     line=dict(color="#22c55e", width=1.5),
-                ), row=9, col=1)
+                ), row=_r_bid_spread, col=1)
 
             # Theo Ask − Market Ask on row 10
             if ask_spread_times:
@@ -873,14 +952,14 @@ def update_graph(selected_strike, data, init_only_check):
                     x=ask_spread_times, y=ask_spread_vals,
                     mode="lines", name="Theo Ask − Mkt Ask",
                     line=dict(color="#ef4444", width=1.5),
-                ), row=10, col=1)
+                ), row=_r_ask_spread, col=1)
 
-        fig.add_hline(y=0, row=9, col=1, line_dash="dash",
+        fig.add_hline(y=0, row=_r_bid_spread, col=1, line_dash="dash",
                       line_color="#5a6270", line_width=0.5)
-        fig.update_yaxes(title_text="¢", gridcolor="#1e2736", row=9, col=1)
-        fig.add_hline(y=0, row=10, col=1, line_dash="dash",
+        fig.update_yaxes(title_text="¢", gridcolor="#1e2736", row=_r_bid_spread, col=1)
+        fig.add_hline(y=0, row=_r_ask_spread, col=1, line_dash="dash",
                       line_color="#5a6270", line_width=0.5)
-        fig.update_yaxes(title_text="¢", gridcolor="#1e2736", row=10, col=1)
+        fig.update_yaxes(title_text="¢", gridcolor="#1e2736", row=_r_ask_spread, col=1)
 
         # Spot on row 11
         if spot_times:
@@ -888,12 +967,12 @@ def update_graph(selected_strike, data, init_only_check):
                 x=spot_times, y=spot_prices,
                 mode="lines", name="Spot (BTC)",
                 line=dict(color="#5a6270", width=1),
-            ), row=11, col=1)
+            ), row=_r_spot, col=1)
 
         fig.update_yaxes(title_text="Price ($)", gridcolor="#1e2736", row=1, col=1)
         fig.update_yaxes(title_text="PnL ($)", gridcolor="#1e2736", row=2, col=1)
-        fig.update_yaxes(title_text="Spot ($)", gridcolor="#1e2736", row=11, col=1)
-        fig.update_xaxes(title_text="Time (CT)", gridcolor="#1e2736", row=11, col=1)
+        fig.update_yaxes(title_text="Spot ($)", gridcolor="#1e2736", row=_r_spot, col=1)
+        fig.update_xaxes(title_text="Time (CT)", gridcolor="#1e2736", row=_r_spot, col=1)
 
     else:
         # All mode
@@ -919,7 +998,8 @@ def update_graph(selected_strike, data, init_only_check):
 
         all_times_pnl = []
         running = {}
-        for ts_str, ticker, action, side, count, price in fills:
+        for row in fills:
+            ts_str, ticker, action, side, count, price = row[:6]
             strike = ticker.split("-T")[1] if "-T" in ticker else ticker
             dt = to_ct(parse_ts(ts_str))
             if strike in pnl_series:
@@ -986,11 +1066,16 @@ def update_graph(selected_strike, data, init_only_check):
     Output("window-stats", "children"),
     [Input("fill-graph", "relayoutData")],
     [State("data-store", "data"),
-     State("strike-dropdown", "value")],
+     State("strike-dropdown", "value"),
+     State("theo-source", "value")],
 )
-def update_window_stats(relayout_data, data, selected_strike):
+def update_window_stats(relayout_data, data, selected_strike, theo_source):
     if not data or not selected_strike or selected_strike == "ALL":
         return ""
+
+    use_weekly = (theo_source == "weekly")
+    _tb = 8 if use_weekly else 4
+    _ta = 9 if use_weekly else 5
 
     event = data["event"]
     market_data = data["market"]
@@ -1046,7 +1131,7 @@ def update_window_stats(relayout_data, data, selected_strike):
     ask_spread_vals = []
     for m in filtered_mkt:
         mkt_bid, mkt_ask = m[2], m[3]
-        tb, ta = m[4], m[5]
+        tb, ta = m[_tb], m[_ta]
         if mkt_bid > 0 and tb > 0:
             bid_spread_vals.append((tb - mkt_bid) * 100)
         if mkt_ask > 0 and ta > 0:
@@ -1056,8 +1141,8 @@ def update_window_stats(relayout_data, data, selected_strike):
     avg_ask_spread = sum(ask_spread_vals) / len(ask_spread_vals) if ask_spread_vals else 0
 
     # Compute lead-lag correlation per side
-    ll_bid = compute_lead_lag(filtered_mkt, side="bid")
-    ll_ask = compute_lead_lag(filtered_mkt, side="ask")
+    ll_bid = compute_lead_lag(filtered_mkt, side="bid", theo_bid_idx=_tb, theo_ask_idx=_ta)
+    ll_ask = compute_lead_lag(filtered_mkt, side="ask", theo_bid_idx=_tb, theo_ask_idx=_ta)
 
     # Build display
     def corr_color(c):
@@ -1135,8 +1220,8 @@ def update_window_stats(relayout_data, data, selected_strike):
     )
 
     # Edge magnitude
-    mag_bid = compute_edge_magnitude(filtered_mkt, side="bid")
-    mag_ask = compute_edge_magnitude(filtered_mkt, side="ask")
+    mag_bid = compute_edge_magnitude(filtered_mkt, side="bid", theo_bid_idx=_tb, theo_ask_idx=_ta)
+    mag_ask = compute_edge_magnitude(filtered_mkt, side="ask", theo_bid_idx=_tb, theo_ask_idx=_ta)
 
     stats_children.append(html.Br())
     stats_children.append(html.Br())
@@ -1183,16 +1268,20 @@ def update_window_stats(relayout_data, data, selected_strike):
      Output("ll-strike-graph", "style")],
     [Input("fill-graph", "relayoutData"),
      Input("strike-dropdown", "value"),
-     Input("data-store", "data")],
+     Input("data-store", "data"),
+     Input("theo-source", "value")],
 )
-def update_ll_strike_graph(relayout_data, selected_strike, data):
+def update_ll_strike_graph(relayout_data, selected_strike, data, theo_source):
     hide = {"display": "none"}
     empty_fig = go.Figure()
 
     if not data or not selected_strike or selected_strike != "ALL":
         return empty_fig, hide
 
-    event = data["event"]
+    use_weekly = (theo_source == "weekly")
+    _tb = 8 if use_weekly else 4
+    _ta = 9 if use_weekly else 5
+
     market_data = data["market"]
     market_by_ticker = build_market_by_ticker(market_data)
 
@@ -1241,8 +1330,8 @@ def update_ll_strike_graph(relayout_data, selected_strike, data):
         if len(filtered) < 20:
             continue
 
-        ll_bid = compute_lead_lag(filtered, side="bid")
-        ll_ask = compute_lead_lag(filtered, side="ask")
+        ll_bid = compute_lead_lag(filtered, side="bid", theo_bid_idx=_tb, theo_ask_idx=_ta)
+        ll_ask = compute_lead_lag(filtered, side="ask", theo_bid_idx=_tb, theo_ask_idx=_ta)
 
         strikes.append(strike_val)
         for iv in LEAD_LAG_INTERVALS:

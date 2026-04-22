@@ -40,6 +40,7 @@ class KalshiWsFeed:
         self._thread = None
         self._loop = None
         self._running = False
+        self.last_update_ts: float = 0.0  # timestamp of last data received
 
         # Local orderbook state per ticker:
         # { ticker: { "yes_levels": {price: qty}, "no_levels": {price: qty} } }
@@ -107,21 +108,29 @@ class KalshiWsFeed:
             pass
 
     def _run_loop(self):
-        """Entry point for the background thread. Creates its own event loop."""
+        """Entry point for the background thread. Creates its own event loop.
+        Reconnects on disconnect with exponential backoff."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        reconnect_delay = 2
+        while self._running:
+            try:
+                self._loop.run_until_complete(self._connect_and_listen())
+            except RuntimeError:
+                # "Event loop stopped before Future completed" — safe to ignore on shutdown
+                break
+            except Exception as e:
+                print(f"[WS] Loop error: {e}")
+            if not self._running:
+                break
+            print(f"[WS] Disconnected, reconnecting in {reconnect_delay}s...")
+            import time
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
         try:
-            self._loop.run_until_complete(self._connect_and_listen())
-        except RuntimeError:
-            # "Event loop stopped before Future completed" — safe to ignore on shutdown
-            pass
+            self._loop.close()
         except Exception:
             pass
-        finally:
-            try:
-                self._loop.close()
-            except Exception:
-                pass
 
     async def _connect_and_listen(self):
         """Connect to Kalshi WS, subscribe to all tickers, and process messages."""
@@ -158,6 +167,9 @@ class KalshiWsFeed:
         for ticker in self._tickers:
             self.books[ticker] = {"yes_levels": {}, "no_levels": {}}
 
+        # --- Start staleness monitor ---
+        stale_task = asyncio.ensure_future(self._stale_monitor())
+
         # --- Message loop ---
         try:
             async for message in self.ws:
@@ -170,14 +182,33 @@ class KalshiWsFeed:
         except Exception:
             pass
         finally:
+            stale_task.cancel()
             # Always clean up — use try/except since ws might already be closed
             try:
                 await self.ws.close()
             except Exception:
                 pass
 
+    async def _stale_monitor(self):
+        """Monitor for staleness — if no data for 30s, force reconnect."""
+        import time
+        _STALE_THRESHOLD = 30
+        while self._running:
+            await asyncio.sleep(5)
+            if self.last_update_ts > 0 and (time.time() - self.last_update_ts) > _STALE_THRESHOLD:
+                print(f"[WS] STALE — no data for {time.time() - self.last_update_ts:.0f}s, forcing reconnect")
+                self.last_update_ts = 0.0
+                if self.ws:
+                    try:
+                        await self.ws.close()
+                    except Exception:
+                        pass
+                break
+
     def _handle_message(self, data: dict):
         """Route incoming WS message to the appropriate handler."""
+        import time
+        self.last_update_ts = time.time()
         msg_type = data.get("type")
 
         if msg_type == "orderbook_snapshot":

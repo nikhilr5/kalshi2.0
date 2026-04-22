@@ -43,6 +43,7 @@ class CryptoPriceFeed:
         self.last_price = 0.0
         self.last_bid = 0.0
         self.last_ask = 0.0
+        self.last_update_ts: float = 0.0  # timestamp of last data received
 
         # Local orderbook — SortedDict for fast best bid/ask lookup
         # bids: price -> size (sorted ascending, best bid = last key)
@@ -68,10 +69,15 @@ class CryptoPriceFeed:
                 await self.ws.send(json.dumps(subscribe))
                 print(f"[Price] Connected, subscribing to level2+ticker for {self.product_id}")
 
+                # Start staleness monitor
+                stale_task = asyncio.ensure_future(self._stale_monitor())
+
                 async for message in self.ws:
                     if not self._running:
                         break
 
+                    import time as _time
+                    self.last_update_ts = _time.time()
                     data = json.loads(message)
                     msg_type = data.get("type")
 
@@ -99,6 +105,10 @@ class CryptoPriceFeed:
             except Exception as e:
                 print(f"[Price:{self.product_id}] Error: {e}")
             finally:
+                try:
+                    stale_task.cancel()
+                except Exception:
+                    pass
                 try:
                     if self.ws:
                         await self.ws.close()
@@ -163,6 +173,22 @@ class CryptoPriceFeed:
             self.on_price(price, self.last_bid, self.last_ask)
         except Exception as e:
             print(f"[Price] Callback error: {e}")
+
+    async def _stale_monitor(self):
+        """Force reconnect if no data for 15s (Coinbase normally updates many times/sec)."""
+        import time
+        _STALE_THRESHOLD = 15
+        while self._running:
+            await asyncio.sleep(5)
+            if self.last_update_ts > 0 and (time.time() - self.last_update_ts) > _STALE_THRESHOLD:
+                print(f"[Price] STALE — no data for {time.time() - self.last_update_ts:.0f}s, forcing reconnect")
+                self.last_update_ts = 0.0
+                if self.ws:
+                    try:
+                        await self.ws.close()
+                    except Exception:
+                        pass
+                break
 
     def start(self):
         """Start the price feed on a background thread."""

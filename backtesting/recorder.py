@@ -28,7 +28,7 @@ from btc_price_feed import CryptoPriceFeed
 from ws_feed import KalshiWsFeed
 from deribit_vol import (
     DeribitBracketPricer, DeribitWsFeed, find_deribit_expiry,
-    KALSHI_TO_DERIBIT_CURRENCY,
+    find_weekly_deribit_expiry, KALSHI_TO_DERIBIT_CURRENCY,
 )
 from db import RecorderDB
 
@@ -38,6 +38,7 @@ COINBASE_PRODUCT = "BTC-USD"
 DERIBIT_CURRENCY = "BTC"
 OTM_FILTER_PCT = 8.0
 SNAPSHOT_INTERVAL = 5  # seconds
+STALE_THRESHOLD = 30  # seconds — feeds stale after this long with no data
 
 
 class Recorder:
@@ -62,6 +63,11 @@ class Recorder:
         # {event_close_time: deribit_expiry_str} — maps each event's close to its Deribit expiry
         self.close_to_expiry = {}
 
+        # Weekly (Friday) Deribit pricer — used for all daily events as alternative theo
+        self.weekly_pricer = None       # DeribitBracketPricer
+        self.weekly_deribit_feed = None # DeribitWsFeed
+        self.weekly_expiry_str = None   # e.g. "25APR26"
+
         # Markets we're tracking: {ticker: {display_strike, event_ticker, close_time}}
         self.tracked = {}
 
@@ -80,6 +86,38 @@ class Recorder:
         if expiry and expiry in self.pricers:
             return self.pricers[expiry]
         return None
+
+    def _start_weekly_deribit(self):
+        """Start a Deribit pricer + WS for the nearest Friday expiry (weekly)."""
+        expiry_str = find_weekly_deribit_expiry(DERIBIT_CURRENCY)
+        if not expiry_str:
+            print("[Recorder] No weekly (Friday) Deribit expiry found")
+            return
+        if expiry_str == self.weekly_expiry_str and self.weekly_pricer:
+            return  # already connected
+
+        # If the weekly expiry is the same as an existing per-event pricer, reuse it
+        if expiry_str in self.pricers:
+            self.weekly_pricer = self.pricers[expiry_str]
+            self.weekly_expiry_str = expiry_str
+            print(f"[Recorder] Weekly pricer reusing existing {expiry_str}")
+            return
+
+        self.weekly_expiry_str = expiry_str
+        pricer = DeribitBracketPricer()
+        pricer.currency = DERIBIT_CURRENCY
+        pricer.risk_free_rate = 0.043
+        self.weekly_pricer = pricer
+
+        print(f"[Recorder] Discovering weekly Deribit {expiry_str}...")
+        instruments = pricer.discover_instruments(expiry_str)
+        if instruments:
+            feed = DeribitWsFeed(pricer, self._on_deribit_update)
+            feed.start(instruments)
+            self.weekly_deribit_feed = feed
+            print(f"[Recorder] Weekly Deribit WS started for {expiry_str}: {len(instruments)} options")
+        else:
+            print(f"[Recorder] No weekly Deribit instruments found for {expiry_str}")
 
     def _start_deribit_for_expiry(self, close_time: str):
         """Start a Deribit pricer + WS feed for a given event close_time if not already running."""
@@ -168,8 +206,7 @@ class Recorder:
         # Start Kalshi WS feed
         tickers = list(self.tracked.keys())
         if tickers:
-            self.ws_feed = KalshiWsFeed(self.api, self._on_ws_update,
-                                         on_fill=self._on_fill)
+            self.ws_feed = KalshiWsFeed(self.api, self._on_ws_update)
             self.ws_feed.start(tickers)
             print(f"[Recorder] Kalshi WS started for {len(tickers)} tickers")
 
@@ -177,6 +214,9 @@ class Recorder:
         close_times = set(info["close_time"] for info in self.tracked.values() if info["close_time"])
         for ct in sorted(close_times):
             self._start_deribit_for_expiry(ct)
+
+        # Start weekly (Friday) Deribit feed for alternative theo
+        self._start_weekly_deribit()
 
         # Log session
         series_str = "+".join(SERIES_LIST)
@@ -227,11 +267,14 @@ class Recorder:
             ticker = f.get("ticker", "")
             action = f.get("action", "")
             side = f.get("side", "yes")
-            # Skip 'no' side — same trade appears as both yes and no
-            if side == "no":
-                continue
-            count = int(float(f.get("count_fp", f.get("count", 0))))
+            count = float(f.get("count_fp", f.get("count", 0)))
             price = float(f.get("yes_price_dollars", 0) or f.get("yes_price", 0) or 0)
+
+            # Normalize to yes terms: no-side buy→sell, no-side sell→buy
+            if side == "no":
+                action = "sell" if action == "buy" else "buy"
+                side = "yes"
+            fee = float(f.get("fee_cost", 0) or 0)
 
             # Look up strike info
             info = self.tracked.get(ticker, {})
@@ -254,6 +297,24 @@ class Recorder:
                 deribit_bid_iv = pricer._find_closest_bid_iv(strike)
                 deribit_ask_iv = pricer._find_closest_ask_iv(strike)
 
+            # Weekly theo at fill time
+            theo_bid_w = 0.0
+            theo_ask_w = 0.0
+            db_bid_iv_w = 0.0
+            db_ask_iv_w = 0.0
+            wp = self.weekly_pricer
+            if strike > 0 and wp and wp.options and spot_b > 0:
+                wb_iv = wp._find_closest_bid_iv(strike)
+                wa_iv = wp._find_closest_ask_iv(strike)
+                if wb_iv > 0:
+                    theo_bid_w = wp.prob_above_with_iv(strike, wb_iv, spot=spot_b, kalshi_close_iso=close)
+                if wa_iv > 0:
+                    theo_ask_w = wp.prob_above_with_iv(strike, wa_iv, spot=spot_a, kalshi_close_iso=close)
+                db_bid_iv_w = wb_iv
+                db_ask_iv_w = wa_iv
+
+            client_order_id = f.get("client_order_id", "")
+
             self.db.insert_fill(
                 ticker=ticker, action=action, side=side,
                 count=count, price=price, strike=strike,
@@ -264,14 +325,60 @@ class Recorder:
                 kalshi_yes_ask=bk.get("yes_ask", 0),
                 deribit_bid_iv=deribit_bid_iv,
                 deribit_ask_iv=deribit_ask_iv,
+                client_order_id=client_order_id,
+                theo_bid_weekly=theo_bid_w, theo_ask_weekly=theo_ask_w,
+                deribit_bid_iv_weekly=db_bid_iv_w, deribit_ask_iv_weekly=db_ask_iv_w,
+                fee=fee,
             )
+            orig_side = f.get("side", "yes")
+            tag = "init" if client_order_id.startswith("init_") else \
+                  "flat" if client_order_id.startswith("flat_") else "?"
+            fee_str = f" fee=${fee:.2f}" if fee > 0 else ""
+            norm_str = f" (from {orig_side})" if orig_side == "no" else ""
             print(f"[Recorder] FILL (REST): {ticker} {action} {side} x{count} "
-                  f"@ ${price:.2f} (theo={theo_bid:.3f}/{theo_ask:.3f})")
+                  f"@ ${price:.2f} [{tag}]{fee_str}{norm_str} (theo={theo_bid:.3f}/{theo_ask:.3f} "
+                  f"wk={theo_bid_w:.3f}/{theo_ask_w:.3f})")
+
+    def _check_staleness(self):
+        """Check all feeds for staleness. Log warnings and reconnect if needed."""
+        now = time.time()
+        stale_feeds = []
+
+        # Check Coinbase price feed
+        if self.price_feed and self.price_feed.last_update_ts > 0:
+            age = now - self.price_feed.last_update_ts
+            if age > STALE_THRESHOLD:
+                stale_feeds.append(f"Coinbase ({age:.0f}s)")
+
+        # Check Kalshi WS feed
+        if self.ws_feed and self.ws_feed.last_update_ts > 0:
+            age = now - self.ws_feed.last_update_ts
+            if age > STALE_THRESHOLD:
+                stale_feeds.append(f"Kalshi WS ({age:.0f}s)")
+
+        # Check per-expiry Deribit feeds
+        for exp_str, feed in self.deribit_feeds.items():
+            if feed.last_update_ts > 0:
+                age = now - feed.last_update_ts
+                if age > STALE_THRESHOLD:
+                    stale_feeds.append(f"Deribit {exp_str} ({age:.0f}s)")
+
+        # Check weekly Deribit feed
+        if self.weekly_deribit_feed and self.weekly_deribit_feed.last_update_ts > 0:
+            age = now - self.weekly_deribit_feed.last_update_ts
+            if age > STALE_THRESHOLD:
+                stale_feeds.append(f"Deribit weekly ({age:.0f}s)")
+
+        if stale_feeds:
+            print(f"[Recorder] STALE feeds: {', '.join(stale_feeds)}")
+
+        return len(stale_feeds) > 0
 
     def _run_loop(self):
         last_snapshot = 0
         last_refilter = 0
         last_fill_poll = 0
+        last_stale_check = 0
 
         while self.running:
             time.sleep(0.5)
@@ -281,6 +388,11 @@ class Recorder:
             if now - last_fill_poll >= 5:
                 last_fill_poll = now
                 self._poll_fills()
+
+            # Check feed staleness every 15s
+            if now - last_stale_check >= 15:
+                last_stale_check = now
+                self._check_staleness()
 
             # Refilter markets every 60s as spot moves
             if now - last_refilter >= 60:
@@ -363,6 +475,9 @@ class Recorder:
             for ct in sorted(current_close_times):
                 self._start_deribit_for_expiry(ct)
 
+            # Refresh weekly Deribit if needed (e.g. crossed into new week)
+            self._start_weekly_deribit()
+
             # Clean up close_to_expiry for expired close times
             for ct in list(self.close_to_expiry.keys()):
                 if ct not in current_close_times:
@@ -416,6 +531,22 @@ class Recorder:
                 deribit_bid_iv = pricer._find_closest_bid_iv(disp)
                 deribit_ask_iv = pricer._find_closest_ask_iv(disp)
 
+            # Weekly theo: use weekly Deribit IVs but event's close_time for T
+            theo_bid_w = 0.0
+            theo_ask_w = 0.0
+            db_bid_iv_w = 0.0
+            db_ask_iv_w = 0.0
+            wp = self.weekly_pricer
+            if wp and wp.options and spot_b > 0 and spot_a > 0:
+                wb_iv = wp._find_closest_bid_iv(disp)
+                wa_iv = wp._find_closest_ask_iv(disp)
+                if wb_iv > 0:
+                    theo_bid_w = wp.prob_above_with_iv(disp, wb_iv, spot=spot_b, kalshi_close_iso=close)
+                if wa_iv > 0:
+                    theo_ask_w = wp.prob_above_with_iv(disp, wa_iv, spot=spot_a, kalshi_close_iso=close)
+                db_bid_iv_w = wb_iv
+                db_ask_iv_w = wa_iv
+
             self.theos[ticker] = (theo_bid, theo_ask)
 
             otm_pct = (disp - spot_mid) / spot_mid * 100 if spot_mid > 0 else 0
@@ -440,6 +571,10 @@ class Recorder:
                 "otm_pct": otm_pct,
                 "edge_bid": yes_bid - theo_ask if yes_bid > 0 and theo_ask > 0 else 0,
                 "edge_ask": theo_bid - yes_ask if theo_bid > 0 and yes_ask > 0 else 0,
+                "theo_bid_weekly": theo_bid_w,
+                "theo_ask_weekly": theo_ask_w,
+                "deribit_bid_iv_weekly": db_bid_iv_w,
+                "deribit_ask_iv_weekly": db_ask_iv_w,
             })
 
         self.db.insert_snapshots(rows)
@@ -491,6 +626,22 @@ class Recorder:
             deribit_bid_iv = pricer._find_closest_bid_iv(strike)
             deribit_ask_iv = pricer._find_closest_ask_iv(strike)
 
+        # Weekly theo at fill time
+        theo_bid_w = 0.0
+        theo_ask_w = 0.0
+        db_bid_iv_w = 0.0
+        db_ask_iv_w = 0.0
+        wp = self.weekly_pricer
+        if strike > 0 and wp and wp.options and spot_b > 0:
+            wb_iv = wp._find_closest_bid_iv(strike)
+            wa_iv = wp._find_closest_ask_iv(strike)
+            if wb_iv > 0:
+                theo_bid_w = wp.prob_above_with_iv(strike, wb_iv, spot=spot_b, kalshi_close_iso=close)
+            if wa_iv > 0:
+                theo_ask_w = wp.prob_above_with_iv(strike, wa_iv, spot=spot_a, kalshi_close_iso=close)
+            db_bid_iv_w = wb_iv
+            db_ask_iv_w = wa_iv
+
         self.db.insert_fill(
             ticker=ticker, action=action, side=side,
             count=count, price=price, strike=strike,
@@ -501,9 +652,11 @@ class Recorder:
             kalshi_yes_ask=bk.get("yes_ask", 0),
             deribit_bid_iv=deribit_bid_iv,
             deribit_ask_iv=deribit_ask_iv,
+            theo_bid_weekly=theo_bid_w, theo_ask_weekly=theo_ask_w,
+            deribit_bid_iv_weekly=db_bid_iv_w, deribit_ask_iv_weekly=db_ask_iv_w,
         )
         print(f"[Recorder] FILL: {ticker} {action} {side} x{count} @ ${price:.2f} "
-              f"(theo={theo_bid:.3f}/{theo_ask:.3f})")
+              f"(theo={theo_bid:.3f}/{theo_ask:.3f} wk={theo_bid_w:.3f}/{theo_ask_w:.3f})")
 
     def _on_deribit_update(self):
         """Deribit data refreshed — theos will update on next snapshot."""
@@ -516,6 +669,8 @@ class Recorder:
             self.price_feed.stop()
         if self.ws_feed:
             self.ws_feed.stop()
+        if self.weekly_deribit_feed:
+            self.weekly_deribit_feed.stop()
         for exp_str, feed in self.deribit_feeds.items():
             feed.stop()
         self.deribit_feeds.clear()

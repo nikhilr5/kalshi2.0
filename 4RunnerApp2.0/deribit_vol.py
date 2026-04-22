@@ -38,6 +38,7 @@ Usage:
 
 import asyncio
 import json
+import time
 import threading
 import requests
 import websockets
@@ -204,6 +205,41 @@ def list_deribit_expiries(currency: str = "BTC") -> list[str]:
             expiries.add(parts[1])
 
     return sorted(expiries)
+
+
+def find_weekly_deribit_expiry(currency: str = "BTC") -> str | None:
+    """Find the nearest upcoming Friday Deribit expiry.
+
+    Returns expiry string like "25APR26", or None if not found.
+    """
+    _months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+               "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+    try:
+        available = list_deribit_expiries(currency)
+    except Exception:
+        return None
+
+    now = datetime.now(tz=timezone.utc).date()
+    best = None
+    best_date = None
+    for exp_str in available:
+        try:
+            for m_name, m_num in _months.items():
+                idx = exp_str.find(m_name)
+                if idx > 0:
+                    d = int(exp_str[:idx])
+                    y = 2000 + int(exp_str[idx + 3:])
+                    exp_date = datetime(y, m_num, d).date()
+                    if exp_date.weekday() != 4:  # Friday only
+                        break
+                    if exp_date >= now:
+                        if best_date is None or exp_date < best_date:
+                            best = exp_str
+                            best_date = exp_date
+                    break
+        except Exception:
+            continue
+    return best
 
 
 # =============================================================================
@@ -775,6 +811,7 @@ class DeribitWsFeed:
         self._running = False
         self._rebuild_pending = False
         self._msg_id = 1
+        self.last_update_ts: float = 0.0  # timestamp of last data received
 
     def start(self, instruments: list[str]):
         """Start WS connection on a background daemon thread."""
@@ -803,15 +840,21 @@ class DeribitWsFeed:
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._connect_and_listen())
-        except Exception as e:
-            print(f"[DeribitWS] Loop error: {e}")
-        finally:
+        reconnect_delay = 2
+        while self._running:
             try:
-                self._loop.close()
-            except Exception:
-                pass
+                self._loop.run_until_complete(self._connect_and_listen())
+            except Exception as e:
+                print(f"[DeribitWS] Loop error: {e}")
+            if not self._running:
+                break
+            print(f"[DeribitWS] Disconnected, reconnecting in {reconnect_delay}s...")
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)  # backoff up to 30s
+        try:
+            self._loop.close()
+        except Exception:
+            pass
 
     async def _connect_and_listen(self):
         try:
@@ -856,10 +899,22 @@ class DeribitWsFeed:
                 pass
 
     async def _rebuild_loop(self):
-        """Rebuild density every 2 seconds if new data arrived."""
+        """Rebuild density every 2 seconds if new data arrived.
+        Also monitors for staleness — if no data for 30s, force reconnect."""
         _log_counter = 0
+        _STALE_THRESHOLD = 30  # seconds with no data = stale
         while self._running:
             await asyncio.sleep(2)
+            # Check for staleness — force reconnect if no data received
+            if self.last_update_ts > 0 and (time.time() - self.last_update_ts) > _STALE_THRESHOLD:
+                print(f"[DeribitWS] STALE — no data for {time.time() - self.last_update_ts:.0f}s, forcing reconnect")
+                self.last_update_ts = 0.0  # reset so we don't spam
+                if self._ws:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                break  # exit rebuild loop → _connect_and_listen exits → outer loop reconnects
             if self._rebuild_pending:
                 self._rebuild_pending = False
                 self.pricer.rebuild_density()
@@ -895,6 +950,7 @@ class DeribitWsFeed:
 
         self.pricer.update_from_ticker(instrument, ticker_data)
         self._rebuild_pending = True
+        self.last_update_ts = time.time()
 
         # Track initial snapshot completion
         if not self._initial_done:

@@ -17,12 +17,14 @@ from cryptography.hazmat.primitives.asymmetric import padding
 class KalshiAPI:
     BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
     WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-    ACCESS_KEY = "2bc651e6-3882-4206-b539-93540910df06"
+    ACCESS_KEY = "73e2b386-6ca6-4ed8-beaf-f58404c6bba0"
     PRIVATE_KEY_PATH = Path.home() / "private_key.pem"
 
     def __init__(self):
         with open(self.PRIVATE_KEY_PATH, "rb") as f:
             self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+        self.on_rate_limit = None  # callback(remaining, limit, reset_ts)
+        self.rate_limited_until = 0  # timestamp when rate limit expires
 
     def _sign(self, timestamp_ms: int, method: str, path: str) -> str:
         """RSA-PSS signature of {timestamp}{method}{path}."""
@@ -53,11 +55,35 @@ class KalshiAPI:
             "KALSHI-ACCESS-TIMESTAMP": str(ts),
         }
 
+    def is_rate_limited(self) -> bool:
+        """Check if we're currently in a rate limit cooldown."""
+        return time.time() < self.rate_limited_until
+
+    def _check_rate_limit(self, resp):
+        """Check response for rate limit headers and 429 status."""
+        # Check headers (may or may not be present depending on Kalshi's API)
+        remaining = resp.headers.get("X-Ratelimit-Remaining") or resp.headers.get("Ratelimit-Remaining")
+        limit = resp.headers.get("X-Ratelimit-Limit") or resp.headers.get("Ratelimit-Limit")
+        reset = resp.headers.get("X-Ratelimit-Reset") or resp.headers.get("Ratelimit-Reset")
+        if remaining is not None and self.on_rate_limit:
+            try:
+                self.on_rate_limit(int(remaining), int(limit or 0), int(reset or 0))
+            except (ValueError, TypeError):
+                pass
+        if resp.status_code == 429:
+            # Back off for 10 seconds on rate limit
+            self.rate_limited_until = time.time() + 10
+            endpoint = f"{resp.request.method} {resp.request.path_url}"
+            if self.on_rate_limit:
+                self.on_rate_limit(0, int(limit or 0), int(reset or 0), endpoint=endpoint)
+            print(f"[API] RATE LIMITED on {endpoint} — backing off 10s")
+
     def _get(self, path: str, params: dict = None) -> dict:
         """GET request. path is relative e.g. /portfolio/balance."""
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("GET", full_path)
         resp = requests.get(f"{self.BASE_URL}{path}", headers=headers, params=params, timeout=10)
+        self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -66,6 +92,7 @@ class KalshiAPI:
         headers = self._headers("POST", full_path)
         print(f"[API POST] {path} body={body}")
         resp = requests.post(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        self._check_rate_limit(resp)
         if resp.status_code != 201:
             print(f"[API ERROR] {resp.status_code}: {resp.text}")
         resp.raise_for_status()
@@ -76,6 +103,7 @@ class KalshiAPI:
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("DELETE", full_path)
         resp = requests.delete(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -127,18 +155,21 @@ class KalshiAPI:
 
     def create_order(self, ticker: str, side: str, action: str,
                      price_dollars: str, count: int,
-                     time_in_force: str = "good_till_canceled") -> dict:
+                     time_in_force: str = "good_till_canceled",
+                     tag: str = "") -> dict:
         """Place a limit order.
         side='yes', action='sell' → sell YES at yes_price_dollars.
         time_in_force: 'good_till_canceled', 'immediate_or_cancel', or 'fill_or_kill'.
+        tag: optional prefix for client_order_id (e.g. 'init' or 'flat').
         """
+        prefix = f"{tag}_" if tag else ""
         body = {
             "ticker": ticker,
             "side": side,
             "action": action,
             "yes_price_dollars": price_dollars,
             "count": count,
-            "client_order_id": str(uuid.uuid4()),
+            "client_order_id": f"{prefix}{uuid.uuid4()}",
             "type": "limit",
             "time_in_force": time_in_force,
         }
