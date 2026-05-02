@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import NormalDist
 
+import numpy as np
+
 _norm = NormalDist()
 
 from PyQt6.QtWidgets import (
@@ -205,12 +207,12 @@ def implied_vol_from_prob(prob: float, S: float, K: float, T: float,
 
 
 class IVSmileWindow(QWidget):
-    """Separate window showing the Deribit IV smile + Kalshi implied IV chart."""
+    """Separate window showing the fitted vol smile curve + data points used."""
 
     def __init__(self, pricer, app_ref):
         super().__init__()
         self.pricer = pricer
-        self.app_ref = app_ref  # reference to main KalshiApp for market data
+        self.app_ref = app_ref
         self.setWindowTitle("IV Smile")
         self.resize(700, 450)
         self.setStyleSheet("background:#0b0f19;")
@@ -223,10 +225,10 @@ class IVSmileWindow(QWidget):
         self.canvas = FigureCanvas(self.fig)
         layout.addWidget(self.canvas)
 
-        # Refresh every 60s
+        # Refresh every 10s
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_chart)
-        self.timer.start(60_000)
+        self.timer.start(10_000)
 
         self.update_chart()
 
@@ -234,73 +236,85 @@ class IVSmileWindow(QWidget):
         ax = self.ax
         ax.clear()
 
-        # --- Deribit IV smile ---
-        opts = self.pricer.options
-        db_strikes = [o.strike for o in opts if o.mark_iv > 0]
-        db_ivs = [o.mark_iv * 100.0 for o in opts if o.mark_iv > 0]
-
-        if db_strikes:
-            ax.plot(db_strikes, db_ivs, color="#facc15", linewidth=1.5, marker="o",
-                    markersize=4, markerfacecolor="#facc15", label="Deribit IV")
-
-        # --- Kalshi implied IV ---
         app = self.app_ref
-        spot = app.spot_bid if app.spot_bid > 0 else app.spot_price
-        close_time = ""
+        spot = app.spot_price
+        if spot <= 0 or not app.display_strikes:
+            self.canvas.draw()
+            return
+
+        # Compute T
+        T = 0.0
         if app.current_event:
             close_time = app.current_event.get("close_time", "")
+            if close_time:
+                try:
+                    close_utc = datetime.fromisoformat(
+                        close_time.replace("Z", "+00:00"))
+                    T = max((close_utc - datetime.now(tz=timezone.utc)
+                             ).total_seconds() / (365.25 * 24 * 3600), 0.0)
+                except Exception:
+                    pass
+        if T <= 0:
+            self.canvas.draw()
+            return
 
-        T = 0.0
-        if close_time:
-            try:
-                close_utc = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-                now_utc = datetime.now(tz=timezone.utc)
-                T = max((close_utc - now_utc).total_seconds() / (365.25 * 24 * 3600), 0.0)
-            except Exception:
-                pass
+        # Compute mid IV for all strikes, track which are nearby (within 4%)
+        nearby_strikes = []
+        nearby_ivs = []
+        for raw, disp in zip(app.all_strikes, app.all_display_strikes):
+            data = app.market_data.get(raw, {})
+            bid = data.get("yes_bid", 0)
+            ask = data.get("yes_ask", 0)
+            if bid <= 0 or ask <= 0:
+                continue
+            mid = (bid + ask) / 2.0
+            iv = _implied_vol_quadratic(mid, spot, disp, T,
+                                        app.pricer.risk_free_rate)
+            if iv <= 0:
+                continue
+            otm = abs(disp / spot - 1)
+            if otm < app._smile_otm_pct:
+                nearby_strikes.append(disp)
+                nearby_ivs.append(iv * 100.0)
 
-        if spot > 0 and T > 0:
-            kalshi_bid_strikes = []
-            kalshi_bid_ivs = []
-            kalshi_ask_strikes = []
-            kalshi_ask_ivs = []
-            for raw, disp in zip(app.all_strikes, app.all_display_strikes):
-                data = app.market_data.get(raw, {})
-                yes_bid = data.get("yes_bid", 0)
-                yes_ask = data.get("yes_ask", 0)
-                if yes_bid > 0.01 and yes_bid < 0.99:
-                    iv = implied_vol_from_prob(yes_bid, spot, disp, T)
-                    if iv > 0:
-                        kalshi_bid_strikes.append(disp)
-                        kalshi_bid_ivs.append(iv * 100.0)
-                if yes_ask > 0.01 and yes_ask < 0.99:
-                    iv = implied_vol_from_prob(yes_ask, spot, disp, T)
-                    if iv > 0:
-                        kalshi_ask_strikes.append(disp)
-                        kalshi_ask_ivs.append(iv * 100.0)
+        # Reject IV outliers using IQR (same logic as _refit_vol_smile)
+        if nearby_ivs:
+            ivs_arr = np.array(nearby_ivs)
+            q1, q3 = np.percentile(ivs_arr, [25, 75])
+            iqr = q3 - q1
+            iv_low = q1 - 1.5 * iqr
+            iv_high = q3 + 1.5 * iqr
+            filtered = [(k, iv) for k, iv in zip(nearby_strikes, nearby_ivs)
+                        if iv_low <= iv <= iv_high]
+            nearby_strikes = [p[0] for p in filtered]
+            nearby_ivs = [p[1] for p in filtered]
 
-            if kalshi_bid_strikes:
-                ax.plot(kalshi_bid_strikes, kalshi_bid_ivs, color="#22c55e",
-                        linewidth=1.5, marker="s", markersize=3,
-                        markerfacecolor="#22c55e", alpha=0.8, label="Kalshi Bid IV")
-            if kalshi_ask_strikes:
-                ax.plot(kalshi_ask_strikes, kalshi_ask_ivs, color="#ef4444",
-                        linewidth=1.5, marker="s", markersize=3,
-                        markerfacecolor="#ef4444", alpha=0.8, label="Kalshi Ask IV")
+        # Plot the data points used for fitting
+        if nearby_strikes:
+            ax.scatter(nearby_strikes, nearby_ivs, color="#facc15",
+                       s=30, zorder=3, label="Mid IV (fit points)")
 
-        # Mark the spot price
-        spot_idx = self.pricer.index_price
-        if spot_idx > 0:
-            ax.axvline(spot_idx, color="#ef4444", linestyle="--",
-                       linewidth=1, alpha=0.4)
+        # Plot the fitted curve
+        a, b, c = app._smile_coeffs
+        if a != 0 or b != 0 or c != 0:
+            k_min = min(nearby_strikes) if nearby_strikes else spot * 0.96
+            k_max = max(nearby_strikes) if nearby_strikes else spot * 1.04
+            k_range = np.linspace(k_min, k_max, 200)
+            fitted_iv = (a * k_range**2 + b * k_range + c) * 100.0
+            ax.plot(k_range, fitted_iv, color="#8b5cf6", linewidth=2,
+                    label="Fitted smile")
+
+        # Mark spot
+        if spot > 0:
+            ax.axvline(spot, color="#ef4444", linestyle="--",
+                       linewidth=1, alpha=0.4, label="Spot")
 
         ax.legend(facecolor="#141923", edgecolor="#1e2736",
                   labelcolor="#c8cdd5", fontsize=9, loc="upper right")
 
         ax.set_xlabel("Strike", color="#5a6270", fontsize=10)
         ax.set_ylabel("IV (%)", color="#5a6270", fontsize=10)
-        ax.set_title(f"IV Smile — {self.pricer.expiry_str}",
-                     color="#c8cdd5", fontsize=12)
+        ax.set_title("Fitted Vol Smile", color="#c8cdd5", fontsize=12)
         ax.set_facecolor("#0b0f19")
         ax.tick_params(colors="#5a6270", labelsize=9)
         ax.spines["bottom"].set_color("#1e2736")
@@ -455,6 +469,15 @@ class AboveBelowApp(QMainWindow):
         self._theo_last_time: dict[float, float] = {}   # raw_strike -> last update timestamp
         self._theo_latency_ema: dict[float, float] = {}  # raw_strike -> EMA of latency in ms
 
+        # Vol smile fitting state
+        self._smile_coeffs: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._smoothed_iv: dict[float, float] = {}      # disp_strike -> EWM smoothed IV
+        self._last_smile_fit_time: float = 0.0           # monotonic time of last fit
+        self._last_smile_spot: float = 0.0               # spot at last fit
+        self._smile_span: int = 10                       # EWM span
+        self._smile_otm_pct: float = 0.04                # fit on strikes within 4%
+        self._smile_spot_threshold: float = 0.005        # refit on 0.5% spot move
+
         self._build_ui()
         self._apply_stylesheet()
         self._fetch_balance()
@@ -487,6 +510,11 @@ class AboveBelowApp(QMainWindow):
         self.event_timer = QTimer()
         self.event_timer.timeout.connect(self._refresh_events)
         self.event_timer.start(60_000)
+
+        # Vol smile refit every 60s
+        self.smile_timer = QTimer()
+        self.smile_timer.timeout.connect(self._refit_vol_smile)
+        self.smile_timer.start(60_000)
 
         self.refresh_timer.start(1000)
 
@@ -671,10 +699,10 @@ class AboveBelowApp(QMainWindow):
 
         # --- Table ---
         self.table = QTableWidget()
-        self.table.setColumnCount(15)
+        self.table.setColumnCount(17)
         self.table.setHorizontalHeaderLabels([
             "Strike", "OTM%", "Yes Bid", "Yes Ask", "Theo", "Edge",
-            "Deribit IV", "Position", "Δ", "γ", "ν", "θ", "Order", "PnL", "", "",
+            "Deribit IV", "Smoothed IV", "Position", "Δ", "γ", "ν", "θ", "Order", "PnL", "", "",
         ])
         header = self.table.horizontalHeader()
         # All columns interactive (user-resizable), with sensible defaults
@@ -686,14 +714,16 @@ class AboveBelowApp(QMainWindow):
         self.table.setColumnWidth(4, 130)   # Theo
         self.table.setColumnWidth(5, 75)    # Edge
         self.table.setColumnWidth(6, 120)   # Deribit IV
-        self.table.setColumnWidth(7, 95)    # Position
-        self.table.setColumnWidth(8, 85)    # Δ
-        self.table.setColumnWidth(9, 85)    # γ
-        self.table.setColumnWidth(10, 85)   # ν
-        self.table.setColumnWidth(11, 160)  # Order
-        self.table.setColumnWidth(12, 90)   # PnL
-        self.table.setColumnWidth(13, 50)   # ON/OFF button
-        self.table.setColumnWidth(14, 50)   # FLAT button
+        self.table.setColumnWidth(7, 85)    # Smoothed IV
+        self.table.setColumnWidth(8, 95)    # Position
+        self.table.setColumnWidth(9, 85)    # Δ
+        self.table.setColumnWidth(10, 85)   # γ
+        self.table.setColumnWidth(11, 85)   # ν
+        self.table.setColumnWidth(12, 85)   # θ
+        self.table.setColumnWidth(13, 160)  # Order
+        self.table.setColumnWidth(14, 90)   # PnL
+        self.table.setColumnWidth(15, 50)   # ON/OFF button
+        self.table.setColumnWidth(16, 50)   # FLAT button
         header.setStretchLastSection(False)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -824,6 +854,8 @@ class AboveBelowApp(QMainWindow):
         self.strategies.clear()
 
         self.current_event = self.events[index]
+        self._smoothed_iv.clear()
+        self._last_smile_spot = 0.0
         new_et = self.current_event.get("event_ticker", "")
         markets = self.current_event["markets"]
 
@@ -1154,6 +1186,12 @@ class AboveBelowApp(QMainWindow):
         self._recompute_and_trade()
         self._ui_dirty = True  # signal UI timer to refresh display
 
+        # Refit vol smile on big spot move
+        if self._last_smile_spot > 0:
+            move = abs(price - self._last_smile_spot) / self._last_smile_spot
+            if move >= self._smile_spot_threshold:
+                self._refit_vol_smile()
+
     # =========================================================================
     # Balance
     # =========================================================================
@@ -1385,8 +1423,9 @@ class AboveBelowApp(QMainWindow):
                 try:
                     close_utc = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
                     remaining = (close_utc - now).total_seconds()
+                    t_years = remaining / (365.25 * 86400)
                     self.kalshi_countdown.setText(
-                        f"Kalshi: {self._format_countdown(remaining)}"
+                        f"Kalshi: {self._format_countdown(remaining)}  T={t_years:.6f}y"
                     )
                 except Exception:
                     self.kalshi_countdown.setText("")
@@ -1623,10 +1662,10 @@ class AboveBelowApp(QMainWindow):
         self.table.setRowCount(len(self.strikes))
         for row, (raw, disp) in enumerate(zip(self.strikes, self.display_strikes)):
             self.table.setItem(row, 0, QTableWidgetItem(f"${disp:,.0f}"))
-            for col in range(1, 14):
+            for col in range(1, 15):
                 self.table.setItem(row, col, QTableWidgetItem("--"))
 
-            # Toggle button (col 14)
+            # Toggle button (col 15)
             strat = self.strategies.get(raw)
             btn = QPushButton("ON" if strat and strat.active else "OFF")
             btn.setStyleSheet(
@@ -1639,9 +1678,9 @@ class AboveBelowApp(QMainWindow):
                  "QPushButton:hover{background:#2d3a4d;}")
             )
             btn.clicked.connect(lambda checked, rs=raw: self._toggle_strategy(rs))
-            self.table.setCellWidget(row, 14, btn)
+            self.table.setCellWidget(row, 15, btn)
 
-            # Flatten button (col 15)
+            # Flatten button (col 16)
             flat_btn = QPushButton("FLAT")
             flat_btn.setStyleSheet(
                 "QPushButton{background:#1e2736;color:#facc15;border:1px solid #2d3a4d;"
@@ -1649,7 +1688,7 @@ class AboveBelowApp(QMainWindow):
                 "QPushButton:hover{background:#2d3a4d;border-color:#facc15;}"
             )
             flat_btn.clicked.connect(lambda checked, rs=raw: self._flatten_position(rs))
-            self.table.setCellWidget(row, 15, flat_btn)
+            self.table.setCellWidget(row, 16, flat_btn)
 
     _filter_tick = 0
 
@@ -1766,8 +1805,11 @@ class AboveBelowApp(QMainWindow):
             # Deribit IV — col 6 (bid / ask + strike used)
             self._display_iv(row, disp)
 
-            # Position — col 7 (qty + avg fill price)
-            item = self.table.item(row, 7)
+            # Smoothed IV — col 7
+            self._display_smoothed_iv(row, disp)
+
+            # Position — col 8 (qty + avg fill price)
+            item = self.table.item(row, 8)
             if item:
                 qty = strat.position if strat else data.get("position", 0)
                 avg_px = data.get("avg_price", 0)
@@ -1792,14 +1834,14 @@ class AboveBelowApp(QMainWindow):
                     if flash_ts:
                         del self._fill_flash[raw_strike]
 
-            # Delta — col 8: position delta (dP/dSpot * position)
+            # Delta — col 9: position delta (dP/dSpot * position)
             self._display_greeks(row, raw_strike, disp, data)
 
-            # Order — col 12 (show both sides, highlight flatten orders)
+            # Order — col 13 (show both sides, highlight flatten orders)
             self._display_orders(row, strat, raw_strike)
 
-            # PnL — col 13: total PnL (session PnL)
-            item = self.table.item(row, 13)
+            # PnL — col 14: total PnL (session PnL)
+            item = self.table.item(row, 14)
             if item:
                 realized = strat.realized_pnl if strat else data.get("realized_pnl", 0)
                 pos = strat.position if strat else data.get("position", 0)
@@ -1890,7 +1932,7 @@ class AboveBelowApp(QMainWindow):
 
     def _display_greeks(self, row: int, raw_strike: float,
                         disp_strike: float, data: dict):
-        """Update the Greek columns: col 8 (Δ), col 9 (γ), col 10 (ν), col 11 (θ).
+        """Update the Greek columns: col 9 (Δ), col 10 (γ), col 11 (ν), col 12 (θ).
 
         Delta = position * dP/dSpot  — $ change per $1 spot move.
         Gamma = position * d²P/dS²  — how fast delta changes per $1 move.
@@ -1901,7 +1943,7 @@ class AboveBelowApp(QMainWindow):
         pos = strat.position if strat else data.get("position", 0)
 
         dim = QColor("#5a6270")
-        items = [self.table.item(row, c) for c in (8, 9, 10, 11)]
+        items = [self.table.item(row, c) for c in (9, 10, 11, 12)]
 
         if pos == 0 or not self.pricer.options or self.spot_price <= 0:
             for it in items:
@@ -2040,6 +2082,105 @@ class AboveBelowApp(QMainWindow):
         else:
             strike_lbl.setText("")
 
+    def _refit_vol_smile(self):
+        """Fit a quadratic vol smile on mid IVs of strikes within 4% of spot.
+
+        Updates self._smoothed_iv with EWM-smoothed fitted IVs (span=10).
+        Called every 60s by timer, and on big spot moves from _on_price.
+        """
+        if self.spot_price <= 0 or not self.display_strikes:
+            return
+
+        # Compute T (time to expiry)
+        t_years = 0.0
+        if self.current_event:
+            close_iso = self.current_event.get("close_time", "")
+            if close_iso:
+                try:
+                    close_utc = datetime.fromisoformat(
+                        close_iso.replace("Z", "+00:00"))
+                    t_years = max(
+                        (close_utc - datetime.now(tz=timezone.utc)).total_seconds()
+                        / (365.25 * 86400), 0)
+                except Exception:
+                    pass
+        if t_years <= 0:
+            return
+
+        # Compute mid IV for each strike from current market mids
+        strikes_arr = []
+        mid_ivs = []
+        for raw_strike, disp in zip(self.strikes, self.display_strikes):
+            data = self.market_data.get(raw_strike, {})
+            bid = data.get("yes_bid", 0.0)
+            ask = data.get("yes_ask", 0.0)
+            if bid <= 0 or ask <= 0:
+                continue
+            mid = (bid + ask) / 2.0
+            iv = _implied_vol_quadratic(mid, self.spot_price, disp, t_years,
+                                        self.pricer.risk_free_rate)
+            if iv > 0:
+                strikes_arr.append(disp)
+                mid_ivs.append(iv)
+
+        if len(strikes_arr) < 3:
+            return
+
+        strikes_np = np.array(strikes_arr)
+        ivs_np = np.array(mid_ivs)
+
+        # Filter to strikes within 4% of spot for fitting
+        otm_pct = np.abs(strikes_np / self.spot_price - 1)
+        nearby_mask = otm_pct < self._smile_otm_pct
+        if nearby_mask.sum() < 3:
+            return
+
+        # Reject IV outliers using IQR on the nearby set
+        nearby_ivs = ivs_np[nearby_mask]
+        q1, q3 = np.percentile(nearby_ivs, [25, 75])
+        iqr = q3 - q1
+        iv_low = q1 - 1.5 * iqr
+        iv_high = q3 + 1.5 * iqr
+        inlier_mask = nearby_mask & (ivs_np >= iv_low) & (ivs_np <= iv_high)
+        if inlier_mask.sum() < 3:
+            return
+
+        # Fit quadratic on nearby strikes (outliers removed)
+        try:
+            coeffs = np.polyfit(strikes_np[inlier_mask], ivs_np[inlier_mask], 2)
+        except Exception:
+            return
+        a, b, c = coeffs[0], coeffs[1], coeffs[2]
+        self._smile_coeffs = (a, b, c)
+
+        # Evaluate fitted IV for ALL strikes and update EWM
+        alpha = 2.0 / (self._smile_span + 1)
+        for disp_k in strikes_arr:
+            fitted = a * disp_k**2 + b * disp_k + c
+            if fitted <= 0:
+                continue
+            prev = self._smoothed_iv.get(disp_k)
+            if prev is not None and prev > 0:
+                self._smoothed_iv[disp_k] = alpha * fitted + (1 - alpha) * prev
+            else:
+                self._smoothed_iv[disp_k] = fitted
+
+        self._last_smile_fit_time = time.monotonic()
+        self._last_smile_spot = self.spot_price
+
+    def _display_smoothed_iv(self, row: int, disp_strike: float):
+        """Update the Smoothed IV cell (col 7)."""
+        item = self.table.item(row, 7)
+        if not item:
+            return
+        siv = self._smoothed_iv.get(disp_strike)
+        if siv and siv > 0:
+            item.setText(f"{siv * 100:.1f}%")
+            item.setForeground(QColor("#8b5cf6"))
+        else:
+            item.setText("--")
+            item.setForeground(QColor("#5a6270"))
+
     _ui_dirty = False
 
     def _get_iv_pricer(self):
@@ -2051,11 +2192,10 @@ class AboveBelowApp(QMainWindow):
     def _recompute_and_trade(self):
         """Compute theos + feed strategies immediately. Runs on WS thread.
 
-        Caches results for the UI timer to display. Tracks latency EMA
-        based on actual computation frequency (not UI refresh rate).
+        Uses smoothed IV from vol smile fit when available, falls back to
+        Deribit IV. Caches results for the UI timer to display.
         """
-        iv_pricer = self._get_iv_pricer()
-        if not self.strikes or not iv_pricer.options:
+        if not self.strikes:
             return
         close_time = ""
         if self.current_event:
@@ -2067,16 +2207,32 @@ class AboveBelowApp(QMainWindow):
 
         now = time.monotonic()
 
+        # Fall back to Deribit IV if no smoothed IV available yet
+        iv_pricer = self._get_iv_pricer()
+        use_deribit_fallback = not self._smoothed_iv and iv_pricer.options
+
         for raw_strike, disp in zip(self.strikes, self.display_strikes):
-            # Get IV from selected source, compute probability with Kalshi close time
-            bid_iv = iv_pricer._find_closest_bid_iv(disp)
-            ask_iv = iv_pricer._find_closest_ask_iv(disp)
-            bid_theo = self.pricer.prob_above_with_iv(
-                disp, bid_iv, spot=spot_b, kalshi_close_iso=close_time,
-            )
-            ask_theo = self.pricer.prob_above_with_iv(
-                disp, ask_iv, spot=spot_a, kalshi_close_iso=close_time,
-            )
+            if use_deribit_fallback:
+                # Deribit fallback — bid/ask IV → bid/ask theo
+                bid_iv = iv_pricer._find_closest_bid_iv(disp)
+                ask_iv = iv_pricer._find_closest_ask_iv(disp)
+                bid_theo = self.pricer.prob_above_with_iv(
+                    disp, bid_iv, spot=spot_b, kalshi_close_iso=close_time,
+                )
+                ask_theo = self.pricer.prob_above_with_iv(
+                    disp, ask_iv, spot=spot_a, kalshi_close_iso=close_time,
+                )
+            else:
+                # Smoothed IV — single IV → single theo (use spot bid/ask for conservatism)
+                siv = self._smoothed_iv.get(disp, 0.0)
+                if siv <= 0:
+                    continue
+                bid_theo = self.pricer.prob_above_with_iv(
+                    disp, siv, spot=spot_b, kalshi_close_iso=close_time,
+                )
+                ask_theo = self.pricer.prob_above_with_iv(
+                    disp, siv, spot=spot_a, kalshi_close_iso=close_time,
+                )
 
             # Cache for UI
             self._cached_theos[raw_strike] = (bid_theo, ask_theo)
@@ -2112,14 +2268,25 @@ class AboveBelowApp(QMainWindow):
                 if not strat.active:
                     continue
                 disp = display_strike(raw_strike)
-                stash_bid_iv = iv_pricer._find_closest_bid_iv(disp)
-                stash_ask_iv = iv_pricer._find_closest_ask_iv(disp)
-                bid_theo = self.pricer.prob_above_with_iv(
-                    disp, stash_bid_iv, spot=spot_b, kalshi_close_iso=stash_close,
-                )
-                ask_theo = self.pricer.prob_above_with_iv(
-                    disp, stash_ask_iv, spot=spot_a, kalshi_close_iso=stash_close,
-                )
+                if use_deribit_fallback:
+                    stash_bid_iv = iv_pricer._find_closest_bid_iv(disp)
+                    stash_ask_iv = iv_pricer._find_closest_ask_iv(disp)
+                    bid_theo = self.pricer.prob_above_with_iv(
+                        disp, stash_bid_iv, spot=spot_b, kalshi_close_iso=stash_close,
+                    )
+                    ask_theo = self.pricer.prob_above_with_iv(
+                        disp, stash_ask_iv, spot=spot_a, kalshi_close_iso=stash_close,
+                    )
+                else:
+                    siv = self._smoothed_iv.get(disp, 0.0)
+                    if siv <= 0:
+                        continue
+                    bid_theo = self.pricer.prob_above_with_iv(
+                        disp, siv, spot=spot_b, kalshi_close_iso=stash_close,
+                    )
+                    ask_theo = self.pricer.prob_above_with_iv(
+                        disp, siv, spot=spot_a, kalshi_close_iso=stash_close,
+                    )
                 md = stashed_md.get(raw_strike)
                 if md:
                     strat.kalshi_bid = md.get("yes_bid", 0.0)
@@ -2182,7 +2349,7 @@ class AboveBelowApp(QMainWindow):
             lat_lbl.setText("")
 
     def _display_orders(self, row: int, strat, raw_strike: float = 0):
-        """Update Order cell (col 8). Flatten orders are highlighted orange."""
+        """Update Order cell (col 13). Flatten orders are highlighted orange."""
         # Use market_data position as source of truth (updated by WS fills + REST)
         data = self.market_data.get(raw_strike, {})
         pos = data.get("position", 0)
@@ -2196,17 +2363,17 @@ class AboveBelowApp(QMainWindow):
 
         if not has_buy and not has_sell:
             # No orders — use plain item
-            existing = self.table.cellWidget(row, 12)
+            existing = self.table.cellWidget(row, 13)
             if existing:
-                self.table.removeCellWidget(row, 12)
-            item = self.table.item(row, 12)
+                self.table.removeCellWidget(row, 13)
+            item = self.table.item(row, 13)
             if item:
                 item.setText("--")
                 item.setForeground(QColor("#5a6270"))
             return
 
         # Build widget with colored labels per side
-        existing = self.table.cellWidget(row, 12)
+        existing = self.table.cellWidget(row, 13)
         if existing is None or existing.objectName() != "order_container":
             container = QWidget()
             container.setObjectName("order_container")
@@ -2220,8 +2387,8 @@ class AboveBelowApp(QMainWindow):
             sell_lbl.setObjectName("order_sell")
             hlay.addWidget(buy_lbl)
             hlay.addWidget(sell_lbl)
-            self.table.setCellWidget(row, 12, container)
-            item = self.table.item(row, 12)
+            self.table.setCellWidget(row, 13, container)
+            item = self.table.item(row, 13)
             if item:
                 item.setText("")
         else:
@@ -2472,7 +2639,7 @@ class AboveBelowApp(QMainWindow):
             if data.get("ticker") == ticker:
                 row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
                 if row >= 0:
-                    btn = self.table.cellWidget(row, 14)
+                    btn = self.table.cellWidget(row, 15)
                     if btn:
                         btn.setText("MAX")
                         btn.setStyleSheet(
@@ -2541,7 +2708,7 @@ class AboveBelowApp(QMainWindow):
         # Update button appearance
         row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
         if row >= 0:
-            btn = self.table.cellWidget(row, 14)
+            btn = self.table.cellWidget(row, 15)
             if btn:
                 if strat.active:
                     btn.setText("ON")
@@ -2662,7 +2829,7 @@ class AboveBelowApp(QMainWindow):
             # Update toggle button
             row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
             if row >= 0:
-                btn = self.table.cellWidget(row, 14)
+                btn = self.table.cellWidget(row, 15)
                 if btn:
                     btn.setText("ON")
                     btn.setStyleSheet(
