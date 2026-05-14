@@ -1,0 +1,21 @@
+{
+  "otm_filter_pct": 2.0,
+  "column_widths": [
+    79,
+    97,
+    101,
+    80,
+    95,
+    96,
+    96,
+    149,
+    129,
+    64,
+    52
+  ],
+  "window_geometry": "AdnQywADAAAAAAeB////cgAAC7cAAAL2AAAHgf///44AAAu3AAAC9gAAAAEAAAAABDgAAAeB////jgAAC7cAAAL2",
+  "velocity_enabled": true,
+  "velocity_window_sec": 4.0,
+  "velocity_move_threshold": 50.0,
+  "velocity_cooldown_sec": 7.0
+}

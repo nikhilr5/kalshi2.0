@@ -8,12 +8,13 @@ import os
 from utility import AnalysisUtils
 
 
-u = AnalysisUtils()
+u = AnalysisUtils(db_path="../OlderAnalysis/marketdata/recorder.db")
 reload = False
 
 if not os.path.exists('./data/vol_smile.csv') or reload:
-    df = u.load_market_snapshots(datetime(2026, 4, 26, 0, 0), datetime(2026, 4, 30, 16, 0), event_prefix="KXBTCD-26MAY0117")
-    df = df[df['expiry_type'] == 'weekly']
+    df = u.load_market_snapshots(datetime(2026, 4, 26, 0, 0), datetime(2026, 4, 30, 16, 0), event_prefix="KXBTCD-")
+    # Keep daily 5pm (event ends in "17") + weekly, drop hourly
+    df = df[df["event_ticker"].str.endswith("17")]
 
     df["T"] = (pd.to_datetime(df["close_time"], utc=True) - df["ts"]).dt.total_seconds() / (365.25 * 24 * 3600)
 
@@ -83,20 +84,5 @@ ivs_np = avg_iv.values
 mask = ivs_np > 0
 (a, b, c) = np.polyfit(strikes_np[mask], ivs_np[mask], 2)
 
-# Plot
-fig, ax = plt.subplots(figsize=(10, 5))
-ax.scatter(strikes_np, ivs_np * 100, s=30, color="#facc15", zorder=3, label="Avg Smoothed IV")
 
-k_range = np.linspace(strikes_np.min(), strikes_np.max(), 200)
-fitted = (a * k_range**2 + b * k_range + c) * 100
-ax.plot(k_range, fitted, color="#8b5cf6", linewidth=2, label="Fitted smile")
-
-ax.set_xlabel("Strike")
-ax.set_ylabel("IV (%)")
-ax.set_title(f"Average Smoothed IV per Strike (span={span})")
-ax.legend()
-ax.grid(True, alpha=0.25)
-fig.tight_layout()
-plt.show()
-
-# u.graph_strike(df, 75500.0, iv_cols=["smoothed_mid_iv"])
+u.graph_strike(df, 75500.0, iv_cols=["smoothed_mid_iv"], use_real_trades=True)

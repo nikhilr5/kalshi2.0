@@ -21,20 +21,45 @@ from collections.abc import Callable
 from kalshi_api import KalshiAPI
 
 
+# user_orders is hosted on a separate Kalshi WS host (external-api-ws.kalshi.com)
+# but uses the SAME path as the main endpoint (/trade-api/ws/v2).  Earlier
+# docs that named the path "/user_orders" were misleading — that's the
+# channel name, not a URL path.  Probed empirically.
+USER_ORDERS_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+
+
 class KalshiWsFeed:
 
     def __init__(self, api: KalshiAPI, on_update: Callable,
-                 on_fill: Callable | None = None):
+                 on_fill: Callable | None = None,
+                 on_trade: Callable | None = None,
+                 on_order_event: Callable | None = None,
+                 on_book_change: Callable | None = None,
+                 on_stale: Callable | None = None):
         """
         Args:
             api: KalshiAPI instance (used for auth headers and WS URL)
-            on_update: callback(ticker, yes_bid, yes_ask) fired on every book change
+            on_update: callback(ticker, yes_bid, yes_ask, bid_size, ask_size)
+                       fired on every TOB change (computed from raw deltas)
             on_fill: optional callback(ticker, action, side, price, count)
                      fired on every fill for this account
+            on_trade: optional callback(msg_dict) — public trade tape
+            on_order_event: optional callback(msg_dict) — every state change of
+                            this account's orders (placed/resting/canceled/executed)
+            on_book_change: optional callback(ticker, side, price, delta) fired
+                            on every raw level change (before the BBO fold).
+                            Useful for forensic recording where you want every
+                            depth change, not just TOB.
         """
         self.api = api
         self.on_update = on_update
         self.on_fill = on_fill
+        self.on_trade = on_trade
+        self.on_order_event = on_order_event
+        self.on_book_change = on_book_change
+        # Fired when staleness monitor trips (30s of no data).  Trading
+        # apps wire this to a kill-switch that cancels resting orders.
+        self.on_stale = on_stale
         self.ws = None
         self.msg_id = 1
         self._thread = None
@@ -148,10 +173,15 @@ class KalshiWsFeed:
             print(f"[WS] Connect error: {e}")
             return
 
-        # --- Subscribe to orderbook + fills in one command ---
+        # --- Subscribe to market-scoped channels (book/fill/trade) ---
+        # NOTE: `user_orders` does NOT live on this endpoint despite
+        # appearing in some docs — it has its own URL
+        # (USER_ORDERS_WS_URL) handled by a separate connection below.
         channels = ["orderbook_delta"]
         if self.on_fill:
             channels.append("fill")
+        if self.on_trade:
+            channels.append("trade")
         subscribe_msg = {
             "id": self.msg_id,
             "cmd": "subscribe",
@@ -197,6 +227,13 @@ class KalshiWsFeed:
             await asyncio.sleep(5)
             if self.last_update_ts > 0 and (time.time() - self.last_update_ts) > _STALE_THRESHOLD:
                 print(f"[WS] STALE — no data for {time.time() - self.last_update_ts:.0f}s, forcing reconnect")
+                # Fire the kill-switch callback BEFORE closing the socket
+                # so the app can issue cancels while we still have connectivity.
+                if self.on_stale:
+                    try:
+                        self.on_stale()
+                    except Exception as e:
+                        print(f"[WS] on_stale callback error: {e}")
                 self.last_update_ts = 0.0
                 if self.ws:
                     try:
@@ -217,6 +254,23 @@ class KalshiWsFeed:
             self._process_delta(data["msg"])
         elif msg_type == "fill" and self.on_fill:
             self._process_fill(data["msg"])
+        elif msg_type == "trade" and self.on_trade:
+            try:
+                self.on_trade(data.get("msg", {}))
+            except Exception as e:
+                print(f"[WS] on_trade error: {e}")
+        elif msg_type == "user_order" and self.on_order_event:
+            try:
+                self.on_order_event(data.get("msg", {}))
+            except Exception as e:
+                print(f"[WS] on_order_event error: {e}")
+        elif msg_type == "error":
+            # Surface subscription errors from Kalshi so we can diagnose
+            # silently-rejected channels (e.g. wrong scope params).
+            print(f"[WS] Server error: {data}")
+        elif msg_type == "subscribed":
+            # Confirmation — useful to see which channels actually took
+            print(f"[WS] Subscribed: {data.get('msg', data)}")
 
     def _process_snapshot(self, msg: dict):
         """Process a full orderbook snapshot. Replaces all levels for this ticker."""
@@ -259,6 +313,14 @@ class KalshiWsFeed:
             levels.pop(price, None)
         else:
             levels[price] = new_qty
+
+        # Fire raw-change hook before the TOB fold — useful for forensic
+        # recording (every depth change captured, not just TOB transitions).
+        if self.on_book_change:
+            try:
+                self.on_book_change(ticker, side, price, delta)
+            except Exception:
+                pass
 
         self._fire_update(ticker)
 
@@ -326,3 +388,130 @@ class KalshiWsFeed:
             self.on_fill(ticker, action, side, price, count)
         except Exception:
             pass
+
+
+# =============================================================================
+# Dedicated user_orders feed
+#
+# `user_orders` lives at a separate URL from the rest of the WS surface
+# (`wss://external-api-ws.kalshi.com/user_orders`).  Subscribing to it on
+# the standard endpoint is silently ignored, which is why we need a
+# second connection.  Account-scoped — no market_tickers parameter.
+# =============================================================================
+
+class UserOrdersWsFeed:
+
+    def __init__(self, api: KalshiAPI, on_order_event: Callable):
+        """
+        Args:
+            api: KalshiAPI instance for auth header signing.
+            on_order_event: callback(msg_dict) fired on every state change
+                of one of this account's orders (resting, canceled, executed).
+        """
+        self.api = api
+        self.on_order_event = on_order_event
+        self.ws = None
+        self.msg_id = 1
+        self._thread = None
+        self._loop = None
+        self._running = False
+
+    def start(self):
+        """Start the user_orders WS in a background daemon thread."""
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True,
+            name="kalshi-user-orders",
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._schedule_close)
+
+    def _schedule_close(self):
+        if self.ws:
+            asyncio.ensure_future(self._safe_close(), loop=self._loop)
+
+    async def _safe_close(self):
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        delay = 2
+        while self._running:
+            try:
+                self._loop.run_until_complete(self._connect_and_listen())
+            except RuntimeError:
+                break
+            except Exception as e:
+                print(f"[UserOrders WS] Loop error: {e}")
+            if not self._running:
+                break
+            print(f"[UserOrders WS] Disconnected, reconnecting in {delay}s...")
+            import time as _time
+            _time.sleep(delay)
+            delay = min(delay * 2, 30)
+        try:
+            self._loop.close()
+        except Exception:
+            pass
+
+    async def _connect_and_listen(self):
+        # Same path as the main WS endpoint — external-api-ws is a
+        # separate host but accepts identical handshake/signing.
+        headers = self.api.ws_auth_headers(path="/trade-api/ws/v2")
+        try:
+            self.ws = await websockets.connect(
+                USER_ORDERS_WS_URL,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=10,
+            )
+            print("[UserOrders WS] Connected")
+        except Exception as e:
+            print(f"[UserOrders WS] Connect error: {e}")
+            return
+
+        # Subscribe — account-scoped, no market_tickers.
+        msg = {
+            "id": self.msg_id,
+            "cmd": "subscribe",
+            "params": {"channels": ["user_orders"]},
+        }
+        self.msg_id += 1
+        await self.ws.send(json.dumps(msg))
+        print("[UserOrders WS] Connected, subscribed")
+
+        try:
+            async for raw in self.ws:
+                if not self._running:
+                    break
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                t = data.get("type")
+                if t == "user_order":
+                    try:
+                        self.on_order_event(data.get("msg", {}))
+                    except Exception as e:
+                        print(f"[UserOrders WS] callback error: {e}")
+                elif t == "error":
+                    print(f"[UserOrders WS] Server error: {data}")
+                elif t == "subscribed":
+                    print(f"[UserOrders WS] Subscribed: {data.get('msg', data)}")
+        except websockets.ConnectionClosed:
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass

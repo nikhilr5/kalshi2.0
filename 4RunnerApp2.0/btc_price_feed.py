@@ -28,13 +28,17 @@ class CryptoPriceFeed:
 
     WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
-    def __init__(self, on_price: Callable, product_id: str = "BTC-USD"):
+    def __init__(self, on_price: Callable, product_id: str = "BTC-USD",
+                 on_stale: Callable | None = None):
         """
         Args:
             on_price: callback(price, bid, ask) fired on every top-of-book change
             product_id: Coinbase product ID, e.g. "BTC-USD", "ETH-USD", "SOL-USD"
+            on_stale: optional callback() fired when no data for STALE_THRESHOLD
+                seconds.  Trading apps use this as a kill switch.
         """
         self.on_price = on_price
+        self.on_stale = on_stale
         self.product_id = product_id
         self.ws = None
         self._thread = None
@@ -182,6 +186,13 @@ class CryptoPriceFeed:
             await asyncio.sleep(5)
             if self.last_update_ts > 0 and (time.time() - self.last_update_ts) > _STALE_THRESHOLD:
                 print(f"[Price] STALE — no data for {time.time() - self.last_update_ts:.0f}s, forcing reconnect")
+                # Notify the app BEFORE we drop the socket so it can
+                # cancel resting orders while still online.
+                if self.on_stale:
+                    try:
+                        self.on_stale()
+                    except Exception as e:
+                        print(f"[Price] on_stale callback error: {e}")
                 self.last_update_ts = 0.0
                 if self.ws:
                     try:

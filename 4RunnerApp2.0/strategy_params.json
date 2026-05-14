@@ -1,42 +1,14 @@
 {
-  "76499.99": {
-    "edge_bid": 0.0,
-    "edge_ask": 0.04,
-    "size_bid": 20,
-    "size_ask": 20,
-    "max_position": 50,
-    "tolerance": 0.02,
-    "flatten_walk_interval": 30.0,
-    "flatten_walk_step": 0.01
-  },
-  "76999.99": {
-    "edge_bid": 0.0,
-    "edge_ask": 0.04,
-    "size_bid": 20,
-    "size_ask": 20,
-    "max_position": 50,
-    "tolerance": 0.02,
-    "flatten_walk_interval": 30.0,
-    "flatten_walk_step": 0.01
-  },
-  "77499.99": {
-    "edge_bid": 0.0087,
-    "edge_ask": 0.0487,
-    "size_bid": 20,
-    "size_ask": 20,
-    "max_position": 50,
-    "tolerance": 0.02,
-    "flatten_walk_interval": 30.0,
-    "flatten_walk_step": 0.01
-  },
-  "77999.99": {
-    "edge_bid": 0.0217,
-    "edge_ask": 0.0617,
-    "size_bid": 20,
-    "size_ask": 20,
-    "max_position": 50,
-    "tolerance": 0.02,
-    "flatten_walk_interval": 30.0,
-    "flatten_walk_step": 0.01
+  "79999.99": {
+    "edge_bid": 0.04,
+    "edge_ask": 0.05,
+    "size_bid": 10,
+    "size_ask": 10,
+    "max_position": 61,
+    "tolerance": 0.005,
+    "flatten_walk_interval": 20.0,
+    "flatten_walk_step": 0.01,
+    "phase3_after_sec": 420.0,
+    "phase3_theo_drift_cents": 4.0
   }
 }

@@ -36,9 +36,127 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QPushButton, QLineEdit, QDialog, QFormLayout, QMenu, QMessageBox,
+    QLayout, QSizePolicy,
 )
-from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QRect, QSize, QPoint
+from PyQt6.QtGui import QFont, QColor, QIcon
+
+
+# =============================================================================
+# Flow Layout — auto-wraps widgets when row width exceeds container width
+# =============================================================================
+
+class FlowLayout(QLayout):
+    """Layout that arranges widgets left-to-right and wraps to a new row
+    when the available width is exceeded."""
+
+    def __init__(self, parent=None, margin=0, spacing=10):
+        super().__init__(parent)
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+        self._spacing = spacing
+        self._items = []
+
+    # Compat shims for code that uses QHBoxLayout API
+    def addSpacing(self, _):
+        pass
+
+    def addStretch(self, *_):
+        pass
+
+    def insertWidget(self, index: int, widget):
+        """Insert widget at the given index (mimics QBoxLayout.insertWidget)."""
+        from PyQt6.QtWidgets import QWidgetItem
+        self.addChildWidget(widget)
+        item = QWidgetItem(widget)
+        self._items.insert(max(0, min(index, len(self._items))), item)
+        self.invalidate()
+
+    def removeWidget(self, widget):
+        """Remove widget from layout (mimics QBoxLayout.removeWidget)."""
+        for i, item in enumerate(self._items):
+            if item.widget() is widget:
+                self._items.pop(i)
+                widget.setParent(None)
+                self.invalidate()
+                return
+
+    def indexOf(self, widget):
+        """Return index of widget, or -1 if not found."""
+        for i, item in enumerate(self._items):
+            if item.widget() is widget:
+                return i
+        return -1
+
+    def __del__(self):
+        item = self.takeAt(0)
+        while item is not None:
+            item = self.takeAt(0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(),
+                      margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        margins = self.contentsMargins()
+        effective_rect = rect.adjusted(margins.left(), margins.top(),
+                                        -margins.right(), -margins.bottom())
+        x = effective_rect.x()
+        y = effective_rect.y()
+        line_height = 0
+
+        for item in self._items:
+            wid = item.widget()
+            space_x = self._spacing
+            space_y = self._spacing
+            next_x = x + item.sizeHint().width() + space_x
+            if next_x - space_x > effective_rect.right() and line_height > 0:
+                x = effective_rect.x()
+                y = y + line_height + space_y
+                next_x = x + item.sizeHint().width() + space_x
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+            x = next_x
+            line_height = max(line_height, item.sizeHint().height())
+        return y + line_height - rect.y() + margins.bottom()
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -49,10 +167,7 @@ from kalshi_api import KalshiAPI
 from market_discovery import discover_events_for_series, parse_strike, display_strike
 from btc_price_feed import CryptoPriceFeed
 from ws_feed import KalshiWsFeed
-from deribit_vol import (
-    DeribitBracketPricer, DeribitWsFeed, find_deribit_expiry,
-    list_deribit_expiries, KALSHI_TO_DERIBIT_CURRENCY,
-)
+
 from strategy import Strategy
 
 
@@ -62,7 +177,50 @@ from strategy import Strategy
 
 _SERIES_FILE = Path(__file__).parent / "series.json"
 _STRATEGY_FILE = Path(__file__).parent / "strategy_params.json"
-_AUTO_EDGE_FILE = Path(__file__).parent / "auto_edge_params.json"
+_APP_SETTINGS_FILE = Path(__file__).parent / "app_settings.json"
+
+
+def _load_app_settings() -> dict:
+    try:
+        with open(_APP_SETTINGS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_app_settings(settings: dict):
+    try:
+        with open(_APP_SETTINGS_FILE, "w") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        print(f"[App] Failed to save app settings: {e}")
+
+def _bs_prob_above(S: float, K: float, sigma: float, T: float, r: float) -> float:
+    """Black-Scholes P(S > K) = N(d2)."""
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    sqrt_T = math.sqrt(T)
+    d2 = (math.log(S / K) + (r - 0.5 * sigma * sigma) * T) / (sigma * sqrt_T)
+    return max(min(0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0))), 1.0), 0.0)
+
+
+def _prob_above_with_iv(K: float, sigma: float, spot: float,
+                        kalshi_close_iso: str, r: float) -> float:
+    """Probability above K using Black-Scholes with an explicit IV (decimal)."""
+    if sigma <= 0 or spot <= 0:
+        return 0.0
+    now_ms = datetime.now(tz=timezone.utc).timestamp() * 1000
+    T = 0.0
+    if kalshi_close_iso:
+        try:
+            close_utc = datetime.fromisoformat(
+                kalshi_close_iso.replace("Z", "+00:00"))
+            T = max((close_utc.timestamp() * 1000 - now_ms) / 1000.0
+                    / (365.25 * 24 * 3600), 0.0)
+        except Exception:
+            T = 0.0
+    return _bs_prob_above(spot, K, sigma, T, r)
+
 
 def _implied_vol_quadratic(price: float, spot: float, strike: float,
                            T: float, r: float = 0.0) -> float:
@@ -116,17 +274,6 @@ def _save_strategy_params(params: dict):
     with open(_STRATEGY_FILE, "w") as f:
         json.dump(params, f, indent=2)
 
-def _load_auto_edge_params() -> dict:
-    try:
-        with open(_AUTO_EDGE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_auto_edge_params(params: dict):
-    with open(_AUTO_EDGE_FILE, "w") as f:
-        json.dump(params, f, indent=2)
-
 CRYPTO_SERIES = _load_series()
 
 
@@ -151,67 +298,15 @@ class DiscoverWorker(QThread):
             self.error.emit(str(e))
 
 
-class DeribitDiscoverWorker(QThread):
-    """Discovers Deribit instruments via REST (single fast call)."""
-    finished = pyqtSignal(str, list)   # (expiry_str, instrument_names)
-    error = pyqtSignal(str)
-
-    def __init__(self, pricer, expiry_str):
-        super().__init__()
-        self.pricer = pricer
-        self.expiry_str = expiry_str
-
-    def run(self):
-        try:
-            names = self.pricer.discover_instruments(self.expiry_str)
-            if len(names) >= 5:
-                self.finished.emit(self.expiry_str, names)
-            else:
-                self.error.emit(f"Only {len(names)} calls for {self.expiry_str}")
-        except Exception as e:
-            self.error.emit(str(e))
-
-
 # =============================================================================
 # IV Smile Window
 # =============================================================================
 
-def implied_vol_from_prob(prob: float, S: float, K: float, T: float,
-                          r: float = 0.043) -> float:
-    """Back out implied volatility from a binary option probability.
-
-    Given P(S>K) = N(d2), solve for sigma using bisection.
-    Returns IV as decimal (e.g. 0.65 for 65%), or 0 if unsolvable.
-    """
-    import math
-    if T <= 0 or S <= 0 or K <= 0 or prob <= 0.01 or prob >= 0.99:
-        return 0.0
-    log_sk = math.log(S / K)
-
-    def bs_prob(sigma):
-        sqrt_T = math.sqrt(T)
-        d2 = (log_sk + (r - 0.5 * sigma * sigma) * T) / (sigma * sqrt_T)
-        return 0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0)))
-
-    lo, hi = 0.01, 5.0
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        p = bs_prob(mid)
-        if p > prob:
-            lo = mid
-        else:
-            hi = mid
-        if hi - lo < 1e-6:
-            break
-    return (lo + hi) / 2
-
-
 class IVSmileWindow(QWidget):
     """Separate window showing the fitted vol smile curve + data points used."""
 
-    def __init__(self, pricer, app_ref):
+    def __init__(self, app_ref):
         super().__init__()
-        self.pricer = pricer
         self.app_ref = app_ref
         self.setWindowTitle("IV Smile")
         self.resize(700, 450)
@@ -269,7 +364,7 @@ class IVSmileWindow(QWidget):
                 continue
             mid = (bid + ask) / 2.0
             iv = _implied_vol_quadratic(mid, spot, disp, T,
-                                        app.pricer.risk_free_rate)
+                                        app.risk_free_rate)
             if iv <= 0:
                 continue
             otm = abs(disp / spot - 1)
@@ -344,10 +439,12 @@ class StrikeParamsDialog(QDialog):
                  max_pos: int, tolerance: float = 0.01,
                  flatten_walk_interval: float = 0.0,
                  flatten_walk_step: float = 0.01,
-                 parent=None, auto_edge: bool = False):
+                 phase3_after_sec: float = 0.0,
+                 phase3_theo_drift_cents: float = 0.0,
+                 parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Params — {strike_label}")
-        self.setFixedSize(260, 360)
+        self.setFixedSize(280, 440)
         self.setStyleSheet(
             "QDialog{background:#0b0f19;}"
             "QLabel{color:#c8cdd5;font-size:12px;}"
@@ -363,30 +460,25 @@ class StrikeParamsDialog(QDialog):
 
         self.edge_bid_input = QLineEdit(f"{edge_bid}")
         self.edge_ask_input = QLineEdit(f"{edge_ask}")
-        if auto_edge:
-            for inp in (self.edge_bid_input, self.edge_ask_input):
-                inp.setEnabled(False)
-                inp.setStyleSheet(
-                    "QLineEdit{background:#0d1117;color:#5a6270;"
-                    "border:1px solid #1e2736;border-radius:3px;padding:4px 8px;}"
-                )
         self.size_bid_input = QLineEdit(f"{size_bid}")
         self.size_ask_input = QLineEdit(f"{size_ask}")
         self.max_pos_input = QLineEdit(f"{max_pos}")
         self.tolerance_input = QLineEdit(f"{tolerance}")
         self.flatten_interval_input = QLineEdit(f"{flatten_walk_interval}")
         self.flatten_step_input = QLineEdit(f"{flatten_walk_step}")
+        self.phase3_after_input = QLineEdit(f"{phase3_after_sec}")
+        self.phase3_drift_input = QLineEdit(f"{phase3_theo_drift_cents}")
 
-        edge_label = "Bid Edge (auto):" if auto_edge else "Bid Edge:"
-        layout.addRow(edge_label, self.edge_bid_input)
-        edge_label = "Ask Edge (auto):" if auto_edge else "Ask Edge:"
-        layout.addRow(edge_label, self.edge_ask_input)
+        layout.addRow("Bid Edge:", self.edge_bid_input)
+        layout.addRow("Ask Edge:", self.edge_ask_input)
         layout.addRow("Bid Size:", self.size_bid_input)
         layout.addRow("Ask Size:", self.size_ask_input)
         layout.addRow("Max Pos:", self.max_pos_input)
         layout.addRow("Tolerance:", self.tolerance_input)
         layout.addRow("Walk Interval (s):", self.flatten_interval_input)
         layout.addRow("Walk Step ($):", self.flatten_step_input)
+        layout.addRow("Phase 3 After (s):", self.phase3_after_input)
+        layout.addRow("Phase 3 Drift (¢):", self.phase3_drift_input)
 
         btn = QPushButton("Apply")
         btn.clicked.connect(self.accept)
@@ -402,7 +494,9 @@ class StrikeParamsDialog(QDialog):
                     int(self.max_pos_input.text()),
                     float(self.tolerance_input.text()),
                     float(self.flatten_interval_input.text()),
-                    float(self.flatten_step_input.text()))
+                    float(self.flatten_step_input.text()),
+                    float(self.phase3_after_input.text()),
+                    float(self.phase3_drift_input.text()))
         except ValueError:
             return None
 
@@ -416,23 +510,20 @@ class AboveBelowApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("4Runner 2.0 — Above/Below Theos")
-        self.resize(1000, 700)
+        self.resize(1000, 700)  # default; overridden below if saved geometry exists
 
         self.api = KalshiAPI()
         self.api.on_rate_limit = self._on_rate_limit
         self._rate_limit_remaining = None
         self._rate_limit_total = None
         self._rate_limit_hit_time = 0
-        self.pricer = DeribitBracketPricer()
-        self.pricer.risk_free_rate = 0.043  # ~4.3% annualised (T-bill rate)
-        self.weekly_pricer = DeribitBracketPricer()
-        self.weekly_pricer.risk_free_rate = 0.043
-        self._deribit_discover_worker = None
-        self._weekly_discover_worker = None
+        # Stale-feed kill switch: when either WS goes silent past its
+        # threshold, cancel all resting orders.  These store the most
+        # recent stale event so the UI can flash a warning.
+        self._stale_source: str = ""           # "Coinbase" or "Kalshi" or ""
+        self._stale_hit_time: float = 0.0      # monotonic ts of last fire
+        self.risk_free_rate = 0.043  # ~4.3% annualised (T-bill rate)
         self._discover_worker = None
-        self.deribit_ws = None      # DeribitWsFeed
-        self.weekly_deribit_ws = None  # Weekly DeribitWsFeed
-        self._weekly_expiry_str = None
         self.iv_window = None       # IVSmileWindow
 
         self.events = []
@@ -459,7 +550,8 @@ class AboveBelowApp(QMainWindow):
         self._pnl_baseline: dict[float, float] = {}  # raw_strike -> PnL at app start
 
         # OTM% filter — only show strikes within this range
-        self.otm_filter_pct: float = 1.5       # show strikes within ±1.5% OTM
+        self._app_settings = _load_app_settings()
+        self.otm_filter_pct: float = float(self._app_settings.get("otm_filter_pct", 8.0))
         self.otm_hysteresis: float = 0.3        # keep showing until OTM exceeds threshold + 0.3%
         self.visible_strikes: set[float] = set()  # currently visible raw strikes
         self.all_strikes: list[float] = []      # all strikes before filtering
@@ -468,6 +560,7 @@ class AboveBelowApp(QMainWindow):
         self._cached_theos: dict[float, tuple[float, float]] = {}  # raw_strike -> (bid_theo, ask_theo)
         self._theo_last_time: dict[float, float] = {}   # raw_strike -> last update timestamp
         self._theo_latency_ema: dict[float, float] = {}  # raw_strike -> EMA of latency in ms
+
 
         # Vol smile fitting state
         self._smile_coeffs: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -478,8 +571,37 @@ class AboveBelowApp(QMainWindow):
         self._smile_otm_pct: float = 0.04                # fit on strikes within 4%
         self._smile_spot_threshold: float = 0.005        # refit on 0.5% spot move
 
+        # Delta lean — adjusts edges based on portfolio delta
+        self._delta_lean_factor: float = 0.5             # lean per unit of delta/$100
+        self._current_lean_bid: float = 0.0
+        self._current_lean_ask: float = 0.0
+
+        # Velocity guard — pulls all init quotes when spot moves too fast.
+        # Flatten/phase3 orders are left untouched.  Manager-level: one
+        # shared cooldown across every strike on the same underlying.
+        from collections import deque
+        self.velocity_enabled: bool = bool(self._app_settings.get("velocity_enabled", True))
+        self.velocity_window_sec: float = float(self._app_settings.get("velocity_window_sec", 3.0))
+        self.velocity_move_threshold: float = float(self._app_settings.get("velocity_move_threshold", 200.0))
+        self.velocity_cooldown_sec: float = float(self._app_settings.get("velocity_cooldown_sec", 5.0))
+        self._spot_history: deque = deque()              # (monotonic_ts, spot) pairs
+        self._velocity_cooldown_until: float = 0.0       # monotonic time
+        self._velocity_was_active: bool = False          # tracks cooldown→idle transition
+        self._velocity_fire_count: int = 0               # session count of guard fires
+
         self._build_ui()
         self._apply_stylesheet()
+
+        # Restore last window geometry if saved
+        saved_geom = self._app_settings.get("window_geometry", "")
+        if saved_geom:
+            try:
+                import base64
+                from PyQt6.QtCore import QByteArray
+                self.restoreGeometry(QByteArray.fromBase64(saved_geom.encode("ascii")))
+            except Exception:
+                pass
+
         self._fetch_balance()
 
         # Timer — update table (non-theo columns) every 1s
@@ -531,8 +653,10 @@ class AboveBelowApp(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        # --- Top row: Series, Event, Spot ---
-        top = QHBoxLayout()
+        # --- Top row: Series, Event, Spot (FlowLayout auto-wraps) ---
+        top_widget = QWidget()
+        top = FlowLayout(top_widget, margin=0, spacing=10)
+        self._top_layout = top  # save for compact mode
 
         top.addWidget(QLabel("Crypto:"))
         self.series_combo = QComboBox()
@@ -599,11 +723,6 @@ class AboveBelowApp(QMainWindow):
         top.addWidget(self.kalshi_countdown)
 
         top.addSpacing(15)
-        self.deribit_countdown = QLabel("")
-        self.deribit_countdown.setStyleSheet("color:#5a6270;font-size:11px;")
-        top.addWidget(self.deribit_countdown)
-
-        top.addSpacing(15)
         self.iv_btn = QPushButton("IV Smile")
         self.iv_btn.setMaximumWidth(80)
         self.iv_btn.setStyleSheet(
@@ -625,67 +744,77 @@ class AboveBelowApp(QMainWindow):
         self.portfolio_btn.clicked.connect(self._open_portfolio_window)
         top.addWidget(self.portfolio_btn)
 
-        layout.addLayout(top)
+        top.addSpacing(5)
+        self.compact_btn = QPushButton("Compact")
+        self.compact_btn.setCheckable(True)
+        self.compact_btn.setMaximumWidth(80)
+        self.compact_btn.setStyleSheet(
+            "QPushButton{background:#1e2736;color:#c8cdd5;border:1px solid #2d3a4d;"
+            "border-radius:3px;padding:4px 8px;}"
+            "QPushButton:hover{background:#2d3a4d;}"
+            "QPushButton:checked{background:#22c55e;color:#000;}"
+        )
+        self.compact_btn.toggled.connect(self._on_compact_toggled)
+        top.addWidget(self.compact_btn)
+
+        layout.addWidget(top_widget)
 
         # --- Second row: Auto Edge + Deribit status ---
-        row2 = QHBoxLayout()
+        self.row2_widget = QWidget()
+        row2 = QHBoxLayout(self.row2_widget)
+        row2.setContentsMargins(0, 0, 0, 0)
 
         _btn_style = ("QPushButton{background:#1e2736;color:#c8cdd5;border:1px solid #2d3a4d;"
                       "border-radius:3px;padding:4px 8px;}"
                       "QPushButton:hover{background:#2d3a4d;}"
                       "QPushButton:checked{background:#22c55e;color:#000;}")
 
-        self.auto_edge_btn = QPushButton("Auto Edge")
-        self.auto_edge_btn.setCheckable(True)
-        self.auto_edge_btn.setChecked(False)
-        self.auto_edge_btn.setMaximumWidth(80)
-        self.auto_edge_btn.setStyleSheet(_btn_style)
-        self.auto_edge_btn.toggled.connect(self._on_auto_edge_toggled)
-        row2.addWidget(self.auto_edge_btn)
+        self.init_only_btn = QPushButton("Init Only")
+        self.init_only_btn.setCheckable(True)
+        self.init_only_btn.setChecked(False)
+        self.init_only_btn.setMaximumWidth(80)
+        self.init_only_btn.setStyleSheet(_btn_style)
+        self.init_only_btn.toggled.connect(self._on_init_only_toggled)
+        row2.addWidget(self.init_only_btn)
 
-        self.auto_edge_config_btn = QPushButton("Config")
-        self.auto_edge_config_btn.setMaximumWidth(55)
-        self.auto_edge_config_btn.setStyleSheet(
+        row2.addSpacing(10)
+        row2.addWidget(QLabel("Lean:"))
+        self.lean_input = QLineEdit(f"{self._delta_lean_factor}")
+        self.lean_input.setMaximumWidth(45)
+        self.lean_input.setStyleSheet(
+            "QLineEdit{background:#141923;color:#c8cdd5;"
+            "border:1px solid #1e2736;border-radius:3px;padding:2px 4px;}"
+        )
+        self.lean_input.editingFinished.connect(self._on_lean_changed)
+        row2.addWidget(self.lean_input)
+
+        row2.addSpacing(10)
+        self.velocity_btn = QPushButton("Velocity…")
+        self.velocity_btn.setMaximumWidth(95)
+        self.velocity_btn.setStyleSheet(
             "QPushButton{background:#1e2736;color:#c8cdd5;border:1px solid #2d3a4d;"
             "border-radius:3px;padding:4px 8px;}"
             "QPushButton:hover{background:#2d3a4d;}"
         )
-        self.auto_edge_config_btn.clicked.connect(self._open_auto_edge_config)
-        row2.addWidget(self.auto_edge_config_btn)
+        self.velocity_btn.clicked.connect(self._open_velocity_dialog)
+        row2.addWidget(self.velocity_btn)
 
-        # Store auto edge params (load saved or use defaults)
-        _defaults = {
-            "base_bid": 1.0, "base_ask": 3.0,
-            "atm_pct": 3.0, "scale": 0.5, "interval": 60,
-        }
-        saved_ae = _load_auto_edge_params()
-        self._auto_edge_params = {k: saved_ae.get(k, v) for k, v in _defaults.items()}
+        # Live state: "ON · 3.0s / $200 / 5.0s" or "OFF"
+        self.velocity_status = QLabel("")
+        self.velocity_status.setStyleSheet("color:#5a6270;font-size:11px;")
+        row2.addWidget(self.velocity_status)
+        self._update_velocity_status()
 
-        self._auto_edge_timer = QTimer()
-        self._auto_edge_timer.timeout.connect(self._recompute_auto_edges)
-
-        row2.addSpacing(15)
-        row2.addWidget(QLabel("IV Source:"))
-        self.iv_source_combo = QComboBox()
-        self.iv_source_combo.addItems(["Auto", "Weekly"])
-        self.iv_source_combo.setMaximumWidth(80)
-        self.iv_source_combo.setStyleSheet(
-            "QComboBox{background:#141923;color:#c8cdd5;"
-            "border:1px solid #1e2736;border-radius:3px;padding:2px 4px;}"
+        row2.addSpacing(10)
+        # Live write throughput — tokens/sec consumed against Kalshi's
+        # write bucket (Basic tier: 100/sec).  Updates from the table tick.
+        self.write_rate_label = QLabel("0 tok/s")
+        self.write_rate_label.setStyleSheet("color:#5a6270;font-size:11px;")
+        self.write_rate_label.setToolTip(
+            "Write tokens consumed in the last 1s.\n"
+            "Basic tier budget: 100 tok/s."
         )
-        self.iv_source_combo.currentTextChanged.connect(self._on_iv_source_changed)
-        row2.addWidget(self.iv_source_combo)
-
-        row2.addSpacing(10)
-        self.deribit_label = QLabel("")
-        self.deribit_label.setStyleSheet("color:#5a6270;font-size:11px;")
-        row2.addWidget(self.deribit_label)
-
-        row2.addSpacing(10)
-        self.deribit_age_label = QLabel("")
-        self.deribit_age_label.setStyleSheet("color:#5a6270;font-size:11px;")
-        row2.addWidget(self.deribit_age_label)
-        self._last_deribit_update = None
+        row2.addWidget(self.write_rate_label)
 
         row2.addSpacing(10)
         self.rate_limit_label = QLabel("")
@@ -693,37 +822,35 @@ class AboveBelowApp(QMainWindow):
         self.rate_limit_label.hide()
         row2.addWidget(self.rate_limit_label)
 
+        # Stale-feed warning — shows which WS dropped + that orders were cancelled
+        self.stale_label = QLabel("")
+        self.stale_label.setStyleSheet("color:#ef4444;font-size:12px;font-weight:bold;")
+        self.stale_label.hide()
+        row2.addWidget(self.stale_label)
+
         row2.addStretch()
 
-        layout.addLayout(row2)
+        layout.addWidget(self.row2_widget)
 
         # --- Table ---
         self.table = QTableWidget()
-        self.table.setColumnCount(17)
+        self.table.setColumnCount(11)
         self.table.setHorizontalHeaderLabels([
-            "Strike", "OTM%", "Yes Bid", "Yes Ask", "Theo", "Edge",
-            "Deribit IV", "Smoothed IV", "Position", "Δ", "γ", "ν", "θ", "Order", "PnL", "", "",
+            "Strike", "Yes Bid", "Yes Ask", "Theo", "Edge",
+            "Smoothed IV", "Position", "Order", "PnL", "", "",
         ])
         header = self.table.horizontalHeader()
         # All columns interactive (user-resizable), with sensible defaults
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(0, 80)    # Strike
-        self.table.setColumnWidth(1, 50)    # OTM%
-        self.table.setColumnWidth(2, 90)    # Yes Bid
-        self.table.setColumnWidth(3, 90)    # Yes Ask
-        self.table.setColumnWidth(4, 130)   # Theo
-        self.table.setColumnWidth(5, 75)    # Edge
-        self.table.setColumnWidth(6, 120)   # Deribit IV
-        self.table.setColumnWidth(7, 85)    # Smoothed IV
-        self.table.setColumnWidth(8, 95)    # Position
-        self.table.setColumnWidth(9, 85)    # Δ
-        self.table.setColumnWidth(10, 85)   # γ
-        self.table.setColumnWidth(11, 85)   # ν
-        self.table.setColumnWidth(12, 85)   # θ
-        self.table.setColumnWidth(13, 160)  # Order
-        self.table.setColumnWidth(14, 90)   # PnL
-        self.table.setColumnWidth(15, 50)   # ON/OFF button
-        self.table.setColumnWidth(16, 50)   # FLAT button
+        # Default widths (used if no saved widths)
+        default_widths = [90, 110, 110, 90, 100, 85, 120, 160, 120, 50, 50]
+        saved_widths = self._app_settings.get("column_widths", [])
+        for i, default in enumerate(default_widths):
+            w = saved_widths[i] if i < len(saved_widths) else default
+            self.table.setColumnWidth(i, w)
+
+        # Persist column widths when user resizes
+        header.sectionResized.connect(self._on_column_resized)
         header.setStretchLastSection(False)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -733,6 +860,13 @@ class AboveBelowApp(QMainWindow):
         self.table.customContextMenuRequested.connect(self._on_table_right_click)
         self.table.cellDoubleClicked.connect(self._on_strike_clicked)
         layout.addWidget(self.table)
+
+        # --- Portfolio Greeks Summary ---
+        self.greeks_label = QLabel("Portfolio:  Δ: --  γ: --  ν: --  θ: --")
+        self.greeks_label.setFont(QFont("Courier", 12, QFont.Weight.Bold))
+        self.greeks_label.setStyleSheet("color:#c8cdd5;padding:4px 8px;")
+        self.greeks_label.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self.greeks_label)
 
     # =========================================================================
     # Series & Event Selection
@@ -761,13 +895,13 @@ class AboveBelowApp(QMainWindow):
         if self.ws_feed:
             self.ws_feed.stop()
             self.ws_feed = None
-        if self.deribit_ws:
-            self.deribit_ws.stop()
-            self.deribit_ws = None
 
         # Start new price feed
         product = self._current_coinbase_product()
-        self.price_feed = CryptoPriceFeed(self._on_price, product)
+        self.price_feed = CryptoPriceFeed(
+            self._on_price, product,
+            on_stale=lambda: self._on_feed_stale("Coinbase"),
+        )
         self.price_feed.start()
 
         # Discover events
@@ -901,11 +1035,20 @@ class AboveBelowApp(QMainWindow):
             # Only restore from exchange if we didn't unstash
             self._restore_strategies()
         self._start_ws_feed()
-        self._fetch_deribit()
 
     # =========================================================================
     # OTM% Filter
     # =========================================================================
+
+    def _on_column_resized(self, *_):
+        """Persist column widths when user resizes."""
+        try:
+            widths = [self.table.columnWidth(i)
+                      for i in range(self.table.columnCount())]
+            self._app_settings["column_widths"] = widths
+            _save_app_settings(self._app_settings)
+        except Exception:
+            pass
 
     def _on_otm_filter_changed(self):
         """User changed the OTM% filter input."""
@@ -914,126 +1057,209 @@ class AboveBelowApp(QMainWindow):
             if val > 0:
                 self.otm_filter_pct = val
                 self._apply_otm_filter()
+                self._app_settings["otm_filter_pct"] = val
+                _save_app_settings(self._app_settings)
         except ValueError:
             pass
+
+    # =========================================================================
+    # Velocity Guard
+    # =========================================================================
+
+    def _update_velocity_status(self):
+        """Steady-state status: ON · params (N)  /  OFF (N)."""
+        suffix = f"  ({self._velocity_fire_count})"
+        if self.velocity_enabled:
+            self.velocity_status.setText(
+                f"ON · {self.velocity_window_sec:.1f}s / "
+                f"${self.velocity_move_threshold:,.0f} / "
+                f"{self.velocity_cooldown_sec:.1f}s"
+                f"{suffix}"
+            )
+            self.velocity_status.setStyleSheet("color:#22c55e;font-size:11px;")
+        else:
+            self.velocity_status.setText(f"OFF{suffix}")
+            self.velocity_status.setStyleSheet("color:#5a6270;font-size:11px;")
+
+    def _tick_velocity_display(self):
+        """Called every UI tick (200ms).  While in cooldown, flash a red
+        countdown.  Once the cooldown expires, restore steady-state once.
+        The session fire count `(N)` is appended in all states.
+        """
+        now = time.monotonic()
+        suffix = f"  ({self._velocity_fire_count})"
+        if now < self._velocity_cooldown_until:
+            remaining = self._velocity_cooldown_until - now
+            self.velocity_status.setText(
+                f"FIRED · cooldown {remaining:.1f}s{suffix}"
+            )
+            self.velocity_status.setStyleSheet(
+                "color:#ef4444;font-size:11px;font-weight:bold;"
+            )
+            self._velocity_was_active = True
+        elif self._velocity_was_active:
+            # Just exited cooldown — restore the steady-state label
+            self._velocity_was_active = False
+            self._update_velocity_status()
+
+    def _open_velocity_dialog(self):
+        """Modal dialog to edit velocity guard params.  Saves on accept."""
+        from PyQt6.QtWidgets import QCheckBox, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Velocity Guard")
+        dlg.setStyleSheet(
+            "QDialog{background:#0f172a;}"
+            "QLabel{color:#c8cdd5;}"
+            "QLineEdit{background:#141923;color:#c8cdd5;"
+            "border:1px solid #1e2736;border-radius:3px;padding:3px 6px;}"
+            "QCheckBox{color:#c8cdd5;}"
+            "QPushButton{background:#1e2736;color:#c8cdd5;"
+            "border:1px solid #2d3a4d;border-radius:3px;padding:4px 12px;}"
+            "QPushButton:hover{background:#2d3a4d;}"
+        )
+        form = QFormLayout(dlg)
+
+        enabled_cb = QCheckBox()
+        enabled_cb.setChecked(self.velocity_enabled)
+
+        win_input = QLineEdit(f"{self.velocity_window_sec}")
+        thr_input = QLineEdit(f"{self.velocity_move_threshold}")
+        cd_input = QLineEdit(f"{self.velocity_cooldown_sec}")
+
+        form.addRow("Enabled:", enabled_cb)
+        form.addRow("Window (sec):", win_input)
+        form.addRow("Move threshold ($):", thr_input)
+        form.addRow("Cooldown (sec):", cd_input)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            new_win = float(win_input.text())
+            new_thr = float(thr_input.text())
+            new_cd = float(cd_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Velocity Guard",
+                                "Invalid number — keeping previous values.")
+            return
+        if new_win <= 0 or new_thr <= 0 or new_cd <= 0:
+            QMessageBox.warning(self, "Velocity Guard",
+                                "All values must be > 0.")
+            return
+
+        self.velocity_enabled = enabled_cb.isChecked()
+        self.velocity_window_sec = new_win
+        self.velocity_move_threshold = new_thr
+        self.velocity_cooldown_sec = new_cd
+        # Disabling clears any active cooldown so init quotes resume now
+        if not self.velocity_enabled:
+            self._velocity_cooldown_until = 0.0
+            for s in self.strategies.values():
+                s._velocity_cooldown_until = 0.0
+        self._app_settings.update({
+            "velocity_enabled": self.velocity_enabled,
+            "velocity_window_sec": self.velocity_window_sec,
+            "velocity_move_threshold": self.velocity_move_threshold,
+            "velocity_cooldown_sec": self.velocity_cooldown_sec,
+        })
+        _save_app_settings(self._app_settings)
+        self._update_velocity_status()
 
     def _on_rate_changed(self):
         """User changed the risk-free rate input."""
         try:
             val = float(self.rate_input.text())
-            self.pricer.risk_free_rate = val / 100.0
+            self.risk_free_rate = val / 100.0
         except ValueError:
             pass
 
-    def _open_auto_edge_config(self):
-        """Open dialog to configure auto edge parameters."""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Auto Edge Configuration")
-        dlg.setStyleSheet(
-            "QDialog{background:#0d1117;color:#c8cdd5;}"
-            "QLabel{color:#c8cdd5;font-size:12px;}"
-            "QLineEdit{background:#161b22;color:#e6edf3;border:1px solid #30363d;"
-            "border-radius:3px;padding:4px 6px;font-size:12px;}"
-        )
-        layout = QFormLayout(dlg)
-
-        p = self._auto_edge_params
-        inputs = {}
-        fields = [
-            ("base_bid", "Base Bid Edge (¢)", p["base_bid"]),
-            ("base_ask", "Base Ask Edge (¢)", p["base_ask"]),
-            ("atm_pct", "ATM Threshold (%)", p["atm_pct"]),
-            ("scale", "Scale (¢ per % beyond ATM)", p["scale"]),
-            ("interval", "Recompute Interval (s)", int(p["interval"])),
-        ]
-        for key, label, val in fields:
-            inp = QLineEdit(str(val))
-            inp.setFixedWidth(100)
-            inputs[key] = inp
-            layout.addRow(QLabel(label), inp)
-
-        btn_row = QHBoxLayout()
-        ok_btn = QPushButton("OK")
-        ok_btn.setStyleSheet(
-            "QPushButton{background:#238636;color:#fff;border:none;"
-            "border-radius:3px;padding:6px 16px;}"
-            "QPushButton:hover{background:#2ea043;}"
-        )
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setStyleSheet(
-            "QPushButton{background:#21262d;color:#c8cdd5;border:1px solid #30363d;"
-            "border-radius:3px;padding:6px 16px;}"
-            "QPushButton:hover{background:#30363d;}"
-        )
-        btn_row.addStretch()
-        btn_row.addWidget(ok_btn)
-        btn_row.addWidget(cancel_btn)
-        layout.addRow(btn_row)
-
-        def accept():
-            try:
-                self._auto_edge_params["base_bid"] = float(inputs["base_bid"].text())
-                self._auto_edge_params["base_ask"] = float(inputs["base_ask"].text())
-                self._auto_edge_params["atm_pct"] = float(inputs["atm_pct"].text())
-                self._auto_edge_params["scale"] = float(inputs["scale"].text())
-                self._auto_edge_params["interval"] = max(5, int(float(inputs["interval"].text())))
-            except ValueError:
-                QMessageBox.warning(dlg, "Invalid Input", "All fields must be numeric.")
-                return
-            # Update timer interval if auto edge is active
-            if self.auto_edge_btn.isChecked():
-                self._auto_edge_timer.start(self._auto_edge_params["interval"] * 1000)
-            _save_auto_edge_params(self._auto_edge_params)
-            # Always recompute immediately on config change
-            self._recompute_auto_edges(force=True)
-            dlg.accept()
-
-        ok_btn.clicked.connect(accept)
-        cancel_btn.clicked.connect(dlg.reject)
-        dlg.exec()
-
-    def _on_auto_edge_toggled(self, checked: bool):
-        """Toggle between manual and auto edge mode."""
+    def _on_compact_toggled(self, checked: bool):
+        """Toggle compact mode — fits the app on a smaller/horizontal monitor."""
         if checked:
-            interval = self._auto_edge_params["interval"]
-            self._auto_edge_timer.start(max(interval, 5) * 1000)
-            self._recompute_auto_edges()  # run immediately
-            print(f"[App] Auto edge ON (interval={interval}s)")
+            # Move row2 buttons into top row (before IV Smile button), hide row2
+            row2_buttons = [self.init_only_btn]
+            iv_idx = self._top_layout.indexOf(self.iv_btn)
+            for btn in row2_buttons:
+                self._top_layout.insertWidget(iv_idx, btn)
+                iv_idx += 1
+            self.row2_widget.hide()
+
+            # Shrink wide widgets
+            self.event_combo.setMinimumWidth(0)
+            self.event_combo.setMaximumWidth(150)
+            self.kalshi_countdown.setMaximumWidth(150)
+            # Let greeks label wrap/shrink
+            self.greeks_label.setWordWrap(True)
+            self.greeks_label.setMinimumWidth(0)
+            # Allow window to shrink
+            self.setMinimumSize(0, 0)
+            self.centralWidget().setMinimumSize(0, 0)
+
+            # Compact column widths
+            self.table.setColumnWidth(0, 65)    # Strike
+            self.table.setColumnWidth(1, 45)    # OTM%
+            self.table.setColumnWidth(2, 80)    # Yes Bid
+            self.table.setColumnWidth(3, 80)    # Yes Ask
+            self.table.setColumnWidth(4, 70)    # Theo
+            self.table.setColumnWidth(5, 65)    # Edge
+            self.table.setColumnWidth(6, 75)    # Δ Lean
+            self.table.setColumnWidth(7, 65)    # Smoothed IV
+            self.table.setColumnWidth(8, 90)    # Position
+            self.table.setColumnWidth(9, 130)   # Order
+            self.table.setColumnWidth(10, 95)   # PnL
+            self.table.setColumnWidth(11, 45)   # ON/OFF
+            self.table.setColumnWidth(12, 45)   # FLAT
         else:
-            self._auto_edge_timer.stop()
-            print("[App] Auto edge OFF (manual mode)")
+            # Move row2 buttons back into row2_widget layout
+            row2_buttons = [self.init_only_btn]
+            row2_layout = self.row2_widget.layout()
+            for i, btn in enumerate(row2_buttons):
+                self._top_layout.removeWidget(btn)
+                row2_layout.insertWidget(i, btn)
+            self.row2_widget.show()
 
-    def _recompute_auto_edges(self, force=False):
-        """Recompute edges for all active strategies based on OTM%."""
-        if not force and not self.auto_edge_btn.isChecked():
-            return
+            # Restore widget widths
+            self.event_combo.setMinimumWidth(280)
+            self.event_combo.setMaximumWidth(16777215)  # default unlimited
+            self.kalshi_countdown.setMaximumWidth(16777215)
+            self.greeks_label.setWordWrap(False)
 
-        p = self._auto_edge_params
-        base_bid = p["base_bid"] / 100.0   # cents to dollars
-        base_ask = p["base_ask"] / 100.0
-        atm_pct = p["atm_pct"]
-        scale_per_pct = p["scale"] / 100.0  # cents to dollars
+            # Restore default column widths
+            self.table.setColumnWidth(0, 80)    # Strike
+            self.table.setColumnWidth(1, 50)    # OTM%
+            self.table.setColumnWidth(2, 110)   # Yes Bid
+            self.table.setColumnWidth(3, 110)   # Yes Ask
+            self.table.setColumnWidth(4, 90)    # Theo
+            self.table.setColumnWidth(5, 75)    # Edge
+            self.table.setColumnWidth(6, 90)    # Δ Lean
+            self.table.setColumnWidth(7, 85)    # Smoothed IV
+            self.table.setColumnWidth(8, 120)   # Position
+            self.table.setColumnWidth(9, 160)   # Order
+            self.table.setColumnWidth(10, 120)  # PnL
+            self.table.setColumnWidth(11, 50)   # ON/OFF
+            self.table.setColumnWidth(12, 50)   # FLAT
 
-        spot = self.spot_price
-        if spot <= 0:
-            return
+    def _on_init_only_toggled(self, checked: bool):
+        """Toggle init-only mode for all strategies."""
+        for strat in self.strategies.values():
+            strat.init_only = checked
+        print(f"[App] Init Only: {'ON' if checked else 'OFF'}")
 
-        updated = 0
-        for ticker, strat in self.strategies.items():
-            otm = abs(strat.strike - spot) / spot * 100
-            beyond = max(otm - atm_pct, 0)
-            new_eb = round(base_bid + beyond * scale_per_pct, 4)
-            new_ea = round(base_ask + beyond * scale_per_pct, 4)
-
-            if abs(strat.edge_bid - new_eb) > 0.0001 or abs(strat.edge_ask - new_ea) > 0.0001:
-                strat.edge_bid = new_eb
-                strat.edge_ask = new_ea
-                updated += 1
-
-        if updated > 0:
-            print(f"[App] Auto edge: updated {updated} strategies "
-                  f"(base={base_bid*100:.1f}¢/{base_ask*100:.1f}¢, "
-                  f"atm={atm_pct}%, scale={scale_per_pct*100:.1f}¢/% beyond)")
+    def _on_lean_changed(self):
+        """User changed the delta lean factor."""
+        try:
+            val = float(self.lean_input.text())
+            if val >= 0:
+                self._delta_lean_factor = val
+        except ValueError:
+            pass
 
     def _apply_otm_filter(self):
         """Filter strikes by OTM% with hysteresis, rebuild table.
@@ -1106,8 +1332,11 @@ class AboveBelowApp(QMainWindow):
         if not tickers:
             return
 
-        self.ws_feed = KalshiWsFeed(self.api, self._on_ws_update,
-                                     on_fill=self._on_ws_fill)
+        self.ws_feed = KalshiWsFeed(
+            self.api, self._on_ws_update,
+            on_fill=self._on_ws_fill,
+            on_stale=lambda: self._on_feed_stale("Kalshi"),
+        )
         self.ws_feed.start(tickers)
 
     def _find_market_data_for_ticker(self, ticker: str):
@@ -1148,11 +1377,13 @@ class AboveBelowApp(QMainWindow):
             pos += count if action == "sell" else -count
         data["position"] = pos
 
-        # Sync to strategy — clear resting order so it reposts
+        # Sync to strategy — clear resting order so it reposts.
+        # Pass fill details so the strategy can update avg_entry locally
+        # (avoids the REST refresh race that caused stale-avg phase 3 fires).
         strat = strats.get(raw) if strats else None
         if strat:
             strat.position = pos
-            strat.on_fill()
+            strat.on_fill(action=action, price=price, count=count, side=side)
 
         # Flash the position cell
         if raw is not None:
@@ -1182,6 +1413,11 @@ class AboveBelowApp(QMainWindow):
             self.spot_bid = bid
         if ask > 0:
             self.spot_ask = ask
+
+        # Velocity guard runs BEFORE re-quoting — if it fires, init orders
+        # are cancelled and the strategy-level cooldown will block re-place.
+        self._check_velocity_guard(price)
+
         # Compute theos + feed strategies immediately (runs on WS thread)
         self._recompute_and_trade()
         self._ui_dirty = True  # signal UI timer to refresh display
@@ -1191,6 +1427,74 @@ class AboveBelowApp(QMainWindow):
             move = abs(price - self._last_smile_spot) / self._last_smile_spot
             if move >= self._smile_spot_threshold:
                 self._refit_vol_smile()
+
+    def _check_velocity_guard(self, spot: float):
+        """If |max-min spot| over the window exceeds the threshold, cancel
+        all INIT orders across every strategy (one batched DELETE) and set
+        a cooldown that blocks new init quotes for cooldown_sec.
+
+        Flatten / phase 3 orders are NOT touched — those are exiting an
+        existing position and should keep working through the move.
+        """
+        if not self.velocity_enabled or spot <= 0:
+            return
+        now = time.monotonic()
+        # In cooldown — skip the velocity recompute entirely.  Strategies
+        # already see the cooldown; nothing to do here.
+        if now < self._velocity_cooldown_until:
+            return
+
+        self._spot_history.append((now, spot))
+        # Drop samples older than the window.
+        while self._spot_history and now - self._spot_history[0][0] > self.velocity_window_sec:
+            self._spot_history.popleft()
+        if len(self._spot_history) < 2:
+            return
+
+        spots = [s for _, s in self._spot_history]
+        move = max(spots) - min(spots)
+        if move < self.velocity_move_threshold:
+            return
+
+        # Trigger: collect init order ids across all strategies and batch cancel.
+        # Set cooldown FIRST so any callbacks that fire mid-cancel see it.
+        self._velocity_cooldown_until = now + self.velocity_cooldown_sec
+        self._velocity_fire_count += 1
+        ids = []
+        for strat in self.strategies.values():
+            ids.extend(strat.cancel_init_orders_local())
+            strat._velocity_cooldown_until = self._velocity_cooldown_until
+
+        print(f"[Velocity] FIRED — spot moved ${move:,.2f} in "
+              f"{self.velocity_window_sec:.1f}s; cancelling {len(ids)} init "
+              f"orders, cooldown {self.velocity_cooldown_sec:.1f}s")
+
+        # Audible alert — same mechanism as fill sound (afplay, controlled
+        # by output volume).  Hero.aiff is distinct from the Glass.aiff
+        # used for fills so the two are easy to tell apart by ear.
+        try:
+            import subprocess
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Hero.aiff"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        if ids:
+            # Async — keeps the WS thread free during the cancel round-trip.
+            # Failures are logged in the callback; local state was already
+            # cleared by `cancel_init_orders_local`, and 404s from
+            # already-filled orders are benign.
+            f = self.api.cancel_orders_batched_async(ids)
+            def _on_batch_done(future):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"[Velocity] batch cancel failed: {e}")
+            f.add_done_callback(_on_batch_done)
+
+        # Drop the buffer so we don't immediately re-trigger when cooldown
+        # expires on a still-moving market.
+        self._spot_history.clear()
 
     # =========================================================================
     # Balance
@@ -1223,6 +1527,59 @@ class AboveBelowApp(QMainWindow):
             pass
 
     # =========================================================================
+    # Stale-feed kill switch
+    # =========================================================================
+
+    def _on_feed_stale(self, source: str):
+        """Fired by either WS feed when it crosses its staleness threshold.
+
+        Cancels every resting order across all (active + stashed) strategies
+        so we don't sit on stale quotes while disconnected.  Once a feed
+        reconnects and ticks resume, strategies repost normally on the next
+        update cycle.  Idempotent if both feeds go stale simultaneously.
+        """
+        print(f"[App] {source} feed STALE — cancelling all resting orders")
+        self._stale_source = source
+        self._stale_hit_time = time.monotonic()
+
+        # Collect every resting order id from active + stashed strategies
+        ids: list[str] = []
+        for strat in self.strategies.values():
+            ids.extend(strat.cancel_all_orders_local())
+        for stashed in self._stashed_strategies.values():
+            for strat in stashed.values():
+                ids.extend(strat.cancel_all_orders_local())
+
+        if ids:
+            try:
+                f = self.api.cancel_orders_batched_async(ids)
+                f.add_done_callback(lambda fut: self._on_stale_cancel_done(fut, len(ids)))
+            except Exception as e:
+                print(f"[App] stale cancel failed: {e}")
+        else:
+            print("[App] no resting orders to cancel on stale")
+
+    def _on_stale_cancel_done(self, future, n: int):
+        try:
+            future.result()
+            print(f"[App] stale cancel batch ack'd ({n} orders)")
+        except Exception as e:
+            print(f"[App] stale cancel batch failed: {e}")
+
+    def _update_stale_label(self):
+        """Update the stale-feed warning label.  Shown for 30s after a
+        stale event so the user can see WHICH feed dropped."""
+        if not hasattr(self, "stale_label"):
+            return
+        if self._stale_hit_time > 0 and (time.monotonic() - self._stale_hit_time) < 30:
+            self.stale_label.setText(f"⚠ {self._stale_source} STALE — orders cancelled")
+            self.stale_label.setStyleSheet(
+                "color:#ef4444;font-size:12px;font-weight:bold;")
+            self.stale_label.show()
+        else:
+            self.stale_label.hide()
+
+    # =========================================================================
     # Rate Limit
     # =========================================================================
 
@@ -1236,6 +1593,20 @@ class AboveBelowApp(QMainWindow):
 
     def _update_rate_limit_label(self):
         """Update the rate limit warning label. Called from table tick."""
+        # Live write tokens/sec — colour-coded against the 100 budget
+        try:
+            tokens, calls = self.api.write_tokens_per_sec(window=1.0)
+            self.write_rate_label.setText(f"{tokens} tok/s · {calls} req/s")
+            if tokens >= 90:
+                color = "#ef4444"   # red — at/over budget
+            elif tokens >= 60:
+                color = "#facc15"   # yellow — approaching
+            else:
+                color = "#5a6270"   # gray — healthy
+            self.write_rate_label.setStyleSheet(f"color:{color};font-size:11px;")
+        except Exception:
+            pass
+
         # Show if we got a 429 in the last 10 seconds
         if self._rate_limit_hit_time > 0:
             elapsed = time.time() - self._rate_limit_hit_time
@@ -1251,148 +1622,6 @@ class AboveBelowApp(QMainWindow):
                 self._rate_limit_hit_time = 0
 
         self.rate_limit_label.hide()
-
-    # =========================================================================
-    # Deribit
-    # =========================================================================
-
-    def _on_iv_source_changed(self, text: str):
-        """User changed IV source dropdown."""
-        print(f"[App] IV source changed to: {text}")
-        if text == "Weekly" and not self.weekly_deribit_ws:
-            self._fetch_weekly_deribit()
-        self._update_deribit_status_label()
-        self._recompute_and_trade()
-        self._ui_dirty = True
-
-    def _fetch_deribit(self):
-        """Discover Deribit instruments, then start WS feed."""
-        if not self.current_event:
-            return
-
-        # Stop any existing Deribit WS feed
-        if self.deribit_ws:
-            self.deribit_ws.stop()
-            self.deribit_ws = None
-
-        series = self._current_series_ticker()
-        currency = KALSHI_TO_DERIBIT_CURRENCY.get(series)
-        if not currency:
-            self.deribit_label.setText(f"No Deribit for {series}")
-            return
-
-        self.pricer.currency = currency
-        self.weekly_pricer.currency = currency
-
-        close_time = self.current_event.get("close_time", "")
-        expiry_str = find_deribit_expiry(close_time, currency=currency)
-        if not expiry_str:
-            self.deribit_label.setText("No expiry match")
-            return
-
-        if self._deribit_discover_worker and self._deribit_discover_worker.isRunning():
-            return
-
-        self.deribit_label.setText(f"Discovering {currency} {expiry_str}...")
-        self._deribit_discover_worker = DeribitDiscoverWorker(self.pricer, expiry_str)
-        self._deribit_discover_worker.finished.connect(self._on_instruments_discovered)
-        self._deribit_discover_worker.error.connect(
-            lambda e: self.deribit_label.setText(f"Error: {e}")
-        )
-        self._deribit_discover_worker.start()
-
-        # Also start the weekly feed if IV source is set to Weekly
-        if self.iv_source_combo.currentText() == "Weekly":
-            self._fetch_weekly_deribit()
-
-    def _fetch_weekly_deribit(self):
-        """Discover and connect to the weekly (nearest Friday) Deribit expiry."""
-        series = self._current_series_ticker()
-        currency = KALSHI_TO_DERIBIT_CURRENCY.get(series)
-        if not currency:
-            return
-
-        if self._weekly_discover_worker and self._weekly_discover_worker.isRunning():
-            return
-
-        # Find all available expiries and pick the nearest weekly (Friday)
-        try:
-            available = list_deribit_expiries(currency)
-        except Exception as e:
-            print(f"[App] Failed to list Deribit expiries: {e}")
-            return
-
-        from datetime import timedelta
-        _months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-                    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
-
-        now = datetime.now(tz=timezone.utc).date()
-        best = None
-        best_date = None
-        for exp_str in available:
-            try:
-                for m_name, m_num in _months.items():
-                    idx = exp_str.find(m_name)
-                    if idx > 0:
-                        d = int(exp_str[:idx])
-                        y = 2000 + int(exp_str[idx + 3:])
-                        exp_date = datetime(y, m_num, d).date()
-                        # Weekly = closest upcoming Friday (weekday 4)
-                        if exp_date.weekday() != 4:
-                            break
-                        if exp_date >= now:
-                            if best_date is None or exp_date < best_date:
-                                best = exp_str
-                                best_date = exp_date
-                        break
-            except Exception:
-                continue
-
-        if not best:
-            print("[App] No weekly Deribit expiry found")
-            return
-
-        # Don't restart if already connected to this expiry
-        if best == self._weekly_expiry_str and self.weekly_deribit_ws:
-            return
-
-        self._weekly_expiry_str = best
-        print(f"[App] Discovering weekly Deribit expiry: {best}")
-
-        if self.weekly_deribit_ws:
-            self.weekly_deribit_ws.stop()
-            self.weekly_deribit_ws = None
-
-        self._weekly_discover_worker = DeribitDiscoverWorker(self.weekly_pricer, best)
-        self._weekly_discover_worker.finished.connect(self._on_weekly_instruments_discovered)
-        self._weekly_discover_worker.error.connect(
-            lambda e: print(f"[App] Weekly Deribit error: {e}")
-        )
-        self._weekly_discover_worker.start()
-
-    def _on_weekly_instruments_discovered(self, expiry_str: str, instruments: list):
-        """Weekly instruments found — start WS feed."""
-        print(f"[App] Weekly Deribit {expiry_str}: {len(instruments)} options")
-        self.weekly_deribit_ws = DeribitWsFeed(
-            self.weekly_pricer, self._on_weekly_deribit_update
-        )
-        self.weekly_deribit_ws.start(instruments)
-
-    def _on_weekly_deribit_update(self):
-        """Weekly Deribit data refreshed — recompute if using weekly IVs."""
-        if self.iv_source_combo.currentText() == "Weekly":
-            self._last_deribit_update = time.monotonic()
-            self._recompute_and_trade()
-            self._ui_dirty = True
-            self._update_deribit_status_label()
-
-    def _on_instruments_discovered(self, expiry_str: str, instruments: list):
-        """Instruments found via REST — now start WS feed for live prices."""
-        self.deribit_label.setText(
-            f"Connecting WS for {len(instruments)} options..."
-        )
-        self.deribit_ws = DeribitWsFeed(self.pricer, self._on_deribit_update)
-        self.deribit_ws.start(instruments)
 
     @staticmethod
     def _format_countdown(seconds: float) -> str:
@@ -1413,10 +1642,9 @@ class AboveBelowApp(QMainWindow):
         return " ".join(parts)
 
     def _update_countdowns(self):
-        """Update Kalshi and Deribit expiry countdown labels."""
+        """Update Kalshi expiry countdown label."""
         now = datetime.now(tz=timezone.utc)
 
-        # Kalshi event expiry
         if self.current_event:
             close_str = self.current_event.get("close_time", "")
             if close_str:
@@ -1434,80 +1662,6 @@ class AboveBelowApp(QMainWindow):
         else:
             self.kalshi_countdown.setText("")
 
-        # Deribit expiry
-        ts_ms = self.pricer.expiration_ts_ms
-        if ts_ms:
-            exp_utc = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            remaining = (exp_utc - now).total_seconds()
-            self.deribit_countdown.setText(
-                f"Deribit: {self._format_countdown(remaining)}"
-            )
-        else:
-            self.deribit_countdown.setText("")
-
-    def _on_deribit_update(self):
-        """Called by DeribitWsFeed after each density rebuild."""
-        self._last_deribit_update = time.monotonic()
-        self._recompute_and_trade()
-        self._ui_dirty = True
-        self._update_deribit_status_label()
-
-    def _update_deribit_status_label(self):
-        """Update the deribit info label based on active IV source."""
-        p = self._get_iv_pricer()
-        if p.ready:
-            lo, hi = p.strike_range
-            source = "weekly" if p is self.weekly_pricer else "daily"
-            self.deribit_label.setText(
-                f"{p.expiry_str}  {p.n_options} opts  "
-                f"[${lo:,.0f} - ${hi:,.0f}]  ({source}, live)"
-            )
-        else:
-            self.deribit_label.setText("Density failed")
-
-    def _find_deribit_strikes(self, K: float) -> tuple:
-        """Find the two Deribit option strikes straddling K.
-
-        Returns (k_low, k_high, dc_dk) or (None, None, None) if not found.
-        """
-        if not self.pricer.ready or not self.pricer.options:
-            return None, None, None
-
-        opts = self.pricer.options
-        for i in range(len(opts) - 1):
-            if opts[i].strike <= K <= opts[i + 1].strike:
-                k_lo = opts[i].strike
-                k_hi = opts[i + 1].strike
-                h = k_hi - k_lo
-                if h <= 0:
-                    continue
-                dc_dk = (opts[i + 1].call_price_usd - opts[i].call_price_usd) / h
-                return k_lo, k_hi, dc_dk
-
-        return None, None, None
-
-    def _find_closest_iv(self, K: float) -> tuple[float | None, float | None, float | None]:
-        """Find bid_iv and ask_iv (as %) from the closest Deribit option to K.
-
-        Returns (bid_iv_pct, ask_iv_pct, strike) or (None, None, None).
-        """
-        iv_p = self._get_iv_pricer()
-        if not iv_p.options:
-            return None, None, None
-        best_opt = None
-        best_dist = float("inf")
-        for opt in iv_p.options:
-            if opt.bid_iv > 0 or opt.ask_iv > 0:
-                dist = abs(opt.strike - K)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_opt = opt
-        if best_opt is None:
-            return None, None, None
-        bid_pct = best_opt.bid_iv * 100.0 if best_opt.bid_iv > 0 else None
-        ask_pct = best_opt.ask_iv * 100.0 if best_opt.ask_iv > 0 else None
-        return bid_pct, ask_pct, best_opt.strike
-
     # =========================================================================
     # IV Smile Window
     # =========================================================================
@@ -1515,7 +1669,7 @@ class AboveBelowApp(QMainWindow):
     def _open_iv_window(self):
         """Open (or bring to front) the IV smile graph window."""
         if self.iv_window is None or not self.iv_window.isVisible():
-            self.iv_window = IVSmileWindow(self._get_iv_pricer(), self)
+            self.iv_window = IVSmileWindow(self)
         self.iv_window.show()
         self.iv_window.raise_()
         self.iv_window.update_chart()
@@ -1661,11 +1815,67 @@ class AboveBelowApp(QMainWindow):
     def _rebuild_table(self):
         self.table.setRowCount(len(self.strikes))
         for row, (raw, disp) in enumerate(zip(self.strikes, self.display_strikes)):
-            self.table.setItem(row, 0, QTableWidgetItem(f"${disp:,.0f}"))
-            for col in range(1, 15):
+            # Strike cell with OTM% sub-label (set as widget)
+            strike_w = QWidget()
+            strike_w.setObjectName("strike_container")
+            strike_w.setStyleSheet("background:transparent;")
+            slay = QVBoxLayout(strike_w)
+            slay.setContentsMargins(4, 1, 4, 1)
+            slay.setSpacing(0)
+            main_lbl = QLabel(f"${disp:,.0f}")
+            main_lbl.setObjectName("strike_main")
+            main_lbl.setStyleSheet("color:#c8cdd5;font-size:12px;")
+            otm_lbl = QLabel("")
+            otm_lbl.setObjectName("strike_otm")
+            otm_lbl.setStyleSheet("color:#5a6270;font-size:8px;")
+            otm_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            slay.addWidget(main_lbl)
+            slay.addWidget(otm_lbl)
+            self.table.setCellWidget(row, 0, strike_w)
+            self.table.setItem(row, 0, QTableWidgetItem(""))
+
+            for col in range(1, 9):
                 self.table.setItem(row, col, QTableWidgetItem("--"))
 
-            # Toggle button (col 15)
+            # Edge cell with Lean sub-label (col 4) — set as widget
+            edge_w = QWidget()
+            edge_w.setObjectName("edge_container")
+            edge_w.setStyleSheet("background:transparent;")
+            elay = QVBoxLayout(edge_w)
+            elay.setContentsMargins(4, 1, 4, 1)
+            elay.setSpacing(0)
+            edge_main = QLabel("--")
+            edge_main.setObjectName("edge_main")
+            edge_main.setStyleSheet("color:#5a6270;font-size:12px;")
+            edge_lean = QLabel("")
+            edge_lean.setObjectName("edge_lean")
+            edge_lean.setStyleSheet("color:#f59e0b;font-size:8px;")
+            edge_lean.setAlignment(Qt.AlignmentFlag.AlignRight)
+            elay.addWidget(edge_main)
+            elay.addWidget(edge_lean)
+            self.table.setCellWidget(row, 4, edge_w)
+            self.table.setItem(row, 4, QTableWidgetItem(""))
+
+            # Position cell with phase 3 countdown sub-label (col 6)
+            pos_w = QWidget()
+            pos_w.setObjectName("pos_container")
+            pos_w.setStyleSheet("background:transparent;")
+            play = QVBoxLayout(pos_w)
+            play.setContentsMargins(4, 1, 4, 1)
+            play.setSpacing(0)
+            pos_main = QLabel("0")
+            pos_main.setObjectName("pos_main")
+            pos_main.setStyleSheet("color:#5a6270;font-size:12px;")
+            pos_sub = QLabel("")
+            pos_sub.setObjectName("pos_sub")
+            pos_sub.setStyleSheet("color:#3a4250;font-size:8px;")
+            pos_sub.setAlignment(Qt.AlignmentFlag.AlignRight)
+            play.addWidget(pos_main)
+            play.addWidget(pos_sub)
+            self.table.setCellWidget(row, 6, pos_w)
+            self.table.setItem(row, 6, QTableWidgetItem(""))
+
+            # Toggle button (col 9)
             strat = self.strategies.get(raw)
             btn = QPushButton("ON" if strat and strat.active else "OFF")
             btn.setStyleSheet(
@@ -1678,9 +1888,9 @@ class AboveBelowApp(QMainWindow):
                  "QPushButton:hover{background:#2d3a4d;}")
             )
             btn.clicked.connect(lambda checked, rs=raw: self._toggle_strategy(rs))
-            self.table.setCellWidget(row, 15, btn)
+            self.table.setCellWidget(row, 9, btn)
 
-            # Flatten button (col 16)
+            # Flatten button (col 10)
             flat_btn = QPushButton("FLAT")
             flat_btn.setStyleSheet(
                 "QPushButton{background:#1e2736;color:#facc15;border:1px solid #2d3a4d;"
@@ -1688,23 +1898,14 @@ class AboveBelowApp(QMainWindow):
                 "QPushButton:hover{background:#2d3a4d;border-color:#facc15;}"
             )
             flat_btn.clicked.connect(lambda checked, rs=raw: self._flatten_position(rs))
-            self.table.setCellWidget(row, 16, flat_btn)
+            self.table.setCellWidget(row, 10, flat_btn)
 
     _filter_tick = 0
 
     def _update_table(self):
         self._update_countdowns()
         self._update_rate_limit_label()
-        # Update Deribit age
-        if self._last_deribit_update is not None:
-            age = time.monotonic() - self._last_deribit_update
-            if age < 60:
-                self.deribit_age_label.setText(f"IV: {age:.0f}s ago")
-                self.deribit_age_label.setStyleSheet(
-                    "color:#22c55e;font-size:11px;" if age < 10 else "color:#5a6270;font-size:11px;")
-            else:
-                self.deribit_age_label.setText(f"IV: {age/60:.1f}m ago")
-                self.deribit_age_label.setStyleSheet("color:#ef4444;font-size:11px;")
+        self._update_stale_label()
         # Update spot display
         if self.spot_price > 0:
             self.spot_label.setText(f"${self.spot_price:,.2f}")
@@ -1730,21 +1931,22 @@ class AboveBelowApp(QMainWindow):
             ask = data.get("yes_ask", 0.0)
             ask_size = data.get("ask_size", 0)
 
-            # OTM% — col 1
-            item = self.table.item(row, 1)
-            if item:
-                if self.spot_price > 0:
-                    otm_pct = (disp - self.spot_price) / self.spot_price * 100
-                    item.setText(f"{otm_pct:+.1f}%")
-                    if abs(otm_pct) >= 3:
-                        item.setForeground(QColor("#facc15"))  # yellow = tail
-                    elif abs(otm_pct) >= 1:
-                        item.setForeground(QColor("#5a6270"))
+            # OTM% — small sub-label inside Strike cell (col 0)
+            strike_w = self.table.cellWidget(row, 0)
+            if strike_w:
+                otm_lbl = strike_w.findChild(QLabel, "strike_otm")
+                if otm_lbl:
+                    if self.spot_price > 0:
+                        otm_pct = (disp - self.spot_price) / self.spot_price * 100
+                        otm_lbl.setText(f"{otm_pct:+.1f}%")
+                        if abs(otm_pct) >= 3:
+                            otm_lbl.setStyleSheet("color:#facc15;font-size:8px;")
+                        elif abs(otm_pct) >= 1:
+                            otm_lbl.setStyleSheet("color:#5a6270;font-size:8px;")
+                        else:
+                            otm_lbl.setStyleSheet("color:#ef4444;font-size:8px;")
                     else:
-                        item.setForeground(QColor("#ef4444"))  # red = near ATM
-                else:
-                    item.setText("--")
-                    item.setForeground(QColor("#5a6270"))
+                        otm_lbl.setText("")
 
             # Yes Bid (size) — col 2 (green, cyan if we are BBO)
             # Yes Ask (size) — col 3 (red, cyan if we are BBO)
@@ -1768,80 +1970,99 @@ class AboveBelowApp(QMainWindow):
                         pass
 
             self._display_market_price(
-                row, 2, bid, bid_size, disp, t_years,
+                row, 1, bid, bid_size, disp, t_years,
                 base_color="#22c55e",
                 highlight_price=my_buy)
             self._display_market_price(
-                row, 3, ask, ask_size, disp, t_years,
+                row, 2, ask, ask_size, disp, t_years,
                 base_color="#ef4444",
                 highlight_price=my_sell)
 
-            # Theo — col 4: handled by fast timer, skip here
+            # Theo — col 3: handled by fast timer, skip here
 
-            # Edge — col 5 (show bid/ask edges)
+            # Edge — col 4 (with Δ Lean as small sub-label)
             strat = self.strategies.get(raw_strike)
-            item = self.table.item(row, 5)
-            if item:
-                if strat:
-                    item.setText(f"${strat.edge_bid:.2f}/${strat.edge_ask:.2f}")
-                    item.setForeground(QColor("#c8cdd5"))
-                elif self.auto_edge_btn.isChecked() and self.spot_price > 0:
-                    # Preview auto edge for strikes without a strategy
-                    p = self._auto_edge_params
-                    base_bid = p["base_bid"] / 100.0
-                    base_ask = p["base_ask"] / 100.0
-                    atm_pct = p["atm_pct"]
-                    scale_per_pct = p["scale"] / 100.0
-                    otm = abs(disp - self.spot_price) / self.spot_price * 100
-                    beyond = max(otm - atm_pct, 0)
-                    eb = base_bid + beyond * scale_per_pct
-                    ea = base_ask + beyond * scale_per_pct
-                    item.setText(f"${eb:.2f}/${ea:.2f}")
-                    item.setForeground(QColor("#5a6270"))  # dimmed to indicate preview
-                else:
-                    item.setText("--")
-                    item.setForeground(QColor("#5a6270"))
+            edge_w = self.table.cellWidget(row, 4)
+            if edge_w:
+                edge_main = edge_w.findChild(QLabel, "edge_main")
+                edge_lean = edge_w.findChild(QLabel, "edge_lean")
+                if edge_main:
+                    if strat:
+                        edge_main.setText(f"${strat.edge_bid:.2f}/${strat.edge_ask:.2f}")
+                        edge_main.setStyleSheet("color:#c8cdd5;font-size:12px;")
+                    else:
+                        edge_main.setText("--")
+                        edge_main.setStyleSheet("color:#5a6270;font-size:12px;")
+                if edge_lean:
+                    lb_cents = self._current_lean_bid * 100
+                    la_cents = self._current_lean_ask * 100
+                    if lb_cents > 0.05 or la_cents > 0.05:
+                        edge_lean.setText(f"+{lb_cents:.1f}/+{la_cents:.1f}")
+                    else:
+                        edge_lean.setText("")
 
-            # Deribit IV — col 6 (bid / ask + strike used)
-            self._display_iv(row, disp)
-
-            # Smoothed IV — col 7
+            # Smoothed IV — col 5
             self._display_smoothed_iv(row, disp)
 
-            # Position — col 8 (qty + avg fill price)
-            item = self.table.item(row, 8)
-            if item:
+            # Position — col 6 (qty + avg, with phase 3 countdown sub-label)
+            pos_w = self.table.cellWidget(row, 6)
+            if pos_w:
+                pos_main = pos_w.findChild(QLabel, "pos_main")
+                pos_sub = pos_w.findChild(QLabel, "pos_sub")
                 qty = strat.position if strat else data.get("position", 0)
                 avg_px = data.get("avg_price", 0)
-                if qty != 0:
-                    if avg_px > 0:
-                        item.setText(f"{qty} @ ${avg_px:.2f}")
+                if pos_main:
+                    if qty != 0:
+                        text = f"{qty} @ ${avg_px:.2f}" if avg_px > 0 else f"{qty}"
+                        color = "#ef4444" if qty < 0 else "#22c55e"
+                        pos_main.setText(text)
+                        pos_main.setStyleSheet(f"color:{color};font-size:12px;")
                     else:
-                        item.setText(f"{qty}")
-                    color = "#ef4444" if qty < 0 else "#22c55e"
-                    item.setForeground(QColor(color))
-                else:
-                    item.setText("0")
-                    item.setForeground(QColor("#5a6270"))
+                        pos_main.setText("0")
+                        pos_main.setStyleSheet("color:#5a6270;font-size:12px;")
 
-                # Flash on recent fill
+                # Phase 3 countdown sub-label
+                if pos_sub:
+                    countdown_text = ""
+                    countdown_color = "#3a4250"
+                    if (strat and qty != 0 and strat.phase3_after_sec > 0):
+                        # Pick the relevant timer based on position direction
+                        if qty > 0:  # long → flatten via sell walk
+                            start = strat._flatten_sell_start
+                        else:  # short → flatten via buy walk
+                            start = strat._flatten_buy_start
+                        if start is not None:
+                            elapsed = time.monotonic() - start
+                            remaining = strat.phase3_after_sec - elapsed
+                            if remaining > 0:
+                                countdown_text = f"P3: {remaining:.0f}s"
+                                # Color shifts as we approach phase 3
+                                if remaining < 30:
+                                    countdown_color = "#ef4444"  # red
+                                elif remaining < 60:
+                                    countdown_color = "#facc15"  # yellow
+                                else:
+                                    countdown_color = "#5a6270"  # gray
+                            else:
+                                countdown_text = "P3 READY"
+                                countdown_color = "#ef4444"
+                    pos_sub.setText(countdown_text)
+                    pos_sub.setStyleSheet(f"color:{countdown_color};font-size:8px;")
+
+                # Flash on recent fill (apply to underlying item bg)
                 flash_ts = self._fill_flash.get(raw_strike)
                 if flash_ts and (time.monotonic() - flash_ts) < 1.5:
-                    item.setBackground(QColor("#facc15"))
-                    item.setForeground(QColor("#000000"))
+                    pos_w.setStyleSheet("background:rgba(250,204,21,0.3);")
                 else:
-                    item.setBackground(QColor(0, 0, 0, 0))
+                    pos_w.setStyleSheet("background:transparent;")
                     if flash_ts:
                         del self._fill_flash[raw_strike]
 
-            # Delta — col 9: position delta (dP/dSpot * position)
-            self._display_greeks(row, raw_strike, disp, data)
-
-            # Order — col 13 (show both sides, highlight flatten orders)
+            # Order — col 7 (show both sides, highlight flatten orders)
             self._display_orders(row, strat, raw_strike)
 
-            # PnL — col 14: total PnL (session PnL)
-            item = self.table.item(row, 14)
+            # PnL — col 8: total PnL (session PnL)
+            item = self.table.item(row, 8)
             if item:
                 realized = strat.realized_pnl if strat else data.get("realized_pnl", 0)
                 pos = strat.position if strat else data.get("position", 0)
@@ -1872,6 +2093,9 @@ class AboveBelowApp(QMainWindow):
                     item.setText("--")
                     item.setForeground(QColor("#5a6270"))
 
+        # Update portfolio greeks summary
+        self._update_portfolio_greeks()
+
     def _display_market_price(self, row: int, col: int,
                               price: float, size: int,
                               disp_strike: float, t_years: float,
@@ -1896,7 +2120,7 @@ class AboveBelowApp(QMainWindow):
         iv_text = ""
         if self.spot_price > 0 and t_years > 0:
             iv = _implied_vol_quadratic(price, self.spot_price, disp_strike, t_years,
-                                       self.pricer.risk_free_rate)
+                                       self.risk_free_rate)
             if iv > 0:
                 iv_text = f"{iv * 100:.1f}%"
 
@@ -1930,157 +2154,91 @@ class AboveBelowApp(QMainWindow):
         iv_lbl.setText(iv_text)
         iv_lbl.setStyleSheet("color:#5a6270;font-size:8px;")
 
-    def _display_greeks(self, row: int, raw_strike: float,
-                        disp_strike: float, data: dict):
-        """Update the Greek columns: col 9 (Δ), col 10 (γ), col 11 (ν), col 12 (θ).
-
-        Delta = position * dP/dSpot  — $ change per $1 spot move.
-        Gamma = position * d²P/dS²  — how fast delta changes per $1 move.
-        Vega  = position * dP/dσ    — $ change per 1% IV move.
-        Theta = position * dP/dT    — $ change per hour of time decay.
-        """
-        strat = self.strategies.get(raw_strike)
-        pos = strat.position if strat else data.get("position", 0)
-
-        dim = QColor("#5a6270")
-        items = [self.table.item(row, c) for c in (9, 10, 11, 12)]
-
-        if pos == 0 or not self.pricer.options or self.spot_price <= 0:
-            for it in items:
-                if it:
-                    it.setText("--")
-                    it.setForeground(dim)
+    def _update_portfolio_greeks(self):
+        """Compute and display portfolio-level greeks (summed across all positions)."""
+        if self.spot_price <= 0:
+            self.greeks_label.setText("Δ: --  γ: --  ν: --  θ: --")
             return
 
         close_time = ""
         if self.current_event:
             close_time = self.current_event.get("close_time", "")
 
-        # Delta & gamma: bump spot ±$1
+        total_delta = 0.0
+        total_gamma = 0.0
+        total_vega = 0.0
+        total_theta = 0.0
         bump = 1.0
-        try:
-            iv_p = self._get_iv_pricer()
-            sigma_mid = iv_p._find_closest_bid_iv(disp_strike)
-            p_mid = self.pricer.prob_above_with_iv(
-                disp_strike, sigma_mid, spot=self.spot_price, kalshi_close_iso=close_time)
-            p_up = self.pricer.prob_above_with_iv(
-                disp_strike, sigma_mid, spot=self.spot_price + bump, kalshi_close_iso=close_time)
-            p_dn = self.pricer.prob_above_with_iv(
-                disp_strike, sigma_mid, spot=self.spot_price - bump, kalshi_close_iso=close_time)
-            dp_ds = (p_up - p_dn) / (2 * bump)
-            d2p_ds2 = (p_up - 2 * p_mid + p_dn) / (bump ** 2)
-        except Exception:
-            for it in items:
-                if it:
-                    it.setText("--")
-                    it.setForeground(dim)
-            return
 
-        # Vega: bump IV ±1%
-        vega_per = 0.0
-        try:
-            sigma = iv_p._find_closest_bid_iv(disp_strike)
-            if sigma > 0:
+        for raw_strike, disp in zip(self.strikes, self.display_strikes):
+            strat = self.strategies.get(raw_strike)
+            data = self.market_data.get(raw_strike, {})
+            pos = strat.position if strat else data.get("position", 0)
+            if pos == 0:
+                continue
+
+            sigma_mid = self._smoothed_iv.get(disp, 0.0)
+            if sigma_mid <= 0:
+                continue
+
+            try:
+                p_mid = _prob_above_with_iv(
+                    disp, sigma_mid, self.spot_price, close_time, self.risk_free_rate)
+                p_up = _prob_above_with_iv(
+                    disp, sigma_mid, self.spot_price + bump, close_time, self.risk_free_rate)
+                p_dn = _prob_above_with_iv(
+                    disp, sigma_mid, self.spot_price - bump, close_time, self.risk_free_rate)
+                dp_ds = (p_up - p_dn) / (2 * bump)
+                d2p_ds2 = (p_up - 2 * p_mid + p_dn) / (bump ** 2)
+
                 iv_bump = 0.01
-                p_iv_up = self.pricer.prob_above_with_iv(
-                    disp_strike, sigma + iv_bump,
-                    spot=self.spot_price, kalshi_close_iso=close_time)
-                p_iv_dn = self.pricer.prob_above_with_iv(
-                    disp_strike, sigma - iv_bump,
-                    spot=self.spot_price, kalshi_close_iso=close_time)
+                p_iv_up = _prob_above_with_iv(
+                    disp, sigma_mid + iv_bump, self.spot_price, close_time, self.risk_free_rate)
+                p_iv_dn = _prob_above_with_iv(
+                    disp, sigma_mid - iv_bump, self.spot_price, close_time, self.risk_free_rate)
                 vega_per = (p_iv_up - p_iv_dn) / (2 * iv_bump)
-        except Exception:
-            pass
 
-        # Theta: price change per hour of time decay
-        theta_per_hr = 0.0
-        try:
-            if sigma_mid > 0 and close_time:
-                from datetime import datetime as _dt, timezone as _tz
-                close_utc = _dt.fromisoformat(close_time.replace("Z", "+00:00"))
-                now_ts = _dt.now(tz=_tz.utc).timestamp()
-                T_sec = close_utc.timestamp() - now_ts
-                if T_sec > 3600:  # more than 1 hour left
-                    # Price 1 hour from now (shorter T)
-                    one_hour_yr = 3600 / (365.25 * 24 * 3600)
-                    T_now = T_sec / (365.25 * 24 * 3600)
-                    T_later = T_now - one_hour_yr
-                    p_later = self.pricer._bs_prob_above(
-                        self.spot_price, disp_strike, sigma_mid, T_later, self.pricer.risk_free_rate)
-                    theta_per_hr = p_later - p_mid  # negative for ATM (time decay)
-        except Exception:
-            pass
+                theta_per_hr = 0.0
+                if close_time:
+                    close_utc = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                    T_sec = close_utc.timestamp() - datetime.now(tz=timezone.utc).timestamp()
+                    if T_sec > 3600:
+                        one_hour_yr = 3600 / (365.25 * 24 * 3600)
+                        T_now = T_sec / (365.25 * 24 * 3600)
+                        T_later = T_now - one_hour_yr
+                        p_later = _bs_prob_above(
+                            self.spot_price, disp, sigma_mid, T_later, self.risk_free_rate)
+                        theta_per_hr = p_later - p_mid
 
-        pos_delta = pos * dp_ds
-        pos_gamma = pos * d2p_ds2
-        pos_vega = pos * vega_per * 0.01
-        pos_theta = pos * theta_per_hr
+                total_delta += pos * dp_ds
+                total_gamma += pos * d2p_ds2
+                total_vega += pos * vega_per * 0.01
+                total_theta += pos * theta_per_hr
+            except Exception:
+                continue
 
-        # Col 8: Delta
-        if items[0]:
-            items[0].setText(f"{pos_delta:+.4f}")
-            items[0].setForeground(QColor("#22c55e" if pos_delta >= 0 else "#ef4444"))
+        # Scale delta to per-$100 BTC move
+        delta_100 = total_delta * 100
+        gamma_100 = total_gamma * 100
+        # Compute delta lean and push to all strategies
+        # Positive delta → widen buy edge, tighten sell edge
+        lean = self._delta_lean_factor
+        self._current_lean_bid = max(delta_100 * lean / 100, 0)   # extra cents on buy side
+        self._current_lean_ask = max(-delta_100 * lean / 100, 0)  # extra cents on sell side
 
-        # Col 9: Gamma
-        if items[1]:
-            items[1].setText(f"{pos_gamma:+.5f}")
-            items[1].setForeground(QColor("#f59e0b"))
+        for strat in self.strategies.values():
+            strat.lean_bid = self._current_lean_bid
+            strat.lean_ask = self._current_lean_ask
 
-        # Col 10: Vega
-        if items[2]:
-            items[2].setText(f"{pos_vega:+.5f}")
-            items[2].setForeground(QColor("#8b5cf6"))
-
-        # Col 11: Theta (per hour)
-        if items[3]:
-            items[3].setText(f"{pos_theta:+.4f}")
-            items[3].setForeground(QColor("#06b6d4"))
-
-    def _display_iv(self, row: int, disp_strike: float):
-        """Update the Deribit IV cell (col 6) with bid/ask IV + strike used."""
-        bid_iv, ask_iv, iv_strike = self._find_closest_iv(disp_strike)
-
-        existing = self.table.cellWidget(row, 6)
-        if existing is None:
-            container = QWidget()
-            container.setStyleSheet("background:transparent;")
-            lay = QVBoxLayout(container)
-            lay.setContentsMargins(4, 1, 4, 1)
-            lay.setSpacing(0)
-            main_lbl = QLabel("--")
-            main_lbl.setStyleSheet("color:#5a6270;font-size:12px;")
-            main_lbl.setObjectName("iv_main")
-            strike_lbl = QLabel("")
-            strike_lbl.setStyleSheet("color:#3a4250;font-size:8px;")
-            strike_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            strike_lbl.setObjectName("iv_strike")
-            lay.addWidget(main_lbl)
-            lay.addWidget(strike_lbl)
-            self.table.setCellWidget(row, 6, container)
-            item = self.table.item(row, 6)
-            if item:
-                item.setText("")
-        else:
-            container = existing
-
-        main_lbl = container.findChild(QLabel, "iv_main")
-        strike_lbl = container.findChild(QLabel, "iv_strike")
-
-        if bid_iv is not None and ask_iv is not None:
-            main_lbl.setText(f"{bid_iv:.1f}% / {ask_iv:.1f}%")
-        elif ask_iv is not None:
-            main_lbl.setText(f"-- / {ask_iv:.1f}%")
-        else:
-            main_lbl.setText("--")
-
-        if iv_strike is not None:
-            oi = self._get_iv_pricer()._find_closest_oi(disp_strike)
-            if oi > 0:
-                strike_lbl.setText(f"${iv_strike:,.0f} (OI:{oi:,.0f})")
-            else:
-                strike_lbl.setText(f"${iv_strike:,.0f}")
-        else:
-            strike_lbl.setText("")
+        delta_color = "#22c55e" if delta_100 >= 0 else "#ef4444"
+        self.greeks_label.setText(
+            f"Portfolio:  "
+            f"Δ: <span style='color:{delta_color}'>${delta_100:+.2f}/$100</span>  "
+            f"γ: <span style='color:#f59e0b'>${gamma_100:+.3f}/$100</span>  "
+            f"ν: <span style='color:#8b5cf6'>${total_vega:+.4f}/1%IV</span>  "
+            f"θ: <span style='color:#06b6d4'>${total_theta:+.4f}/hr</span>  "
+            f"Lean: <span style='color:#f59e0b'>B+{self._current_lean_bid*100:.1f}c / S+{self._current_lean_ask*100:.1f}c</span>"
+        )
 
     def _refit_vol_smile(self):
         """Fit a quadratic vol smile on mid IVs of strikes within 4% of spot.
@@ -2118,7 +2276,7 @@ class AboveBelowApp(QMainWindow):
                 continue
             mid = (bid + ask) / 2.0
             iv = _implied_vol_quadratic(mid, self.spot_price, disp, t_years,
-                                        self.pricer.risk_free_rate)
+                                        self.risk_free_rate)
             if iv > 0:
                 strikes_arr.append(disp)
                 mid_ivs.append(iv)
@@ -2153,9 +2311,9 @@ class AboveBelowApp(QMainWindow):
         a, b, c = coeffs[0], coeffs[1], coeffs[2]
         self._smile_coeffs = (a, b, c)
 
-        # Evaluate fitted IV for ALL strikes and update EWM
+        # Evaluate fitted IV for ALL display strikes and update EWM
         alpha = 2.0 / (self._smile_span + 1)
-        for disp_k in strikes_arr:
+        for disp_k in self.display_strikes:
             fitted = a * disp_k**2 + b * disp_k + c
             if fitted <= 0:
                 continue
@@ -2169,8 +2327,8 @@ class AboveBelowApp(QMainWindow):
         self._last_smile_spot = self.spot_price
 
     def _display_smoothed_iv(self, row: int, disp_strike: float):
-        """Update the Smoothed IV cell (col 7)."""
-        item = self.table.item(row, 7)
+        """Update the Smoothed IV cell (col 5)."""
+        item = self.table.item(row, 5)
         if not item:
             return
         siv = self._smoothed_iv.get(disp_strike)
@@ -2183,59 +2341,28 @@ class AboveBelowApp(QMainWindow):
 
     _ui_dirty = False
 
-    def _get_iv_pricer(self):
-        """Return the pricer to use for IV lookup based on dropdown selection."""
-        if self.iv_source_combo.currentText() == "Weekly" and self.weekly_pricer.options:
-            return self.weekly_pricer
-        return self.pricer
-
     def _recompute_and_trade(self):
-        """Compute theos + feed strategies immediately. Runs on WS thread.
-
-        Uses smoothed IV from vol smile fit when available, falls back to
-        Deribit IV. Caches results for the UI timer to display.
-        """
-        if not self.strikes:
+        """Compute theos from smoothed IV + feed strategies. Runs on WS thread."""
+        if not self.strikes or not self._smoothed_iv:
             return
         close_time = ""
         if self.current_event:
             close_time = self.current_event.get("close_time", "")
-        spot_b = self.spot_bid if self.spot_bid > 0 else self.spot_price
-        spot_a = self.spot_ask if self.spot_ask > 0 else self.spot_price
-        if spot_b <= 0 or spot_a <= 0:
+        spot = self.spot_price
+        if spot <= 0:
             return
 
         now = time.monotonic()
-
-        # Fall back to Deribit IV if no smoothed IV available yet
-        iv_pricer = self._get_iv_pricer()
-        use_deribit_fallback = not self._smoothed_iv and iv_pricer.options
+        r = self.risk_free_rate
 
         for raw_strike, disp in zip(self.strikes, self.display_strikes):
-            if use_deribit_fallback:
-                # Deribit fallback — bid/ask IV → bid/ask theo
-                bid_iv = iv_pricer._find_closest_bid_iv(disp)
-                ask_iv = iv_pricer._find_closest_ask_iv(disp)
-                bid_theo = self.pricer.prob_above_with_iv(
-                    disp, bid_iv, spot=spot_b, kalshi_close_iso=close_time,
-                )
-                ask_theo = self.pricer.prob_above_with_iv(
-                    disp, ask_iv, spot=spot_a, kalshi_close_iso=close_time,
-                )
-            else:
-                # Smoothed IV — single IV → single theo (use spot bid/ask for conservatism)
-                siv = self._smoothed_iv.get(disp, 0.0)
-                if siv <= 0:
-                    continue
-                bid_theo = self.pricer.prob_above_with_iv(
-                    disp, siv, spot=spot_b, kalshi_close_iso=close_time,
-                )
-                ask_theo = self.pricer.prob_above_with_iv(
-                    disp, siv, spot=spot_a, kalshi_close_iso=close_time,
-                )
+            siv = self._smoothed_iv.get(disp, 0.0)
+            if siv <= 0:
+                continue
+            theo = _prob_above_with_iv(disp, siv, spot, close_time, r)
 
-            # Cache for UI
-            self._cached_theos[raw_strike] = (bid_theo, ask_theo)
+            # Cache for UI (single theo stored as both bid/ask for compatibility)
+            self._cached_theos[raw_strike] = theo
 
             # Track latency on actual computation
             last = self._theo_last_time.get(raw_strike)
@@ -2254,8 +2381,8 @@ class AboveBelowApp(QMainWindow):
                     strat.kalshi_ask = md.get("yes_ask", 0.0)
                     strat.kalshi_bid_size = md.get("bid_size", 0)
                     strat.kalshi_ask_size = md.get("ask_size", 0)
-                    strat.avg_entry = md.get("avg_price", 0.0)
-                strat.update_theo(bid_theo, ask_theo)
+                    strat.seed_avg_entry_if_unlocked(md.get("avg_price", 0.0))
+                strat.update_theo(theo, theo)
 
         # Feed stashed strategies (other events running in background)
         for et, stashed_strats in self._stashed_strategies.items():
@@ -2268,36 +2395,24 @@ class AboveBelowApp(QMainWindow):
                 if not strat.active:
                     continue
                 disp = display_strike(raw_strike)
-                if use_deribit_fallback:
-                    stash_bid_iv = iv_pricer._find_closest_bid_iv(disp)
-                    stash_ask_iv = iv_pricer._find_closest_ask_iv(disp)
-                    bid_theo = self.pricer.prob_above_with_iv(
-                        disp, stash_bid_iv, spot=spot_b, kalshi_close_iso=stash_close,
-                    )
-                    ask_theo = self.pricer.prob_above_with_iv(
-                        disp, stash_ask_iv, spot=spot_a, kalshi_close_iso=stash_close,
-                    )
-                else:
-                    siv = self._smoothed_iv.get(disp, 0.0)
-                    if siv <= 0:
-                        continue
-                    bid_theo = self.pricer.prob_above_with_iv(
-                        disp, siv, spot=spot_b, kalshi_close_iso=stash_close,
-                    )
-                    ask_theo = self.pricer.prob_above_with_iv(
-                        disp, siv, spot=spot_a, kalshi_close_iso=stash_close,
-                    )
+                siv = self._smoothed_iv.get(disp, 0.0)
+                if siv <= 0:
+                    continue
+                theo = _prob_above_with_iv(disp, siv, spot, stash_close, r)
                 md = stashed_md.get(raw_strike)
                 if md:
                     strat.kalshi_bid = md.get("yes_bid", 0.0)
                     strat.kalshi_ask = md.get("yes_ask", 0.0)
                     strat.kalshi_bid_size = md.get("bid_size", 0)
                     strat.kalshi_ask_size = md.get("ask_size", 0)
-                    strat.avg_entry = md.get("avg_price", 0.0)
-                strat.update_theo(bid_theo, ask_theo)
+                    strat.seed_avg_entry_if_unlocked(md.get("avg_price", 0.0))
+                strat.update_theo(theo, theo)
 
     def _update_fast_theos(self):
         """UI timer (200ms) — refresh theo display from cached values."""
+        # Tick velocity status independently of theo dirtiness so the
+        # cooldown countdown stays smooth.
+        self._tick_velocity_display()
         if not self._ui_dirty:
             return
         self._ui_dirty = False
@@ -2306,17 +2421,17 @@ class AboveBelowApp(QMainWindow):
             if row >= self.table.rowCount():
                 break
             cached = self._cached_theos.get(raw_strike)
-            if cached:
-                bid_theo, ask_theo = cached
+            if cached is not None:
                 latency_ms = self._theo_latency_ema.get(raw_strike)
-                self._display_theo_cached(row, bid_theo, ask_theo, latency_ms)
+                self._display_theo_cached(row, cached, latency_ms)
 
-    def _display_theo_cached(self, row: int, bid_theo: float, ask_theo: float,
+    def _display_theo_cached(self, row: int, theo: float,
                              latency_ms: float | None):
-        """Update the Theo cell from cached values."""
-        existing = self.table.cellWidget(row, 4)
-        if existing is None:
+        """Update the Theo cell (col 3) from cached value."""
+        existing = self.table.cellWidget(row, 3)
+        if existing is None or existing.objectName() != "theo_container":
             container = QWidget()
+            container.setObjectName("theo_container")
             container.setStyleSheet("background:transparent;")
             lay = QVBoxLayout(container)
             lay.setContentsMargins(4, 1, 4, 1)
@@ -2330,8 +2445,8 @@ class AboveBelowApp(QMainWindow):
             lat_lbl.setObjectName("theo_lat")
             lay.addWidget(main_lbl)
             lay.addWidget(lat_lbl)
-            self.table.setCellWidget(row, 4, container)
-            item = self.table.item(row, 4)
+            self.table.setCellWidget(row, 3, container)
+            item = self.table.item(row, 3)
             if item:
                 item.setText("")
         else:
@@ -2340,8 +2455,7 @@ class AboveBelowApp(QMainWindow):
         main_lbl = container.findChild(QLabel, "theo_main")
         lat_lbl = container.findChild(QLabel, "theo_lat")
 
-        main_lbl.setText(f"${bid_theo:.3f} / ${ask_theo:.3f}")
-        main_lbl.setStyleSheet("color:#c8cdd5;font-size:12px;")
+        main_lbl.setText(f"${theo:.3f}")
 
         if latency_ms is not None:
             lat_lbl.setText(f"{latency_ms:.0f}ms")
@@ -2349,7 +2463,7 @@ class AboveBelowApp(QMainWindow):
             lat_lbl.setText("")
 
     def _display_orders(self, row: int, strat, raw_strike: float = 0):
-        """Update Order cell (col 13). Flatten orders are highlighted orange."""
+        """Update Order cell (col 7). Flatten orders are highlighted orange."""
         # Use market_data position as source of truth (updated by WS fills + REST)
         data = self.market_data.get(raw_strike, {})
         pos = data.get("position", 0)
@@ -2363,21 +2477,21 @@ class AboveBelowApp(QMainWindow):
 
         if not has_buy and not has_sell:
             # No orders — use plain item
-            existing = self.table.cellWidget(row, 13)
+            existing = self.table.cellWidget(row, 7)
             if existing:
-                self.table.removeCellWidget(row, 13)
-            item = self.table.item(row, 13)
+                self.table.removeCellWidget(row, 7)
+            item = self.table.item(row, 7)
             if item:
                 item.setText("--")
                 item.setForeground(QColor("#5a6270"))
             return
 
         # Build widget with colored labels per side
-        existing = self.table.cellWidget(row, 13)
+        existing = self.table.cellWidget(row, 7)
         if existing is None or existing.objectName() != "order_container":
             container = QWidget()
             container.setObjectName("order_container")
-            container.setStyleSheet("background:transparent;")
+            container.setAutoFillBackground(True)
             hlay = QHBoxLayout(container)
             hlay.setContentsMargins(4, 1, 4, 1)
             hlay.setSpacing(4)
@@ -2387,12 +2501,30 @@ class AboveBelowApp(QMainWindow):
             sell_lbl.setObjectName("order_sell")
             hlay.addWidget(buy_lbl)
             hlay.addWidget(sell_lbl)
-            self.table.setCellWidget(row, 13, container)
-            item = self.table.item(row, 13)
+            self.table.setCellWidget(row, 7, container)
+            item = self.table.item(row, 7)
             if item:
                 item.setText("")
         else:
             container = existing
+
+        # Highlight whole cell background when flattening
+        is_flattening = (buy_flatten and has_buy) or (sell_flatten and has_sell)
+        item = self.table.item(row, 7)
+        if is_flattening:
+            container.setStyleSheet(
+                "QWidget#order_container{background:rgba(255,140,0,0.25);}"
+                "QLabel{background:transparent;}"
+            )
+            if item:
+                item.setBackground(QColor(255, 140, 0, 64))
+        else:
+            container.setStyleSheet(
+                "QWidget#order_container{background:transparent;}"
+                "QLabel{background:transparent;}"
+            )
+            if item:
+                item.setBackground(QColor(0, 0, 0, 0))
 
         buy_lbl = container.findChild(QLabel, "order_buy")
         sell_lbl = container.findChild(QLabel, "order_sell")
@@ -2401,16 +2533,19 @@ class AboveBelowApp(QMainWindow):
         normal = "color:#facc15;font-size:12px;"
         flatten = "color:#ff8c00;font-size:12px;font-weight:bold;"
 
-        if has_buy:
+        buy_price = strat.current_buy_price if strat else None
+        sell_price = strat.current_sell_price if strat else None
+
+        if buy_price is not None:
             buy_size = abs(pos) if buy_flatten else strat.size_bid
-            buy_lbl.setText(f"B${strat.current_buy_price:.2f}({buy_size})")
+            buy_lbl.setText(f"${buy_price:.2f}/{buy_size}")
             buy_lbl.setStyleSheet(flatten if buy_flatten else normal)
         else:
             buy_lbl.setText("")
 
-        if has_sell:
+        if sell_price is not None:
             sell_size = pos if sell_flatten else strat.size_ask
-            sell_lbl.setText(f"S${strat.current_sell_price:.2f}({sell_size})")
+            sell_lbl.setText(f"${sell_price:.2f}/{sell_size}")
             sell_lbl.setStyleSheet(flatten if sell_flatten else normal)
         else:
             sell_lbl.setText("")
@@ -2433,6 +2568,8 @@ class AboveBelowApp(QMainWindow):
             sb, sa = strat.size_bid, strat.size_ask
             max_pos, tol = strat.max_position, strat.tolerance
             fwi, fws = strat.flatten_walk_interval, strat.flatten_walk_step
+            p3a = strat.phase3_after_sec
+            p3d = strat.phase3_theo_drift_cents
         else:
             saved = _load_strategy_params().get(str(raw_strike), {})
             eb = saved.get("edge_bid", 0.03)
@@ -2443,53 +2580,46 @@ class AboveBelowApp(QMainWindow):
             tol = saved.get("tolerance", 0.01)
             fwi = saved.get("flatten_walk_interval", 0.0)
             fws = saved.get("flatten_walk_step", 0.01)
+            p3a = saved.get("phase3_after_sec", 0.0)
+            p3d = saved.get("phase3_theo_drift_cents", 0.0)
 
-        ae_on = self.auto_edge_btn.isChecked()
-        dlg = StrikeParamsDialog(f"${disp:,.0f}", eb, ea, sb, sa, max_pos, tol, fwi, fws, self, auto_edge=ae_on)
+        dlg = StrikeParamsDialog(f"${disp:,.0f}", eb, ea, sb, sa, max_pos, tol,
+                                 fwi, fws, p3a, p3d, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             params = dlg.get_params()
             if params is None:
                 return
-            new_eb, new_ea, new_sb, new_sa, new_max, new_tol, new_fwi, new_fws = params
+            (new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
+             new_fwi, new_fws, new_p3a, new_p3d) = params
 
             if strat is None:
                 data = self.market_data.get(raw_strike)
                 if not data:
                     return
-                # When auto edge is on, use 0 as placeholder — auto edge will set real values
-                init_eb = new_eb if not ae_on else 0.0
-                init_ea = new_ea if not ae_on else 0.0
                 strat = Strategy(
                     ticker=data["ticker"], strike=disp,
-                    edge_bid=init_eb, edge_ask=init_ea,
+                    edge_bid=new_eb, edge_ask=new_ea,
                     size_bid=new_sb, size_ask=new_sa,
                     max_position=new_max, api=self.api,
                     tolerance=new_tol, on_max_position=self._on_max_position,
                 )
                 strat.flatten_walk_interval = new_fwi
                 strat.flatten_walk_step = new_fws
+                strat.phase3_after_sec = new_p3a
+                strat.phase3_theo_drift_cents = new_p3d
                 self.strategies[raw_strike] = strat
-                if ae_on:
-                    self._recompute_auto_edges(force=True)
             else:
-                if ae_on:
-                    # Auto edge controls edge — only update non-edge params
-                    strat.size_bid = new_sb
-                    strat.size_ask = new_sa
-                    strat.max_position = new_max
-                    strat.tolerance = new_tol
-                    strat.flatten_walk_interval = new_fwi
-                    strat.flatten_walk_step = new_fws
-                else:
-                    old_eb, old_ea = strat.edge_bid, strat.edge_ask
-                    strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
-                                        new_fwi, new_fws)
-                    # If edge changed and strategy is active, force reprice
-                    if strat.active and (new_eb != old_eb or new_ea != old_ea):
-                        strat._cancel_sell()
-                        strat._cancel_buy()
-                        strat.current_sell_price = None
-                        strat.current_buy_price = None
+                old_eb, old_ea = strat.edge_bid, strat.edge_ask
+                strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
+                                    new_fwi, new_fws)
+                strat.phase3_after_sec = new_p3a
+                strat.phase3_theo_drift_cents = new_p3d
+                # If edge changed and strategy is active, force reprice
+                if strat.active and (new_eb != old_eb or new_ea != old_ea):
+                    strat._cancel_sell()
+                    strat._cancel_buy()
+                    strat.current_sell_price = None
+                    strat.current_buy_price = None
 
             self._save_all_strategy_params()
             print(f"[App] ${disp:,.0f} params: edge_bid={new_eb}, edge_ask={new_ea}, "
@@ -2540,6 +2670,8 @@ class AboveBelowApp(QMainWindow):
             sb, sa = strat.size_bid, strat.size_ask
             max_pos, tol = strat.max_position, strat.tolerance
             fwi, fws = strat.flatten_walk_interval, strat.flatten_walk_step
+            p3a = strat.phase3_after_sec
+            p3d = strat.phase3_theo_drift_cents
         else:
             saved = _load_strategy_params().get(str(first_raw), {})
             eb = saved.get("edge_bid", 0.03)
@@ -2550,17 +2682,20 @@ class AboveBelowApp(QMainWindow):
             tol = saved.get("tolerance", 0.01)
             fwi = saved.get("flatten_walk_interval", 0.0)
             fws = saved.get("flatten_walk_step", 0.01)
+            p3a = saved.get("phase3_after_sec", 0.0)
+            p3d = saved.get("phase3_theo_drift_cents", 0.0)
 
-        ae_on = self.auto_edge_btn.isChecked()
         dlg = StrikeParamsDialog(
-            f"{len(rows)} strikes", eb, ea, sb, sa, max_pos, tol, fwi, fws, self, auto_edge=ae_on
+            f"{len(rows)} strikes", eb, ea, sb, sa, max_pos, tol,
+            fwi, fws, p3a, p3d, self
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         params = dlg.get_params()
         if params is None:
             return
-        new_eb, new_ea, new_sb, new_sa, new_max, new_tol, new_fwi, new_fws = params
+        (new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
+         new_fwi, new_fws, new_p3a, new_p3d) = params
 
         for row in rows:
             if row < 0 or row >= len(self.strikes):
@@ -2573,39 +2708,29 @@ class AboveBelowApp(QMainWindow):
 
             strat = self.strategies.get(raw_strike)
             if strat is None:
-                init_eb = new_eb if not ae_on else 0.0
-                init_ea = new_ea if not ae_on else 0.0
                 strat = Strategy(
                     ticker=data["ticker"], strike=disp,
-                    edge_bid=init_eb, edge_ask=init_ea,
+                    edge_bid=new_eb, edge_ask=new_ea,
                     size_bid=new_sb, size_ask=new_sa,
                     max_position=new_max, api=self.api,
                     tolerance=new_tol, on_max_position=self._on_max_position,
                 )
                 strat.flatten_walk_interval = new_fwi
                 strat.flatten_walk_step = new_fws
+                strat.phase3_after_sec = new_p3a
+                strat.phase3_theo_drift_cents = new_p3d
                 self.strategies[raw_strike] = strat
             else:
-                if ae_on:
-                    # Auto edge controls edge — only update non-edge params
-                    strat.size_bid = new_sb
-                    strat.size_ask = new_sa
-                    strat.max_position = new_max
-                    strat.tolerance = new_tol
-                    strat.flatten_walk_interval = new_fwi
-                    strat.flatten_walk_step = new_fws
-                else:
-                    old_eb, old_ea = strat.edge_bid, strat.edge_ask
-                    strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
-                                        new_fwi, new_fws)
-                    if strat.active and (new_eb != old_eb or new_ea != old_ea):
-                        strat._cancel_sell()
-                        strat._cancel_buy()
-                        strat.current_sell_price = None
-                        strat.current_buy_price = None
-
-        if ae_on:
-            self._recompute_auto_edges(force=True)
+                old_eb, old_ea = strat.edge_bid, strat.edge_ask
+                strat.update_params(new_eb, new_ea, new_sb, new_sa, new_max, new_tol,
+                                    new_fwi, new_fws)
+                strat.phase3_after_sec = new_p3a
+                strat.phase3_theo_drift_cents = new_p3d
+                if strat.active and (new_eb != old_eb or new_ea != old_ea):
+                    strat._cancel_sell()
+                    strat._cancel_buy()
+                    strat.current_sell_price = None
+                    strat.current_buy_price = None
 
         self._save_all_strategy_params()
         print(f"[App] Bulk params ({len(rows)} strikes): edge_bid={new_eb}, "
@@ -2630,6 +2755,8 @@ class AboveBelowApp(QMainWindow):
                 "tolerance": strat.tolerance,
                 "flatten_walk_interval": strat.flatten_walk_interval,
                 "flatten_walk_step": strat.flatten_walk_step,
+                "phase3_after_sec": strat.phase3_after_sec,
+                "phase3_theo_drift_cents": strat.phase3_theo_drift_cents,
             }
         _save_strategy_params(params)
 
@@ -2639,7 +2766,7 @@ class AboveBelowApp(QMainWindow):
             if data.get("ticker") == ticker:
                 row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
                 if row >= 0:
-                    btn = self.table.cellWidget(row, 15)
+                    btn = self.table.cellWidget(row, 9)
                     if btn:
                         btn.setText("MAX")
                         btn.setStyleSheet(
@@ -2690,6 +2817,9 @@ class AboveBelowApp(QMainWindow):
                 )
                 strat.flatten_walk_interval = saved.get("flatten_walk_interval", 0.0)
                 strat.flatten_walk_step = saved.get("flatten_walk_step", 0.01)
+                strat.phase3_after_sec = saved.get("phase3_after_sec", 0.0)
+                strat.phase3_theo_drift_cents = saved.get("phase3_theo_drift_cents", 0.0)
+                strat.init_only = self.init_only_btn.isChecked()
                 self.strategies[raw_strike] = strat
 
             # Validate sizes <= max_position
@@ -2708,7 +2838,7 @@ class AboveBelowApp(QMainWindow):
         # Update button appearance
         row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
         if row >= 0:
-            btn = self.table.cellWidget(row, 15)
+            btn = self.table.cellWidget(row, 9)
             if btn:
                 if strat.active:
                     btn.setText("ON")
@@ -2726,7 +2856,7 @@ class AboveBelowApp(QMainWindow):
                     )
 
     def _flatten_position(self, raw_strike: float):
-        """Immediately flatten position by taking the other side BBO."""
+        """Show confirmation dialog, then flatten position at contra side BBO."""
         strat = self.strategies.get(raw_strike)
         md = self.market_data.get(raw_strike, {})
         ticker = md.get("ticker", "")
@@ -2735,43 +2865,68 @@ class AboveBelowApp(QMainWindow):
         if strat:
             pos = strat.position
         else:
-            # No strategy — check market_data for position
             pos = md.get("position", 0)
 
         if pos == 0 or not ticker:
             print(f"[App] Flatten: no position to flatten for {display_strike(raw_strike):,.0f}")
             return
 
-        # Stop the strategy to cancel resting orders first
-        if strat and strat.active:
-            strat.stop()
+        disp = display_strike(raw_strike)
+
+        if pos > 0:
+            action = "SELL"
+            price = strat.kalshi_bid if strat else md.get("yes_bid", 0)
+            side_desc = f"hit bid"
+        else:
+            action = "BUY"
+            price = strat.kalshi_ask if strat else md.get("yes_ask", 0)
+            side_desc = f"lift ask"
+
+        if price <= 0:
+            QMessageBox.warning(self, "Flatten",
+                                f"No {'bid' if pos > 0 else 'ask'} available for ${disp:,.0f}")
+            return
+
+        qty = abs(pos)
+        cost = price * qty
+
+        reply = QMessageBox.question(
+            self, "Flatten Position",
+            f"${disp:,.0f} — {action} {qty}x @ ${price:.2f} ({side_desc})\n"
+            f"Total: ${cost:.2f}\n\n"
+            f"Strategy will remain active.\n"
+            f"Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
 
         try:
-            if pos > 0:
-                # Long → sell at market bid (hit the bid)
-                price = strat.kalshi_bid if strat else md.get("yes_bid", 0)
-                if price <= 0:
-                    print(f"[App] Flatten: no bid available")
-                    return
-                resp = self.api.create_order(
-                    ticker=ticker, side="yes", action="sell",
-                    price_dollars=f"{price:.2f}", count=abs(pos),
+            action_str = "sell" if pos > 0 else "buy"
+            resp = self.api.create_order(
+                ticker=ticker, side="yes", action=action_str,
+                price_dollars=f"{price:.2f}", count=qty,
+                tag="flat",
+            )
+            print(f"[App] Flatten: {action_str.upper()} {qty}x @ ${price:.2f} (${disp:,.0f})")
+
+            # Check if order filled or is resting
+            order = resp.get("order", resp)
+            status = order.get("status", "")
+            remaining = float(order.get("remaining_count", qty))
+            if status == "resting" or remaining > 0:
+                filled = qty - remaining
+                self.greeks_label.setText(
+                    f"<span style='color:#ff8c00;font-size:14px;font-weight:bold;'>"
+                    f"⚠ FLAT RESTING: {action_str.upper()} {remaining:.0f}x @ ${price:.2f} "
+                    f"(${disp:,.0f}) — {filled:.0f} filled, {remaining:.0f} resting</span>"
                 )
-                print(f"[App] Flatten: SELL {abs(pos)}x @ ${price:.2f} "
-                      f"(${display_strike(raw_strike):,.0f})")
-            else:
-                # Short → buy at market ask (lift the ask)
-                price = strat.kalshi_ask if strat else md.get("yes_ask", 0)
-                if price <= 0:
-                    print(f"[App] Flatten: no ask available")
-                    return
-                resp = self.api.create_order(
-                    ticker=ticker, side="yes", action="buy",
-                    price_dollars=f"{price:.2f}", count=abs(pos),
-                )
-                print(f"[App] Flatten: BUY {abs(pos)}x @ ${price:.2f} "
-                      f"(${display_strike(raw_strike):,.0f})")
         except Exception as e:
+            self.greeks_label.setText(
+                f"<span style='color:#ef4444;font-size:14px;font-weight:bold;'>"
+                f"⚠ FLAT FAILED: {e}</span>"
+            )
             print(f"[App] Flatten failed: {e}")
 
     def _restore_strategies(self):
@@ -2809,6 +2964,8 @@ class AboveBelowApp(QMainWindow):
                 )
                 strat.flatten_walk_interval = params.get("flatten_walk_interval", 0.0)
                 strat.flatten_walk_step = params.get("flatten_walk_step", 0.01)
+                strat.phase3_after_sec = params.get("phase3_after_sec", 0.0)
+                strat.phase3_theo_drift_cents = params.get("phase3_theo_drift_cents", 0.0)
                 strat.start()
                 self.strategies[raw_strike] = strat
 
@@ -2829,7 +2986,7 @@ class AboveBelowApp(QMainWindow):
             # Update toggle button
             row = self.strikes.index(raw_strike) if raw_strike in self.strikes else -1
             if row >= 0:
-                btn = self.table.cellWidget(row, 15)
+                btn = self.table.cellWidget(row, 9)
                 if btn:
                     btn.setText("ON")
                     btn.setStyleSheet(
@@ -2937,7 +3094,17 @@ class AboveBelowApp(QMainWindow):
             pos = int(float(p.get("position_fp", 0)))
             exposure = float(p.get("market_exposure_dollars", 0))
             pnl = pnl_map.get(ticker, 0.0)
+
+            # Compute avg from fill-walking logic (resets when pos crosses 0,
+            # so it only reflects the current open position, not historical
+            # round-trips). Falls back to API exposure if fill walk is empty.
             avg_px = avg_price_map.get(ticker, 0.0)
+            if avg_px <= 0 and pos != 0 and exposure > 0:
+                if pos > 0:
+                    avg_px = exposure / pos
+                else:
+                    avg_px = 1.0 - exposure / abs(pos)
+
             data["position"] = pos
             data["exposure"] = exposure
             data["realized_pnl"] = pnl
@@ -3101,15 +3268,20 @@ class AboveBelowApp(QMainWindow):
     # =========================================================================
 
     def closeEvent(self, event):
+        # Save window geometry for next launch
+        try:
+            import base64
+            geom = bytes(self.saveGeometry().toBase64()).decode("ascii")
+            self._app_settings["window_geometry"] = geom
+            _save_app_settings(self._app_settings)
+        except Exception:
+            pass
+
         # 1. Stop feeds FIRST so no new orders can be placed
         if self.price_feed:
             self.price_feed.stop()
         if self.ws_feed:
             self.ws_feed.stop()
-        if self.deribit_ws:
-            self.deribit_ws.stop()
-        if self.weekly_deribit_ws:
-            self.weekly_deribit_ws.stop()
 
         # 2. Stop all strategies (cancels their tracked orders)
         all_strats = list(self.strategies.values())
@@ -3126,6 +3298,13 @@ class AboveBelowApp(QMainWindow):
         #    the strategies didn't track (e.g. orders from a previous session)
         self._cancel_all_orders()
 
+        # 4. Drain the async REST pool — waits for in-flight cancels
+        #    submitted by step 2 to complete before the process exits.
+        try:
+            self.api.shutdown()
+        except Exception:
+            pass
+
         self.strategies.clear()
         self._stashed_strategies.clear()
         self._stashed_market_data.clear()
@@ -3140,7 +3319,37 @@ class AboveBelowApp(QMainWindow):
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(sys.argv)
+    app.setApplicationName("4Runner")
+    # macOS Dock hover label comes from the bundle's CFBundleName, not
+    # QApplication.setApplicationName — running a raw .py file shows
+    # "Python" by default.  Override the bundle's info dict at startup
+    # so the Dock tooltip reads "4Runner".  Best-effort: silently skip
+    # if PyObjC isn't installed.
+    try:
+        from Foundation import NSBundle  # type: ignore
+        bundle = NSBundle.mainBundle()
+        if bundle:
+            info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+            if info is not None:
+                info["CFBundleName"] = "4Runner"
+                info["CFBundleDisplayName"] = "4Runner"
+    except Exception:
+        pass
+    icon_path = Path(__file__).resolve().parent / "icon.png"
+    if icon_path.exists():
+        icon = QIcon(str(icon_path))
+        app.setWindowIcon(icon)
+        # On macOS the Dock icon comes from NSApplication's image, not
+        # Qt's window icon — push it through PyObjC so the Dock matches.
+        try:
+            from AppKit import NSApplication, NSImage  # type: ignore
+            ns_img = NSImage.alloc().initByReferencingFile_(str(icon_path))
+            NSApplication.sharedApplication().setApplicationIconImage_(ns_img)
+        except Exception:
+            pass
     window = AboveBelowApp()
+    if icon_path.exists():
+        window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
     sys.exit(app.exec())
 

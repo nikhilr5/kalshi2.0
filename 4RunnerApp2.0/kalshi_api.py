@@ -9,7 +9,9 @@ import time
 import base64
 import uuid
 import requests
+from collections import deque
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -25,6 +27,52 @@ class KalshiAPI:
             self.private_key = serialization.load_pem_private_key(f.read(), password=None)
         self.on_rate_limit = None  # callback(remaining, limit, reset_ts)
         self.rate_limited_until = 0  # timestamp when rate limit expires
+        # Worker pool for non-blocking order writes (cancel/place).
+        # Sized for concurrent reprices across strikes — one round-trip per
+        # call, mostly idle on network IO so threads are cheap.
+        self._executor = ThreadPoolExecutor(
+            max_workers=20, thread_name_prefix="kalshi-rest"
+        )
+        # Rolling log of write-token consumption — used to compute
+        # tokens/sec for display.  Each entry: (monotonic_ts, tokens).
+        self._write_log: deque = deque()
+
+    def shutdown(self):
+        """Wait for in-flight async writes to complete, then stop the pool."""
+        self._executor.shutdown(wait=True)
+
+    # --- Write throughput tracking ---
+
+    def _log_write(self, tokens: int):
+        """Record a write call's token cost for tokens/sec computation."""
+        now = time.monotonic()
+        self._write_log.append((now, tokens))
+        # Keep at most ~5s of history — plenty for 1s windows
+        while self._write_log and now - self._write_log[0][0] > 5.0:
+            self._write_log.popleft()
+
+    def write_tokens_per_sec(self, window: float = 1.0) -> tuple:
+        """Return (tokens, calls) used in the last `window` seconds."""
+        now = time.monotonic()
+        cutoff = now - window
+        tokens = 0
+        calls = 0
+        for ts, t in self._write_log:
+            if ts >= cutoff:
+                tokens += t
+                calls += 1
+        return tokens, calls
+
+    # --- Async wrappers — return a Future immediately, work runs on the pool ---
+
+    def create_order_async(self, **kwargs):
+        return self._executor.submit(self.create_order, **kwargs)
+
+    def cancel_order_async(self, order_id: str):
+        return self._executor.submit(self.cancel_order, order_id)
+
+    def cancel_orders_batched_async(self, order_ids: list):
+        return self._executor.submit(self.cancel_orders_batched, order_ids)
 
     def _sign(self, timestamp_ms: int, method: str, path: str) -> str:
         """RSA-PSS signature of {timestamp}{method}{path}."""
@@ -46,12 +94,13 @@ class KalshiAPI:
             "Content-Type": "application/json",
         }
 
-    def ws_auth_headers(self) -> dict:
-        """Auth headers for websocket handshake."""
+    def ws_auth_headers(self, path: str = "/trade-api/ws/v2") -> dict:
+        """Auth headers for a websocket handshake.  Pass `path` for any
+        non-standard endpoint (e.g. `/user_orders` on the dedicated host)."""
         ts = int(time.time() * 1000)
         return {
             "KALSHI-ACCESS-KEY": self.ACCESS_KEY,
-            "KALSHI-ACCESS-SIGNATURE": self._sign(ts, "GET", "/trade-api/ws/v2"),
+            "KALSHI-ACCESS-SIGNATURE": self._sign(ts, "GET", path),
             "KALSHI-ACCESS-TIMESTAMP": str(ts),
         }
 
@@ -156,11 +205,13 @@ class KalshiAPI:
     def create_order(self, ticker: str, side: str, action: str,
                      price_dollars: str, count: int,
                      time_in_force: str = "good_till_canceled",
-                     tag: str = "") -> dict:
+                     tag: str = "",
+                     post_only: bool = False) -> dict:
         """Place a limit order.
         side='yes', action='sell' → sell YES at yes_price_dollars.
         time_in_force: 'good_till_canceled', 'immediate_or_cancel', or 'fill_or_kill'.
         tag: optional prefix for client_order_id (e.g. 'init' or 'flat').
+        post_only: if True, exchange rejects the order if it would cross.
         """
         prefix = f"{tag}_" if tag else ""
         body = {
@@ -173,6 +224,9 @@ class KalshiAPI:
             "type": "limit",
             "time_in_force": time_in_force,
         }
+        if post_only:
+            body["post_only"] = True
+        self._log_write(10)  # create_order = default 10 tokens
         return self._post("/portfolio/orders", body)
 
     def get_order(self, order_id: str) -> dict:
@@ -180,7 +234,27 @@ class KalshiAPI:
         return self._get(f"/portfolio/orders/{order_id}")
 
     def cancel_order(self, order_id: str) -> dict:
+        self._log_write(2)  # cancel_order = 2 tokens
         return self._delete(f"/portfolio/orders/{order_id}")
+
+    def cancel_orders_batched(self, order_ids: list) -> dict:
+        """Batch cancel — DELETE /portfolio/orders/batched.
+
+        One round-trip cancels N orders (vs N round-trips with cancel_order).
+        Still billed 2 rate-limit tokens per order in the batch, so the
+        cost saving is network latency, not API budget.
+
+        Body: {"orders": [{"order_id": "..."}, ...]}
+        Returns: {"orders": [{order_id, order, reduced_by_fp, error}, ...]}
+        Each item has its own `error` field — partial failures don't fail
+        the request.  Callers should inspect per-order results.
+        """
+        ids = [oid for oid in (order_ids or []) if oid]
+        if not ids:
+            return {"orders": []}
+        body = {"orders": [{"order_id": oid} for oid in ids]}
+        self._log_write(2 * len(ids))  # 2 tokens per order in the batch
+        return self._delete("/portfolio/orders/batched", body)
 
     def get_orders(self, status: str = "resting") -> list:
         orders = []
@@ -228,6 +302,21 @@ class KalshiAPI:
             if not cursor or not data.get("fills"):
                 break
         return fills
+
+    def get_trades(self, ticker: str, limit: int = 1000) -> list:
+        """Fetch public trade history for a market ticker."""
+        trades = []
+        cursor = None
+        while True:
+            params = {"ticker": ticker, "limit": min(limit - len(trades), 200)}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get(f"/markets/trades", params)
+            trades.extend(data.get("trades", []))
+            cursor = data.get("cursor")
+            if not cursor or not data.get("trades") or len(trades) >= limit:
+                break
+        return trades
 
     def get_balance(self) -> dict:
         return self._get("/portfolio/balance")
