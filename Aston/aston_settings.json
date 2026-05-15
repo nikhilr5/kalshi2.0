@@ -1,0 +1,8 @@
+{
+  "edge_bid": 2.0,
+  "edge_ask": 2.0,
+  "size_bid": 1,
+  "size_ask": 1,
+  "max_position": 8,
+  "sigma_scalar": 0.85
+}
