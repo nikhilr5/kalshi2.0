@@ -15,11 +15,11 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QMainWindow, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
-    QToolButton, QVBoxLayout, QWidget,
+    QLabel, QMainWindow, QMenu, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from kalshi_api import KalshiAPI
@@ -273,6 +273,11 @@ class AstonApp(QMainWindow):
 
         # Portfolio — both pulled directly from /portfolio/balance.
         # Total portfolio value displayed = balance + portfolio_value.
+        # Auto-MM mode — tracks which ticker we've already auto-engaged
+        # so manual OFF after auto-ON isn't re-fought within the same
+        # 15-min window.  Reset on auto-mode toggle and on ticker change.
+        self._auto_mm_done_ticker: str | None = None
+
         self._balance_cents: int = -1          # cash (Kalshi `balance`)
         self._portfolio_value_cents: int = 0   # position MtM (Kalshi `portfolio_value`)
         self._balance_worker: BalanceWorker | None = None
@@ -363,12 +368,18 @@ class AstonApp(QMainWindow):
 
         header.addStretch()
 
-        # Big on/off toggle.
-        self.toggle_btn = QPushButton("MM  OFF")
+        # Big on/off toggle + dropdown for auto-mode config.  QToolButton
+        # in MenuButtonPopup mode splits into two zones: the main face
+        # toggles MM, the small right arrow opens the menu.
+        self.toggle_btn = QToolButton()
+        self.toggle_btn.setText("MM  OFF")
         self.toggle_btn.setCheckable(True)
-        self.toggle_btn.setMinimumWidth(160)
+        self.toggle_btn.setMinimumWidth(180)
         self.toggle_btn.setMinimumHeight(46)
+        self.toggle_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.toggle_btn.clicked.connect(self._on_toggle_clicked)
+        self._build_mm_menu()
         self._apply_toggle_style(False)
         header.addWidget(self.toggle_btn)
 
@@ -653,23 +664,126 @@ class AstonApp(QMainWindow):
         return v
 
     def _apply_toggle_style(self, on: bool):
-        """Style the MM toggle button to read as an on/off switch."""
+        """Style the MM toggle button (QToolButton with menu popup)."""
         if on:
             self.toggle_btn.setText("MM  ON")
             self.toggle_btn.setStyleSheet("""
-                QPushButton{background:#16a34a;color:#fff;font-weight:bold;
+                QToolButton{background:#16a34a;color:#fff;font-weight:bold;
                             font-size:14px;letter-spacing:2px;border:none;
-                            border-radius:23px;padding:0 18px;}
-                QPushButton:hover{background:#15803d;}
+                            border-top-left-radius:23px;
+                            border-bottom-left-radius:23px;
+                            padding:0 18px;}
+                QToolButton:hover{background:#15803d;}
+                QToolButton::menu-button{background:#15803d;
+                            border:none;
+                            border-top-right-radius:23px;
+                            border-bottom-right-radius:23px;
+                            width:26px;}
+                QToolButton::menu-button:hover{background:#166534;}
             """)
         else:
             self.toggle_btn.setText("MM  OFF")
             self.toggle_btn.setStyleSheet("""
-                QPushButton{background:#1e2736;color:#5a6270;font-weight:bold;
+                QToolButton{background:#1e2736;color:#5a6270;font-weight:bold;
                             font-size:14px;letter-spacing:2px;border:none;
-                            border-radius:23px;padding:0 18px;}
-                QPushButton:hover{background:#2d3a4d;color:#c8cdd5;}
+                            border-top-left-radius:23px;
+                            border-bottom-left-radius:23px;
+                            padding:0 18px;}
+                QToolButton:hover{background:#2d3a4d;color:#c8cdd5;}
+                QToolButton::menu-button{background:#2d3a4d;
+                            border:none;
+                            border-top-right-radius:23px;
+                            border-bottom-right-radius:23px;
+                            width:26px;}
+                QToolButton::menu-button:hover{background:#3d4d63;}
             """)
+
+    def _build_mm_menu(self):
+        """Construct the dropdown attached to the MM toggle.  Holds
+        the always-on flag and the auto-off threshold presets."""
+        menu = QMenu(self)
+
+        self.auto_mm_action = QAction(
+            "Always on (auto new market)", self)
+        self.auto_mm_action.setCheckable(True)
+        self.auto_mm_action.setChecked(
+            bool(self.settings.get("auto_mm_on", False)))
+        self.auto_mm_action.toggled.connect(self._on_auto_mm_toggled)
+        menu.addAction(self.auto_mm_action)
+
+        menu.addSeparator()
+        header_action = QAction("Auto-off threshold:", self)
+        header_action.setEnabled(False)
+        menu.addAction(header_action)
+
+        self._threshold_group = QActionGroup(self)
+        self._threshold_group.setExclusive(True)
+        current = int(self.settings.get("auto_mm_off_secs", 90))
+        for label, secs in [("30s", 30), ("1:00", 60), ("1:30", 90),
+                            ("2:00", 120), ("3:00", 180)]:
+            a = QAction(f"    {label}", self)
+            a.setCheckable(True)
+            a.setChecked(secs == current)
+            a.triggered.connect(
+                lambda _checked, s=secs: self._set_auto_mm_threshold(s))
+            self._threshold_group.addAction(a)
+            menu.addAction(a)
+
+        self.toggle_btn.setMenu(menu)
+
+    def _on_auto_mm_toggled(self, checked: bool):
+        """Persist + immediately evaluate auto-state when the flag flips."""
+        self.settings["auto_mm_on"] = bool(checked)
+        _save_settings(self.settings)
+        # Reset the per-ticker armed marker so toggling the flag back
+        # on re-arms an auto-on for the current ticker.
+        self._auto_mm_done_ticker = None
+        self._check_auto_mm()
+
+    def _set_auto_mm_threshold(self, secs: int):
+        self.settings["auto_mm_off_secs"] = int(secs)
+        _save_settings(self.settings)
+
+    def _check_auto_mm(self):
+        """When always-on mode is on, manage the toggle as a function of
+        time-to-expiry:
+
+          - On a fresh market roll (ticker just changed) and T > threshold:
+            auto-engage MM.  Tracked once per ticker via
+            `_auto_mm_done_ticker` so the user's manual OFF after auto-on
+            isn't fought.
+          - Anytime T < threshold while engaged: auto-disengage.  This
+            stays active in always-on mode, so a manual ON in the
+            forbidden zone will immediately flip back to OFF.
+        """
+        if not self.settings.get("auto_mm_on", False):
+            return
+        if not self.market or not self.ticker or self.strike <= 0:
+            return
+
+        secs = seconds_to_close(self.market)
+        threshold = int(self.settings.get("auto_mm_off_secs", 90))
+        is_on = self.strategy is not None
+
+        # Auto-OFF
+        if is_on and secs < threshold:
+            self.toggle_btn.setChecked(False)
+            self._on_toggle_clicked()
+            self.status_label.setText(
+                f"[AutoMM] OFF — {int(secs)}s < {threshold}s threshold")
+            return
+
+        # Auto-ON, once per ticker
+        if (not is_on
+                and secs > threshold
+                and getattr(self, "_auto_mm_done_ticker", None)
+                    != self.ticker):
+            self._auto_mm_done_ticker = self.ticker
+            self.toggle_btn.setChecked(True)
+            self._on_toggle_clicked()
+            if self.strategy is not None:
+                self.status_label.setText(
+                    f"[AutoMM] ON — {self.ticker} ({int(secs)}s left)")
 
     def _apply_stylesheet(self):
         # Two-tier visual hierarchy: main panel (#mainPanel) lifted with
@@ -1176,6 +1290,9 @@ class AstonApp(QMainWindow):
             samples = self.vol_est.sample_count()
             self.vol_card.value.setText(f"warming ({samples})")
         self._refresh_vol_tooltip()
+
+        # Auto-MM lifecycle (always-on mode, threshold-based shutoff)
+        self._check_auto_mm()
 
         # Position card — pos count plus avg-entry-of-open-position in
         # parentheses, e.g. "+12 (53.4¢)".  Avg entry is the weighted

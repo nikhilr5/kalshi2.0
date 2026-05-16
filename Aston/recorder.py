@@ -407,6 +407,7 @@ class StandaloneRecorder:
 
         self._stop_event = threading.Event()
         self._discovery_thread: threading.Thread | None = None
+        self._rotation_thread: threading.Thread | None = None
 
     # ---- startup / shutdown ----
 
@@ -443,6 +444,15 @@ class StandaloneRecorder:
             name="recorder-discovery")
         self._discovery_thread.start()
 
+        # Rotation thread — pushes stale per-day DBs to S3 + deletes
+        # locally.  In-process (vs a separate launchd job) so it
+        # inherits the recorder's Terminal TCC grant; no macOS
+        # privacy-pane fight.  Checks every hour.
+        self._rotation_thread = threading.Thread(
+            target=self._rotation_loop, daemon=True,
+            name="recorder-rotation")
+        self._rotation_thread.start()
+
         print("[Recorder] Running.  Ctrl-C to stop.")
         while not self._stop_event.is_set():
             time.sleep(1)
@@ -465,6 +475,95 @@ class StandaloneRecorder:
         except Exception:
             pass
         print("[Recorder] Done")
+
+    # ---- daily-rotation to S3 (in-process; inherits Terminal TCC grant) ----
+
+    S3_ROTATION_BUCKET = "s3://kalshibtc/archive"
+    ROTATION_AGE_S = 24 * 3600
+    ROTATION_INTERVAL_S = 3600   # hourly scan
+
+    def _rotation_loop(self):
+        """Wake up hourly, push any per-day DB (and -wal/-shm sidecars)
+        older than ROTATION_AGE_S to S3, then delete locally on
+        confirmed-upload.  Skips today's file unconditionally."""
+        # Short delay before first run so startup logs aren't crowded.
+        self._stop_event.wait(60)
+        while not self._stop_event.is_set():
+            try:
+                self._do_rotation_pass()
+            except Exception as e:
+                print(f"[rotate] pass failed: {e}")
+            self._stop_event.wait(self.ROTATION_INTERVAL_S)
+
+    def _do_rotation_pass(self):
+        import subprocess
+        now = time.time()
+        today_path = db_path_for(self.series,
+                                  datetime.now(tz=timezone.utc),
+                                  self.state.base_dir)
+        today_name = today_path.name
+
+        eligible = []
+        for f in self.state.base_dir.glob("KX*15M-*.db"):
+            if f.name == today_name:
+                continue
+            if (now - f.stat().st_mtime) < self.ROTATION_AGE_S:
+                continue
+            eligible.append(f)
+
+        if not eligible:
+            return
+
+        print(f"[rotate] {len(eligible)} stale DB(s) eligible")
+        for db in sorted(eligible):
+            # If we still hold an idle connection to this file (rare —
+            # _conn_now reaps stale conns on next write), close it
+            # before deleting so the file handle is released.
+            with self.state._lock:
+                if db in self.state._conns:
+                    try:
+                        self.state._conns[db].close()
+                    except Exception:
+                        pass
+                    del self.state._conns[db]
+
+            # Bundle -wal and -shm so a future restore is consistent.
+            siblings = [db]
+            for ext in (".db-wal", ".db-shm"):
+                sib = db.with_suffix(ext)
+                if sib.exists():
+                    siblings.append(sib)
+
+            ok = True
+            for f in siblings:
+                remote = f"{self.S3_ROTATION_BUCKET}/{f.name}"
+                print(f"[rotate] up {f.name}")
+                cp = subprocess.run(
+                    ["aws", "s3", "cp", str(f), remote,
+                     "--only-show-errors"],
+                    capture_output=True, text=True, timeout=1800,
+                )
+                if cp.returncode != 0:
+                    print(f"[rotate] FAIL {f.name}: "
+                          f"{cp.stderr.strip() or cp.stdout.strip()}")
+                    ok = False
+                    break
+                # Verify on S3 before trusting the upload.
+                verify = subprocess.run(
+                    ["aws", "s3", "ls", remote],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if verify.returncode != 0 or not verify.stdout.strip():
+                    print(f"[rotate] FAIL verify {f.name}")
+                    ok = False
+                    break
+            if ok:
+                for f in siblings:
+                    try:
+                        f.unlink()
+                        print(f"[rotate] rm {f.name}")
+                    except Exception as e:
+                        print(f"[rotate] could not rm {f.name}: {e}")
 
     # ---- market discovery & WS rolls ----
 

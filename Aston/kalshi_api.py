@@ -184,6 +184,11 @@ class KalshiAPI:
 
     # --- Market Discovery ---
 
+    def get_market(self, ticker: str) -> dict:
+        """Single-market details.  Post-settlement the response has a
+        `result` field of `"yes"` or `"no"`."""
+        return self._get(f"/markets/{ticker}").get("market", {})
+
     def get_markets_for_event(self, event_ticker: str) -> list:
         params = {"event_ticker": event_ticker, "limit": 200}
         return self._get("/markets", params).get("markets", [])

@@ -1,13 +1,432 @@
+import json
+import re
 import sqlite3
+import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 import zoneinfo
 
 import numpy as np
 import pandas as pd
 import math
 from statistics import NormalDist
+import math
+from scipy.optimize import brentq
 
+SECONDS_PER_YEAR = 365.25 * 24 * 3600
+ANN_MIN = 365.25 * 24 * 60
+FOUR_LN2 = 4.0 * math.log(2.0)
+
+# Where the recorder writes per-day DB files, and where this module
+# caches anything pulled from S3.  Both overridable per-call.
+DEFAULT_LOCAL_DIR = (Path("~/Desktop/Kalshi2.0/analysis/backtesting/data")
+                     .expanduser())
+DEFAULT_S3_CACHE_DIR = (Path("~/Desktop/Kalshi2.0/analysis/backtesting/_s3_cache")
+                        .expanduser())
+DEFAULT_S3_BUCKET = "s3://kalshibtc/archive"
+
+_MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+           "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+
+
+def parse_day_suffix(suffix: str):
+    """`26MAY15` → `date(2026, 5, 15)`.  Returns None on bad format."""
+    m = re.match(r"^(\d{2})([A-Z]{3})(\d{2})$", suffix)
+    if not m:
+        return None
+    yy, mon, dd = m.groups()
+    if mon not in _MONTHS:
+        return None
+    try:
+        return date(2000 + int(yy), _MONTHS[mon], int(dd))
+    except ValueError:
+        return None
+
+
+def list_eligible_dbs(series_prefix: str, cutoff: str,
+                      local_dir: Path = DEFAULT_LOCAL_DIR,
+                      s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+                      s3_bucket: str = DEFAULT_S3_BUCKET) -> list[Path]:
+    """Return every per-day DB path for `series_prefix` whose YYMONDD
+    suffix is ≥ `cutoff`.  Local files take priority over S3.  Missing
+    S3 files get downloaded into `s3_cache_dir` on demand."""
+    cutoff_date = parse_day_suffix(cutoff)
+    if cutoff_date is None:
+        raise ValueError(f"bad cutoff format {cutoff!r}; expected YYMONDD")
+
+    paths: dict[str, Path] = {}
+
+    # Local — recorder's data dir
+    for f in local_dir.glob(f"{series_prefix}-*.db"):
+        suffix = f.stem.rsplit("-", 1)[-1]
+        d = parse_day_suffix(suffix)
+        if d and d >= cutoff_date:
+            paths[f.name] = f
+
+    # Local — previously-cached S3 files
+    if s3_cache_dir.exists():
+        for f in s3_cache_dir.glob(f"{series_prefix}-*.db"):
+            if f.name in paths:
+                continue
+            suffix = f.stem.rsplit("-", 1)[-1]
+            d = parse_day_suffix(suffix)
+            if d and d >= cutoff_date:
+                paths[f.name] = f
+
+    # S3 — list and download anything not yet present locally
+    try:
+        r = subprocess.run(
+            ["aws", "s3", "ls", f"{s3_bucket}/"],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        s3_names = []
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name = parts[3]
+            if (not name.startswith(f"{series_prefix}-")
+                    or not name.endswith(".db")):
+                continue
+            suffix = name[:-3].rsplit("-", 1)[-1]
+            d = parse_day_suffix(suffix)
+            if d and d >= cutoff_date:
+                s3_names.append(name)
+
+        missing = [n for n in s3_names if n not in paths]
+        if missing:
+            s3_cache_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[s3] downloading {len(missing)} file(s) → {s3_cache_dir}")
+            for name in sorted(missing):
+                target = s3_cache_dir / name
+                print(f"     {name}")
+                cp = subprocess.run(
+                    ["aws", "s3", "cp", f"{s3_bucket}/{name}", str(target),
+                     "--only-show-errors"],
+                    capture_output=True, text=True,
+                )
+                if cp.returncode == 0:
+                    paths[name] = target
+                else:
+                    print(f"     [warn] download failed: "
+                          f"{cp.stderr.strip() or cp.stdout.strip()}")
+    except FileNotFoundError:
+        print("[s3] aws CLI not on PATH — using local files only")
+    except subprocess.TimeoutExpired:
+        print("[s3] aws s3 ls timed out — using local files only")
+    except subprocess.CalledProcessError as e:
+        print(f"[s3] aws s3 ls failed ({e.returncode}) — "
+              f"using local files only")
+
+    return sorted(paths.values(), key=lambda p: p.name)
+
+
+def load_all_data(series_prefix: str, cutoff: str,
+                  local_dir: Path = DEFAULT_LOCAL_DIR,
+                  s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+                  s3_bucket: str = DEFAULT_S3_BUCKET) -> tuple:
+    """Concat theo / book / spot / fills / order_events across every
+    eligible per-day DB.  Returns five DataFrames (in that order) with
+    parsed `ts` columns.  Missing tables in older DBs are skipped."""
+    files = list_eligible_dbs(series_prefix, cutoff,
+                              local_dir, s3_cache_dir, s3_bucket)
+    if not files:
+        print(f"[load] no eligible DB files for {series_prefix} ≥ {cutoff}")
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, empty
+
+    print(f"[load] {len(files)} file(s) for {series_prefix} ≥ {cutoff}")
+    theo_l, book_l, spot_l, fill_l, evt_l = [], [], [], [], []
+    for path in files:
+        print(f"   {path.name}")
+        conn = sqlite3.connect(str(path))
+        try:
+            for table, target in (
+                ("theo_state",   theo_l),
+                ("kalshi_book",  book_l),
+                ("spot_ticks",   spot_l),
+                ("fills",        fill_l),
+                ("order_events", evt_l),
+            ):
+                try:
+                    target.append(
+                        pd.read_sql(f"SELECT * FROM {table} ORDER BY ts", conn))
+                except Exception as e:
+                    print(f"     [warn] skipping {table}: {e}")
+        finally:
+            conn.close()
+
+    def _concat(parts):
+        return (pd.concat(parts, ignore_index=True)
+                if parts else pd.DataFrame())
+
+    theo  = _concat(theo_l)
+    book  = _concat(book_l)
+    spot  = _concat(spot_l)
+    fills = _concat(fill_l)
+    events = _concat(evt_l)
+
+    for df in (theo, book, spot, fills, events):
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+    return theo, book, spot, fills, events
+
+
+def realized_sigma_forward(spot: pd.DataFrame,
+                            horizon_minutes: int = 15) -> pd.DataFrame:
+    """Per-minute forward-looking Parkinson σ from spot ticks.
+
+    Returns a DataFrame with columns:
+        minute            — 1-min boundary (UTC)
+        high, low         — within-minute extremes
+        parkinson_var     — per-minute variance: ln(H/L)² / (4·ln 2)
+        realized_{N}m     — σ over the NEXT `horizon_minutes` minutes,
+                            annualized (NaN for trailing rows that
+                            don't have a full forward window).
+    """
+    if spot.empty:
+        return pd.DataFrame()
+    spot = spot.sort_values('ts').reset_index(drop=True)
+    spot = spot.assign(minute=spot['ts'].dt.floor('1min'))
+    minute_bars = (
+        spot.groupby('minute')
+            .agg(high=('price', 'max'), low=('price', 'min'))
+            .reset_index()
+            .sort_values('minute')
+            .reset_index(drop=True)
+    )
+    hl_ratio = minute_bars['high'] / minute_bars['low']
+    minute_bars['parkinson_var'] = np.where(
+        (minute_bars['high'] > 0)
+        & (minute_bars['low'] > 0)
+        & (minute_bars['high'] > minute_bars['low']),
+        np.log(hl_ratio) ** 2 / FOUR_LN2,
+        0.0,
+    )
+    cum = minute_bars['parkinson_var'].cumsum()
+    future_var = cum.shift(-horizon_minutes) - cum
+    col = f'realized_{horizon_minutes}m'
+    minute_bars[col] = np.sqrt(
+        future_var.clip(lower=0) * (ANN_MIN / horizon_minutes)
+    )
+    minute_bars.loc[future_var.isna(), col] = np.nan
+    return minute_bars
+
+
+def fetch_settlements_from_api(tickers, kalshi_api,
+                                 cache_path: Path | str | None = None
+                                 ) -> dict[str, int]:
+    """Pull authoritative settlement results from Kalshi.
+
+    Returns `{ticker: 1 if result == "yes" else 0}` for every ticker
+    whose market has settled.  Tickers without a `result` field yet
+    (not closed, or closed-but-not-yet-resolved) are silently omitted.
+
+    Caches results to `cache_path` as JSON.  Settled markets are
+    immutable, so subsequent runs re-use the cache and only hit the
+    API for tickers that haven't been seen.  Pass `cache_path=None`
+    to disable caching entirely (always queries the API).
+    """
+    cache: dict[str, int] = {}
+    cache_p: Path | None = Path(cache_path) if cache_path else None
+    if cache_p and cache_p.exists():
+        try:
+            with cache_p.open() as f:
+                cache = {k: int(v) for k, v in json.load(f).items()}
+        except Exception as e:
+            print(f"[settle] cache read failed: {e}")
+            cache = {}
+
+    out: dict[str, int] = {}
+    new_lookups = 0
+    new_settled = 0
+    for ticker in tickers:
+        if ticker in cache:
+            out[ticker] = cache[ticker]
+            continue
+        new_lookups += 1
+        try:
+            market = kalshi_api.get_market(ticker)
+        except Exception as e:
+            print(f"[settle] {ticker}: API error: {e}")
+            continue
+        result = (market.get("result") or "").lower()
+        if result == "yes":
+            out[ticker] = cache[ticker] = 1
+            new_settled += 1
+        elif result == "no":
+            out[ticker] = cache[ticker] = 0
+            new_settled += 1
+        # else: not yet settled — leave out
+
+    if new_settled > 0 and cache_p is not None:
+        try:
+            cache_p.parent.mkdir(parents=True, exist_ok=True)
+            with cache_p.open("w") as f:
+                json.dump(cache, f)
+        except Exception as e:
+            print(f"[settle] cache write failed: {e}")
+
+    print(f"[settle] {len(out)} settled / {len(tickers)} tickers "
+          f"({new_lookups} new lookups, {new_settled} newly settled)")
+    return out
+
+
+def compute_settlements(theo: pd.DataFrame, spot: pd.DataFrame,
+                          twap_window_s: int = 60,
+                          min_ticks: int = 5) -> dict[str, int]:
+    """Approximate per-ticker settlement outcomes from spot ticks.
+
+    Kalshi crypto 15-min markets settle on the TWAP of the underlying
+    over the final `twap_window_s` seconds before close.  We don't
+    capture the official settlement yet, so we derive it: average
+    `spot_ticks.price` over [close − twap_window_s, close], compare to
+    strike, emit 1 if TWAP > strike else 0.
+
+    Tickers with fewer than `min_ticks` spot ticks in the window are
+    skipped (returned dict doesn't include them) — they'd be too noisy
+    to score reliably.
+    """
+    if theo.empty or spot.empty:
+        return {}
+    spot = spot.sort_values('ts')
+    out: dict[str, int] = {}
+    for ticker, group in theo.groupby('ticker'):
+        try:
+            last = group.loc[group['seconds_to_expiry'].idxmin()]
+        except (KeyError, ValueError):
+            continue
+        secs_remaining = float(last['seconds_to_expiry'])
+        close_time = last['ts'] + pd.Timedelta(seconds=secs_remaining)
+        strike = float(last['strike'])
+        if strike <= 0:
+            continue
+        window_start = close_time - pd.Timedelta(seconds=twap_window_s)
+        twap_rows = spot[(spot['ts'] >= window_start)
+                         & (spot['ts'] <= close_time)]
+        if len(twap_rows) < min_ticks:
+            continue
+        twap = float(twap_rows['price'].mean())
+        out[ticker] = 1 if twap > strike else 0
+    return out
+
+
+def brier_score(predictions: pd.Series, outcomes: pd.Series) -> float | None:
+    """Brier = mean((pred − outcome)²).  Returns None if no valid pairs.
+
+    Lower is better.  A naive constant-0.5 forecaster scores 0.25;
+    perfect calibration scores 0.  Used to compare probability
+    forecasts (theo, market mid) against binary settlement outcomes.
+    """
+    mask = (~predictions.isna()) & (~outcomes.isna())
+    p, o = predictions[mask], outcomes[mask]
+    if len(p) == 0:
+        return None
+    return float(((p - o) ** 2).mean())
+
+
+def forecast_error_stats(pred: pd.Series, actual: pd.Series,
+                          sep: str = "\n") -> str:
+    """Multi-line formatted summary of forecast accuracy.
+
+    Reports n, correlation, bias, MAE, RMSE — same definitions used in
+    vol_forecasting's calibration panels.  `sep="<br>"` for HTML / plotly
+    annotations, `sep="\\n"` (default) for terminal printing."""
+    mask = (~pred.isna()) & (~actual.isna())
+    p, a = pred[mask], actual[mask]
+    if len(p) == 0:
+        return "n=0"
+    err = p - a
+    parts = [
+        f"n={len(p):,}",
+        f"corr ={np.corrcoef(p, a)[0,1]:+.3f}",
+        f"bias ={err.mean()*100:+.2f}%",
+        f"MAE  ={err.abs().mean()*100:.2f}%",
+        f"RMSE ={np.sqrt((err**2).mean())*100:.2f}%",
+    ]
+    return sep.join(parts)
+
+
+def implied_sigma(market_price, spot, strike, seconds_to_expiry, r: float = 0.0):
+    """Closed-form annualized σ implied by N(d2) = market_price.
+
+    Works on scalars, numpy arrays, or pandas Series — all broadcast.
+    Returns same type, with NaN for unsolvable inputs (price beyond
+    the model's max for the given moneyness/T, or degenerate inputs).
+
+    Derivation: let u = σ√T.  d2 = m/u − u/2 where m = ln(S/K) + rT.
+    Setting d2 = N⁻¹(price) = x:
+        u² + 2xu − 2m = 0   →   u = −x + √(x² + 2m)
+    σ = u / √T.  When the discriminant is negative, the binary's
+    price is outside the no-drift lognormal's reachable range — return
+    NaN.
+
+    Much faster than brentq on a per-row basis (~50× on 1M rows).
+    """
+    import numpy as np
+    from scipy.stats import norm as _norm
+
+    price = np.asarray(market_price, dtype=float)
+    S     = np.asarray(spot,         dtype=float)
+    K     = np.asarray(strike,       dtype=float)
+    secs  = np.asarray(seconds_to_expiry, dtype=float)
+
+    eps = 1e-6
+    valid = ((price > eps) & (price < 1 - eps)
+             & (S > 0) & (K > 0) & (secs > 0))
+
+    # Safe inputs so the math doesn't warn on invalid rows; we'll
+    # mask the output with NaN at the end.
+    safe_price = np.where(valid, price, 0.5)
+    safe_S     = np.where(valid, S, 1.0)
+    safe_K     = np.where(valid, K, 1.0)
+    safe_T     = np.where(valid, secs / SECONDS_PER_YEAR, 1.0)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        x = _norm.ppf(safe_price)
+        m = np.log(safe_S / safe_K) + r * safe_T
+        disc = x * x + 2 * m
+        sqrt_disc = np.sqrt(np.where(disc > 0, disc, 0))
+        # Two positive roots possible.  The larger σ root is the
+        # pathological one (drift correction dominates); the lower
+        # is the conventional IV.  Pick the smaller positive u.
+        u_plus  = -x + sqrt_disc
+        u_minus = -x - sqrt_disc
+        u = np.where(u_minus > 0, u_minus, u_plus)
+        sigma = u / np.sqrt(safe_T)
+
+    out = np.where(valid & (disc > 0) & (u > 0), sigma, np.nan)
+    # Preserve pandas Series indexing if the caller passed one.
+    if hasattr(market_price, "index"):
+        import pandas as pd
+        return pd.Series(out, index=market_price.index)
+    return out
+
+#used to compute markouts when passed in fills and book
+def calculate_markouts(fills : pd.DataFrame, book: pd.DataFrame, markouts: list[int]):
+    result = fills
+    for t in markouts:
+        new_field = 'markout_' + str(t) + 's'
+        result[new_field + "_ts"] = result['ts'] + pd.Timedelta(seconds=t)
+        result = pd.merge_asof(
+            result,
+            book,
+            left_on=new_field + '_ts',
+            right_on='ts',
+            by='ticker',
+            direction='backward',
+            suffixes=('_f', '_' + new_field)
+        )
+        result['yes_mid'] = (result['yes_bid'] + result['yes_ask']) / 2
+        result[new_field] = np.where(result['action'] == 'buy',
+            (result['yes_mid']- result['price'])* 100,
+            (result['price'] - result['yes_mid']) * 100)
+        
+        result['ts'] = result['ts_f']
+        result = result.drop(columns=['yes_bid', 'yes_ask', 'yes_mid', 'ts_f', 'id', 'ask_size', 'bid_size'])
+        
+    return result
 
 @dataclass(frozen=True)
 class AnalysisUtils:
@@ -685,3 +1104,33 @@ class AnalysisUtils:
             return "  |  ".join(parts)
 
         app.run(debug=False)
+
+
+    @staticmethod
+    def implied_sigma(market_price: float, spot: float, strike: float,
+                    seconds_to_expiry: float) -> float | None:
+        """Back out annualized σ from a binary option's market price.
+
+        Solves N(d2) = market_price for σ.  Assumes r = 0 (fine for
+        15-min crypto binaries).  Returns None if the inputs are
+        degenerate or no σ in [1e-4, 5.0] matches.
+        """
+        if not (0 < market_price < 1):
+            return None
+        if spot <= 0 or strike <= 0 or seconds_to_expiry <= 0:
+            return None
+
+        T = seconds_to_expiry / SECONDS_PER_YEAR
+        log_sk = math.log(spot / strike)
+        SQRT2 = math.sqrt(2.0)
+
+        def price_minus_target(sigma):
+            sqrt_T = math.sqrt(T)
+            d2 = (log_sk - 0.5 * sigma * sigma * T) / (sigma * sqrt_T)
+            n = 0.5 * (1.0 + math.erf(d2 / SQRT2))
+            return n - market_price
+
+        try:
+            return brentq(price_minus_target, 1e-4, 5.0, xtol=1e-6)
+        except ValueError:
+            return None  # market_price outside the [σ=1e-4, σ=5] reachable range
