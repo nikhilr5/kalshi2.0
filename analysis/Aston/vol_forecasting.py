@@ -26,6 +26,8 @@ from utility import (
     implied_sigma,
     load_all_data,
     realized_sigma_forward,
+    theo_vec,
+    theo_vec_twap
 )
 
 # Aston package is a sibling — let Python find the KalshiAPI module.
@@ -96,8 +98,19 @@ n_settled = len(settlements)
 theo['outcome'] = theo['ticker'].map(settlements)
 book['outcome'] = book['ticker'].map(settlements)
 
-har_brier = brier_score(theo['theo'], theo['outcome'])
+theo['calculated_theo'] = theo_vec(theo['spot'], theo['strike'], theo['forecasted_vol'], theo['seconds_to_expiry'])
+har_brier = brier_score(theo['calculated_theo'], theo['outcome'])
 mkt_brier = brier_score(book['mid'], book['outcome'])
+
+theo['calculated_theo_twap'] = theo_vec_twap(
+    theo['spot'], theo['strike'],
+    theo['forecasted_vol'], theo['seconds_to_expiry']
+)
+
+har_brier_twap = brier_score(theo['calculated_theo_twap'], theo['outcome'])
+har_brier_until_90s = brier_score(theo[theo['seconds_to_expiry'] > 90]['calculated_theo'], theo['outcome'])
+mkt_brier_until_90s = brier_score(book[book['seconds_to_expiry'] > 90]['mid'], book['outcome'])
+
 
 
 # =============================================================================
@@ -203,6 +216,7 @@ for col in (1, 2):
 # subplot, plotly assigns the time series to axes 1 and the two row-2
 # scatters to axes 2 and 3 respectively.
 panel_briers = (har_brier, mkt_brier)
+panel_briers_90s = (har_brier_until_90s, mkt_brier_until_90s)
 scatter_axes = (('x2', 'y2'), ('x3', 'y3'))
 for i, (pred, actual) in enumerate([
         (df_f['forecasted_vol'], df_f['realized_15m']),
@@ -210,8 +224,11 @@ for i, (pred, actual) in enumerate([
 ]):
     sigma_block = forecast_error_stats(pred, actual, sep='<br>')
     brier_val = panel_briers[i]
+    brier_val_90s = panel_briers_90s[i]
     if brier_val is not None and n_settled > 0:
         brier_block = (f"<br><br>Brier ={brier_val:.4f}"
+                       f"<br>Brier (Up until 90s until expiry)={brier_val_90s:.4f}"
+                       f"<br>Brier TWAP Theo={har_brier_twap:.4f}"
                        f"<br>markets={n_settled}")
     else:
         brier_block = "<br><br>Brier =--"

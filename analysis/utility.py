@@ -139,8 +139,8 @@ def load_all_data(series_prefix: str, cutoff: str,
     print(f"[load] {len(files)} file(s) for {series_prefix} ≥ {cutoff}")
     theo_l, book_l, spot_l, fill_l, evt_l = [], [], [], [], []
     for path in files:
-        print(f"   {path.name}")
         conn = sqlite3.connect(str(path))
+        fill_count = 0
         try:
             for table, target in (
                 ("theo_state",   theo_l),
@@ -150,12 +150,16 @@ def load_all_data(series_prefix: str, cutoff: str,
                 ("order_events", evt_l),
             ):
                 try:
-                    target.append(
-                        pd.read_sql(f"SELECT * FROM {table} ORDER BY ts", conn))
+                    df = pd.read_sql(
+                        f"SELECT * FROM {table} ORDER BY ts", conn)
+                    target.append(df)
+                    if table == "fills":
+                        fill_count = len(df)
                 except Exception as e:
                     print(f"     [warn] skipping {table}: {e}")
         finally:
             conn.close()
+        print(f"   {path.name} ({fill_count})")
 
     def _concat(parts):
         return (pd.concat(parts, ignore_index=True)
@@ -403,6 +407,118 @@ def implied_sigma(market_price, spot, strike, seconds_to_expiry, r: float = 0.0)
         return pd.Series(out, index=market_price.index)
     return out
 
+def plot_markout_heatmaps(result: pd.DataFrame, markout_secs: list[int] | None = None):
+    """Markouts-by-minutes-til-expiration heatmap, with the overall
+    per-horizon means printed alongside.
+
+    Args:
+        result: output of calculate_markouts(); must also have a
+            `minutes_til_expiration` column.
+        markout_secs: which horizons to include.  Defaults to every
+            `markout_Xs` column found on `result`.
+    """
+    import matplotlib.pyplot as plt
+    import re
+
+    if markout_secs is None:
+        pat = re.compile(r"^markout_(\d+)s$")
+        markout_secs = sorted(int(m.group(1))
+                              for c in result.columns
+                              for m in [pat.match(c)] if m)
+    markout_cols = [f"markout_{t}s" for t in markout_secs]
+
+    # Aggregate by minutes-til-expiration; also compute overall means.
+    g = result.groupby("minutes_til_expiration")
+    table = g[markout_cols].mean().sort_index()
+    n = g.size().reindex(table.index)
+    overall = result[markout_cols].mean()
+
+    fig, (ax_text, ax_heat) = plt.subplots(
+        1, 2, figsize=(13, 8), gridspec_kw={"width_ratios": [1, 3]})
+
+    # Left panel — sample meta + overall means as plain text
+    ax_text.axis("off")
+    n_total = len(result)
+    ts_min = result["ts"].min()
+    ts_max = result["ts"].max()
+    lines = [
+        "Sample",
+        f"  fills : {n_total:,}",
+        f"  from  : {ts_min:%Y-%m-%d %H:%M} UTC",
+        f"  to    : {ts_max:%Y-%m-%d %H:%M} UTC",
+        "",
+        "Overall markout means",
+    ]
+    for t in markout_secs:
+        col = f"markout_{t}s"
+        v = overall[col]
+        n_used = int(result[col].notna().sum())
+        lines.append(f"  {t:>4}s : {v:+.4f}  (n={n_used:,})")
+    ax_text.text(0.0, 1.0, "\n".join(lines),
+                 family="monospace", fontsize=11,
+                 va="top", ha="left")
+
+    # Right panel — heatmap
+    vmax = max(table.abs().max().max(), 1.0)
+    vmin = -vmax
+    im = ax_heat.imshow(table.values, aspect="auto", cmap="RdYlGn",
+                        vmin=vmin, vmax=vmax)
+    ax_heat.set_xticks(range(len(markout_cols)))
+    ax_heat.set_xticklabels(markout_cols, rotation=45, ha="right")
+    ax_heat.set_yticks(range(len(table)))
+    ax_heat.set_yticklabels(
+        [f"{idx}  (n={n.loc[idx]})" for idx in table.index])
+    ax_heat.set_ylabel("Minutes til expiration")
+    ax_heat.set_title("Markout by Minutes til Expiration")
+    for i in range(table.shape[0]):
+        for j in range(table.shape[1]):
+            v = table.values[i, j]
+            if pd.notna(v):
+                ax_heat.text(j, i, f"{v:+.2f}",
+                             ha="center", va="center",
+                             fontsize=8, color="black")
+    plt.colorbar(im, ax=ax_heat, label="cents")
+
+    plt.tight_layout()
+    plt.show()
+
+import numpy as np
+from scipy.special import erf
+
+def theo_vec(spot, strike, sigma, secs, r=0.0):
+    SPY = 365.25 * 24 * 3600
+    T = np.asarray(secs) / SPY
+    d2 = (np.log(spot/strike) + (r - 0.5*sigma*sigma)*T) / (sigma*np.sqrt(T))
+    return 0.5 * (1 + erf(d2 / np.sqrt(2)))
+
+
+def theo_vec_twap(spot, strike, sigma, secs, twap_window_s=60, r=0.0):
+    """Vectorized N(d2) with TWAP-aware effective T.
+
+    Kalshi crypto 15m contracts settle on the TWAP over the final
+    `twap_window_s` (default 60s).  The variance of that average is
+    smaller than the variance of a point-at-close, so the effective T
+    for pricing is:
+
+        T >= δ:  T_eff = T - 2δ/3
+        T <  δ:  T_eff = T³ / (3δ²)
+
+    Both branches are continuous at T = δ.  Plugs T_eff into the
+    standard N(d2) formula.  Set twap_window_s=0 to recover the
+    raw (non-TWAP) theo (same as theo_vec).
+    """
+    SPY = 365.25 * 24 * 3600
+    secs = np.asarray(secs, dtype=float)
+    eff = np.where(
+        secs >= twap_window_s,
+        secs - 2 * twap_window_s / 3,
+        secs ** 3 / (3 * twap_window_s ** 2),
+    )
+    T = eff / SPY
+    d2 = (np.log(spot / strike) + (r - 0.5 * sigma * sigma) * T) / (sigma * np.sqrt(T))
+    return 0.5 * (1 + erf(d2 / np.sqrt(2)))
+
+
 #used to compute markouts when passed in fills and book
 def calculate_markouts(fills : pd.DataFrame, book: pd.DataFrame, markouts: list[int]):
     result = fills
@@ -418,13 +534,27 @@ def calculate_markouts(fills : pd.DataFrame, book: pd.DataFrame, markouts: list[
             direction='backward',
             suffixes=('_f', '_' + new_field)
         )
+
+        # Compute mid markout AND mask rows where the markout horizon
+        # exceeds remaining time to expiry — without the mask, late-
+        # window fills get scored against a stale pre-expiry book
+        # because merge_asof(backward) just returns the last available
+        # row for that ticker.  Nested np.where: outer applies the
+        # expiry filter, inner picks BUY vs SELL formula.
         result['yes_mid'] = (result['yes_bid'] + result['yes_ask']) / 2
-        result[new_field] = np.where(result['action'] == 'buy',
-            (result['yes_mid']- result['price'])* 100,
-            (result['price'] - result['yes_mid']) * 100)
+        result[new_field] = np.where(
+            result['seconds_to_expiry'] >= t,
+            np.where(result['action'] == 'buy',
+                     (result['yes_mid'] - result['price']) * 100,
+                     (result['price'] - result['yes_mid']) * 100),
+            np.nan,
+        )
+    
         
         result['ts'] = result['ts_f']
-        result = result.drop(columns=['yes_bid', 'yes_ask', 'yes_mid', 'ts_f', 'id', 'ask_size', 'bid_size'])
+        drop_cols = ['yes_bid', 'yes_ask', 'yes_mid', 'ts_f', 'id', 'ask_size', 'bid_size',
+             f'ts_{new_field}', f'{new_field}_ts']
+        result = result.drop(columns=drop_cols)
         
     return result
 
