@@ -7,3 +7,7 @@ __pycache__/
 backtesting/marketdata/
 marketdata/
 analysis/backtesting/data/
+*.log
+.claude/
+Aston/.claude/
+analysis/backtesting/_s3_cache/

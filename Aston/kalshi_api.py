@@ -27,6 +27,11 @@ class KalshiAPI:
             self.private_key = serialization.load_pem_private_key(f.read(), password=None)
         self.on_rate_limit = None  # callback(remaining, limit, reset_ts)
         self.rate_limited_until = 0  # timestamp when rate limit expires
+        # Persistent Session — reuses TCP + TLS across calls.  Saves
+        # ~22ms per request vs a fresh requests.get/post/delete (which
+        # opens a new TCP+TLS connection each time).  At 2-4 REST calls
+        # per reprice cycle, that's 40-100ms saved per cycle.
+        self.session = requests.Session()
         # Worker pool for non-blocking order writes (cancel/place).
         # Sized for concurrent reprices across strikes — one round-trip per
         # call, mostly idle on network IO so threads are cheap.
@@ -36,6 +41,9 @@ class KalshiAPI:
         # Rolling log of write-token consumption — used to compute
         # tokens/sec for display.  Each entry: (monotonic_ts, tokens).
         self._write_log: deque = deque()
+        # Rolling RTT log (per-call wall time in ms) for latency analysis.
+        # Each entry: (monotonic_ts, method, path, rtt_ms).
+        self._rtt_log: deque = deque(maxlen=10000)
 
     def shutdown(self):
         """Wait for in-flight async writes to complete, then stop the pool."""
@@ -127,11 +135,34 @@ class KalshiAPI:
                 self.on_rate_limit(0, int(limit or 0), int(reset or 0), endpoint=endpoint)
             print(f"[API] RATE LIMITED on {endpoint} — backing off 10s")
 
+    def _log_rtt(self, method: str, path: str, t0: float):
+        """Record wall-time RTT for one REST call.
+
+        Every 100 calls, also print a summary of the most recent 100 to
+        stdout — visible in the tee'd aston.log.  Useful for confirming
+        Session reuse is keeping the connection warm (p50 should be
+        6–12ms; ~50ms would mean the Session isn't reusing connections).
+        """
+        rtt_ms = (time.perf_counter() - t0) * 1000.0
+        self._rtt_log.append((time.monotonic(), method, path, rtt_ms))
+        if len(self._rtt_log) % 100 == 0:
+            recent = [r[3] for r in list(self._rtt_log)[-100:]]
+            recent.sort()
+            n = len(recent)
+            p50  = recent[n // 2]
+            p95  = recent[int(n * 0.95) - 1]
+            mx   = recent[-1]
+            print(f"[API RTT] last {n} calls: "
+                  f"p50={p50:.1f}ms  p95={p95:.1f}ms  max={mx:.1f}ms  "
+                  f"(total {len(self._rtt_log)})")
+
     def _get(self, path: str, params: dict = None) -> dict:
         """GET request. path is relative e.g. /portfolio/balance."""
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("GET", full_path)
-        resp = requests.get(f"{self.BASE_URL}{path}", headers=headers, params=params, timeout=10)
+        t0 = time.perf_counter()
+        resp = self.session.get(f"{self.BASE_URL}{path}", headers=headers, params=params, timeout=10)
+        self._log_rtt("GET", path, t0)
         self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
@@ -140,7 +171,9 @@ class KalshiAPI:
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("POST", full_path)
         print(f"[API POST] {path} body={body}")
-        resp = requests.post(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        t0 = time.perf_counter()
+        resp = self.session.post(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        self._log_rtt("POST", path, t0)
         self._check_rate_limit(resp)
         if resp.status_code != 201:
             print(f"[API ERROR] {resp.status_code}: {resp.text}")
@@ -158,7 +191,9 @@ class KalshiAPI:
         """DELETE request with full-path signing."""
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("DELETE", full_path)
-        resp = requests.delete(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        t0 = time.perf_counter()
+        resp = self.session.delete(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        self._log_rtt("DELETE", path, t0)
         self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()

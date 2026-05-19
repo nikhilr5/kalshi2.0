@@ -83,7 +83,10 @@ class StateRecorder:
         conn.execute("PRAGMA synchronous=NORMAL")
 
         # Existing fills table — schema kept identical to legacy
-        # 4Runner recorder + PositionManager.
+        # 4Runner recorder + PositionManager.  `kalshi_ts` (added
+        # 2026-05-18) is the exchange-side timestamp parsed from the
+        # WS msg's ts_ms field, ISO-8601 UTC.  Lets us isolate Kalshi
+        # processing latency from local recorder delay.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS fills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,9 +104,16 @@ class StateRecorder:
                 kalshi_yes_ask REAL,
                 client_order_id TEXT,
                 fee REAL DEFAULT 0,
-                is_taker INTEGER DEFAULT 0
+                is_taker INTEGER DEFAULT 0,
+                kalshi_ts TEXT
             )
         """)
+        # Backfill the column on pre-existing per-day files that
+        # were created before kalshi_ts was added to the schema.
+        try:
+            conn.execute("ALTER TABLE fills ADD COLUMN kalshi_ts TEXT")
+        except sqlite3.OperationalError:
+            pass  # already exists
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_ticker ON fills(ticker)")
 
@@ -120,9 +130,14 @@ class StateRecorder:
                 count REAL,
                 remaining_count REAL,
                 status TEXT,
-                client_order_id TEXT
+                client_order_id TEXT,
+                kalshi_ts TEXT
             )
         """)
+        try:
+            conn.execute("ALTER TABLE order_events ADD COLUMN kalshi_ts TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_oe_ts ON order_events(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_oe_oid ON order_events(order_id)")
 
@@ -196,7 +211,8 @@ class StateRecorder:
     def write_fill(self, series_ticker: str, ticker: str, action: str,
                    side: str, count: float, price: float, strike: float,
                    spot: float, kalshi_bid: float, kalshi_ask: float,
-                   client_order_id: str = "init", is_taker: int = 0):
+                   client_order_id: str = "init", is_taker: int = 0,
+                   kalshi_ts: str | None = None):
         now = datetime.now(tz=timezone.utc).isoformat()
         with self._lock:
             conn = self._conn_now(series_ticker)
@@ -204,28 +220,31 @@ class StateRecorder:
                 INSERT INTO fills (
                     ts, ticker, event_ticker, action, side, count, price, strike,
                     spot_bid, spot_ask, kalshi_yes_bid, kalshi_yes_ask,
-                    client_order_id, fee, is_taker
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    client_order_id, fee, is_taker, kalshi_ts
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (now, ticker, ticker, action, side, count, price, strike,
                   spot, spot, kalshi_bid, kalshi_ask,
-                  client_order_id, 0.0, is_taker))
+                  client_order_id, 0.0, is_taker, kalshi_ts))
             conn.commit()
 
     def write_order_event(self, series_ticker: str, order_id: str,
                           ticker: str, event_type: str, side: str,
                           action: str, price: float, count: float,
                           remaining_count: float, status: str,
-                          client_order_id: str):
+                          client_order_id: str,
+                          kalshi_ts: str | None = None):
         now = datetime.now(tz=timezone.utc).isoformat()
         with self._lock:
             conn = self._conn_now(series_ticker)
             conn.execute("""
                 INSERT INTO order_events (
                     ts, order_id, ticker, event_type, side, action,
-                    price, count, remaining_count, status, client_order_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    price, count, remaining_count, status, client_order_id,
+                    kalshi_ts
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """, (now, order_id, ticker, event_type, side, action,
-                  price, count, remaining_count, status, client_order_id))
+                  price, count, remaining_count, status, client_order_id,
+                  kalshi_ts))
             conn.commit()
 
     def write_spot_tick(self, series_ticker: str, product: str,
@@ -689,6 +708,22 @@ class StandaloneRecorder:
                                    msg.get("remaining_count", 0)) or 0)
         client_order_id = msg.get("client_order_id", "")
 
+        # Kalshi server-side timestamp.  Prefer ts_ms (millisecond
+        # precision) and fall back to ts (seconds).  Convert to ISO-
+        # 8601 UTC so it sorts/joins cleanly against our local `ts`.
+        kalshi_ts: str | None = None
+        ts_ms = msg.get("ts_ms")
+        ts_s = msg.get("ts")
+        try:
+            if ts_ms is not None:
+                kalshi_ts = datetime.fromtimestamp(
+                    float(ts_ms) / 1000.0, tz=timezone.utc).isoformat()
+            elif ts_s is not None:
+                kalshi_ts = datetime.fromtimestamp(
+                    float(ts_s), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            kalshi_ts = None
+
         # ---- Fills first (deltas of fill_count) ----
         new_fill = float(msg.get("fill_count_fp",
                                   msg.get("fill_count", 0)) or 0)
@@ -706,7 +741,8 @@ class StandaloneRecorder:
                     side=side, count=delta, price=price,
                     strike=self.strike, spot=self.spot,
                     kalshi_bid=self.yes_bid, kalshi_ask=self.yes_ask,
-                    client_order_id=client_order_id, is_taker=is_taker)
+                    client_order_id=client_order_id, is_taker=is_taker,
+                    kalshi_ts=kalshi_ts)
                 print(f"[Recorder] FILL {ticker} {action.upper()} "
                       f"x{delta:g} @ {price*100:.1f}¢")
             except Exception as e:
@@ -738,7 +774,8 @@ class StandaloneRecorder:
                     series_ticker=series, order_id=order_id, ticker=ticker,
                     event_type=event_type, side=side, action=action,
                     price=price, count=count, remaining_count=remaining,
-                    status=status, client_order_id=client_order_id)
+                    status=status, client_order_id=client_order_id,
+                    kalshi_ts=kalshi_ts)
                 print(f"[Recorder] {event_type.upper()} {ticker} "
                       f"{action.upper()} @ {price*100:.1f}¢ "
                       f"({order_id[:12]})")

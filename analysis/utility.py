@@ -316,6 +316,22 @@ def compute_settlements(theo: pd.DataFrame, spot: pd.DataFrame,
     return out
 
 
+def bootstrap_ci(values, B: int = 10000, alpha: float = 0.05,
+                  seed: int = 0) -> tuple[float, float]:
+    """Percentile bootstrap CI for the mean.  Returns (lo, hi) at the
+    (1 − alpha) confidence level, or (nan, nan) if fewer than 2 finite
+    samples.  Deterministic given `seed`."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) < 2:
+        return (float('nan'), float('nan'))
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(v), size=(B, len(v)))
+    means = v[idx].mean(axis=1)
+    lo, hi = np.quantile(means, [alpha / 2, 1 - alpha / 2])
+    return float(lo), float(hi)
+
+
 def brier_score(predictions: pd.Series, outcomes: pd.Series) -> float | None:
     """Brier = mean((pred − outcome)²).  Returns None if no valid pairs.
 
