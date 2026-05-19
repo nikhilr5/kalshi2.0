@@ -11,3 +11,4 @@ analysis/backtesting/data/
 .claude/
 Aston/.claude/
 analysis/backtesting/_s3_cache/
+analysis/Aston/.settlements_cache.json

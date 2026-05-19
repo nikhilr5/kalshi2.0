@@ -8,7 +8,7 @@ This is required for authenticated endpoints (orders, portfolio).
 import time
 import base64
 import uuid
-import requests
+import httpx
 from collections import deque
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -28,10 +28,16 @@ class KalshiAPI:
         self.on_rate_limit = None  # callback(remaining, limit, reset_ts)
         self.rate_limited_until = 0  # timestamp when rate limit expires
         # Persistent Session — reuses TCP + TLS across calls.  Saves
-        # ~22ms per request vs a fresh requests.get/post/delete (which
-        # opens a new TCP+TLS connection each time).  At 2-4 REST calls
-        # per reprice cycle, that's 40-100ms saved per cycle.
-        self.session = requests.Session()
+        # ~22ms per request vs a fresh client (which opens a new TCP+TLS
+        # connection each time).  At 2-4 REST calls per reprice cycle,
+        # that's 40-100ms saved per cycle.  httpx.Client with http2=True
+        # also multiplexes concurrent requests over a single connection,
+        # cutting head-of-line blocking vs HTTP/1.1.
+        self.session = httpx.Client(http2=True, timeout=10.0)
+        # One-shot flag — prints negotiated HTTP version on the first
+        # response so we can confirm HTTP/2 is actually in use rather
+        # than silently falling back to HTTP/1.1.
+        self._http_version_logged = False
         # Worker pool for non-blocking order writes (cancel/place).
         # Sized for concurrent reprices across strikes — one round-trip per
         # call, mostly idle on network IO so threads are cheap.
@@ -48,6 +54,10 @@ class KalshiAPI:
     def shutdown(self):
         """Wait for in-flight async writes to complete, then stop the pool."""
         self._executor.shutdown(wait=True)
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     # --- Write throughput tracking ---
 
@@ -130,10 +140,20 @@ class KalshiAPI:
         if resp.status_code == 429:
             # Back off for 10 seconds on rate limit
             self.rate_limited_until = time.time() + 10
-            endpoint = f"{resp.request.method} {resp.request.path_url}"
+            # httpx Request has no path_url; raw_path includes query string,
+            # which is what requests' path_url returned.
+            endpoint = f"{resp.request.method} {resp.request.url.raw_path.decode('ascii', 'replace')}"
             if self.on_rate_limit:
                 self.on_rate_limit(0, int(limit or 0), int(reset or 0), endpoint=endpoint)
             print(f"[API] RATE LIMITED on {endpoint} — backing off 10s")
+
+    def _log_http_version(self, resp):
+        """One-shot print of the negotiated HTTP version.  Smoke test
+        that http2=True is actually being honored end-to-end (Kalshi's
+        edge could ALPN-downgrade to HTTP/1.1)."""
+        if not self._http_version_logged:
+            self._http_version_logged = True
+            print(f"[API] negotiated {resp.http_version}")
 
     def _log_rtt(self, method: str, path: str, t0: float):
         """Record wall-time RTT for one REST call.
@@ -161,8 +181,9 @@ class KalshiAPI:
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("GET", full_path)
         t0 = time.perf_counter()
-        resp = self.session.get(f"{self.BASE_URL}{path}", headers=headers, params=params, timeout=10)
+        resp = self.session.get(f"{self.BASE_URL}{path}", headers=headers, params=params)
         self._log_rtt("GET", path, t0)
+        self._log_http_version(resp)
         self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
@@ -172,8 +193,9 @@ class KalshiAPI:
         headers = self._headers("POST", full_path)
         print(f"[API POST] {path} body={body}")
         t0 = time.perf_counter()
-        resp = self.session.post(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        resp = self.session.post(f"{self.BASE_URL}{path}", headers=headers, json=body)
         self._log_rtt("POST", path, t0)
+        self._log_http_version(resp)
         self._check_rate_limit(resp)
         if resp.status_code != 201:
             print(f"[API ERROR] {resp.status_code}: {resp.text}")
@@ -181,8 +203,9 @@ class KalshiAPI:
             # cause is visible in logs without inspecting `resp.text`
             # separately.  Default raise_for_status() drops the body
             # and leaves only the status line.
-            raise requests.HTTPError(
-                f"{resp.status_code} {resp.reason} for {full_path}: {resp.text}",
+            raise httpx.HTTPStatusError(
+                f"{resp.status_code} {resp.reason_phrase} for {full_path}: {resp.text}",
+                request=resp.request,
                 response=resp,
             )
         return resp.json()
@@ -192,8 +215,13 @@ class KalshiAPI:
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("DELETE", full_path)
         t0 = time.perf_counter()
-        resp = self.session.delete(f"{self.BASE_URL}{path}", headers=headers, json=body, timeout=10)
+        # httpx.Client.delete() does not accept json=; use request() to
+        # send a body on DELETE (Kalshi's batch-cancel endpoint needs it).
+        resp = self.session.request(
+            "DELETE", f"{self.BASE_URL}{path}", headers=headers, json=body,
+        )
         self._log_rtt("DELETE", path, t0)
+        self._log_http_version(resp)
         self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
