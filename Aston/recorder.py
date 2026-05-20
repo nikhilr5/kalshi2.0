@@ -416,9 +416,9 @@ class StandaloneRecorder:
         # latch so we never re-emit cancelled/filled twice.
         self._seen_placed: set[str] = set()
         self._terminated: set[str] = set()
-        # Per-order incremental fill tracking (already in legacy recorder).
-        self._order_fill_count: dict[str, float] = {}
-        self._order_taker_cost: dict[str, float] = {}
+        # Dedup for the fill-channel handler — `trade_id`s already
+        # written, so reconnect-replays don't double-insert.
+        self._seen_trades: set[str] = set()
 
         # seconds_to_close lives in market_discovery — pull lazily.
         from market_discovery import seconds_to_close
@@ -631,7 +631,9 @@ class StandaloneRecorder:
                 self.book_ws.stop()
             except Exception:
                 pass
-        self.book_ws = self._KalshiWsFeed(self.api, on_update=self._on_book)
+        self.book_ws = self._KalshiWsFeed(
+            self.api, on_update=self._on_book,
+            on_fill_raw=self._on_fill)
         self.book_ws.start([new_ticker])
         print(f"[Recorder] tracking {new_ticker}  strike={self.strike}")
 
@@ -708,45 +710,28 @@ class StandaloneRecorder:
                                    msg.get("remaining_count", 0)) or 0)
         client_order_id = msg.get("client_order_id", "")
 
-        # Kalshi server-side timestamp.  Prefer ts_ms (millisecond
-        # precision) and fall back to ts (seconds).  Convert to ISO-
-        # 8601 UTC so it sorts/joins cleanly against our local `ts`.
+        # Kalshi server-side timestamp.  The `user_orders` channel
+        # uses `last_updated_ts_ms` (state-transition time) and
+        # `created_ts_ms` — not the `ts_ms` / `ts` keys that the
+        # `fill` and `orderbook_delta` channels use.  Prefer
+        # last-updated since it tracks state transitions.
         kalshi_ts: str | None = None
-        ts_ms = msg.get("ts_ms")
-        ts_s = msg.get("ts")
+        ts_ms = msg.get("last_updated_ts_ms")
+        if ts_ms is None:
+            ts_ms = msg.get("created_ts_ms")
         try:
             if ts_ms is not None:
                 kalshi_ts = datetime.fromtimestamp(
                     float(ts_ms) / 1000.0, tz=timezone.utc).isoformat()
-            elif ts_s is not None:
-                kalshi_ts = datetime.fromtimestamp(
-                    float(ts_s), tz=timezone.utc).isoformat()
         except (TypeError, ValueError, OSError):
             kalshi_ts = None
 
-        # ---- Fills first (deltas of fill_count) ----
+        # Fills are written by `_on_fill` (fill-channel handler) with
+        # the authoritative `ts_ms`.  We still need the running fill
+        # count from the user_orders msg here to detect the 'filled'
+        # terminal state of the order itself.
         new_fill = float(msg.get("fill_count_fp",
                                   msg.get("fill_count", 0)) or 0)
-        prev_fill = self._order_fill_count.get(order_id, 0.0)
-        delta = new_fill - prev_fill
-        if delta > 0:
-            new_taker = float(msg.get("taker_fill_cost_dollars", 0) or 0)
-            prev_taker = self._order_taker_cost.get(order_id, 0.0)
-            is_taker = 1 if (new_taker - prev_taker) > 1e-9 else 0
-            self._order_fill_count[order_id] = new_fill
-            self._order_taker_cost[order_id] = new_taker
-            try:
-                self.state.write_fill(
-                    series_ticker=series, ticker=ticker, action=action,
-                    side=side, count=delta, price=price,
-                    strike=self.strike, spot=self.spot,
-                    kalshi_bid=self.yes_bid, kalshi_ask=self.yes_ask,
-                    client_order_id=client_order_id, is_taker=is_taker,
-                    kalshi_ts=kalshi_ts)
-                print(f"[Recorder] FILL {ticker} {action.upper()} "
-                      f"x{delta:g} @ {price*100:.1f}¢")
-            except Exception as e:
-                print(f"[Recorder] fill write failed for {ticker}: {e}")
 
         # ---- Terminal order-event detection ----
         # placed: first time we see this order in 'resting' state
@@ -781,6 +766,64 @@ class StandaloneRecorder:
                       f"({order_id[:12]})")
             except Exception as e:
                 print(f"[Recorder] order_event write failed: {e}")
+
+    def _on_fill(self, msg: dict):
+        """Fill-channel handler.  Writes a fills row with the
+        authoritative match `ts_ms` from Kalshi.
+
+        Dormant until `app.py` wires the `fill` WS subscription
+        through to this method.  Until then, fills continue to be
+        recorded indirectly via `_on_order_event` (user_orders deltas);
+        once wired, that legacy block should be removed to avoid
+        duplicate writes.  De-duped by `trade_id`.
+        """
+        trade_id = msg.get("trade_id") or ""
+        ticker = msg.get("market_ticker") or msg.get("ticker") or ""
+        if not ticker:
+            return
+        series = _series_from_ticker(ticker)
+        if series != self.series:
+            return
+        if trade_id and trade_id in self._seen_trades:
+            return
+        if trade_id:
+            self._seen_trades.add(trade_id)
+
+        action = msg.get("action") or "buy"
+        side = msg.get("side") or "yes"
+        try:
+            price = float(msg.get("yes_price_dollars", 0) or 0)
+            count = float(msg.get("count_fp", msg.get("count", 0)) or 0)
+        except (TypeError, ValueError):
+            return
+        is_taker = 1 if msg.get("is_taker") else 0
+        client_order_id = msg.get("client_order_id", "")
+
+        kalshi_ts: str | None = None
+        ts_ms = msg.get("ts_ms")
+        ts_s = msg.get("ts")
+        try:
+            if ts_ms is not None:
+                kalshi_ts = datetime.fromtimestamp(
+                    float(ts_ms) / 1000.0, tz=timezone.utc).isoformat()
+            elif ts_s is not None:
+                kalshi_ts = datetime.fromtimestamp(
+                    float(ts_s), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            kalshi_ts = None
+
+        try:
+            self.state.write_fill(
+                series_ticker=series, ticker=ticker, action=action,
+                side=side, count=count, price=price,
+                strike=self.strike, spot=self.spot,
+                kalshi_bid=self.yes_bid, kalshi_ask=self.yes_ask,
+                client_order_id=client_order_id, is_taker=is_taker,
+                kalshi_ts=kalshi_ts)
+            print(f"[Recorder] FILL(ch) {ticker} {action.upper()} "
+                  f"x{count:g} @ {price*100:.1f}¢")
+        except Exception as e:
+            print(f"[Recorder] fill-channel write failed for {ticker}: {e}")
 
 
 # =============================================================================

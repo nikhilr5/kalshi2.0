@@ -32,6 +32,7 @@ class KalshiWsFeed:
 
     def __init__(self, api: KalshiAPI, on_update: Callable,
                  on_fill: Callable | None = None,
+                 on_fill_raw: Callable | None = None,
                  on_trade: Callable | None = None,
                  on_order_event: Callable | None = None,
                  on_book_change: Callable | None = None,
@@ -43,6 +44,11 @@ class KalshiWsFeed:
                        fired on every TOB change (computed from raw deltas)
             on_fill: optional callback(ticker, action, side, price, count)
                      fired on every fill for this account
+            on_fill_raw: optional callback(msg_dict) — same fills as
+                         `on_fill` but passes the raw message so the
+                         caller can pull `ts_ms`, `trade_id`, etc.  Used
+                         by the recorder for authoritative match-time
+                         timestamps.
             on_trade: optional callback(msg_dict) — public trade tape
             on_order_event: optional callback(msg_dict) — every state change of
                             this account's orders (placed/resting/canceled/executed)
@@ -54,6 +60,7 @@ class KalshiWsFeed:
         self.api = api
         self.on_update = on_update
         self.on_fill = on_fill
+        self.on_fill_raw = on_fill_raw
         self.on_trade = on_trade
         self.on_order_event = on_order_event
         self.on_book_change = on_book_change
@@ -178,7 +185,7 @@ class KalshiWsFeed:
         # appearing in some docs — it has its own URL
         # (USER_ORDERS_WS_URL) handled by a separate connection below.
         channels = ["orderbook_delta"]
-        if self.on_fill:
+        if self.on_fill or self.on_fill_raw:
             channels.append("fill")
         if self.on_trade:
             channels.append("trade")
@@ -252,7 +259,7 @@ class KalshiWsFeed:
             self._process_snapshot(data["msg"])
         elif msg_type == "orderbook_delta":
             self._process_delta(data["msg"])
-        elif msg_type == "fill" and self.on_fill:
+        elif msg_type == "fill" and (self.on_fill or self.on_fill_raw):
             self._process_fill(data["msg"])
         elif msg_type == "trade" and self.on_trade:
             try:
@@ -387,10 +394,16 @@ class KalshiWsFeed:
                 break
 
         print(f"[WS Fill] {ticker} {action} {side} x{count} @ ${price:.2f}")
-        try:
-            self.on_fill(ticker, action, side, price, count)
-        except Exception:
-            pass
+        if self.on_fill:
+            try:
+                self.on_fill(ticker, action, side, price, count)
+            except Exception:
+                pass
+        if self.on_fill_raw:
+            try:
+                self.on_fill_raw(msg)
+            except Exception as e:
+                print(f"[WS] on_fill_raw error: {e}")
 
 
 # =============================================================================

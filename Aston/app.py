@@ -903,6 +903,12 @@ class AstonApp(QMainWindow):
         new_ticker = market.get("ticker", "")
         if self.market and self.market.get("ticker") == new_ticker:
             self.market = market
+            # Backfill strike if a prior partial response left it at 0.
+            # Without this, the only way to recover a missing strike was
+            # to flip series and force a full teardown — observed in the
+            # field on certain mid-roll API responses.
+            if not self.strike or self.strike <= 0:
+                self.strike = parse_strike(market)
             return
         # Different market — tear down old, wire up new.
         self._teardown_current_market()

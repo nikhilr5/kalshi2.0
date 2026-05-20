@@ -45,16 +45,28 @@ Current Aston settings:
   - R² in-sample = 0.474, OOS = 0.566
 - Theo: pure N(d2), no TWAP adjustment, no drift correction.
 
-## Baseline results (one day, ~800 minute samples, 61 markets)
+## Baseline results (5 days, 451 settled markets, 2,217 snapshots)
+
+Bucketed snapshots at T-14m/-10m/-5m/-2m/-30s per market; HAR and Mid
+scored on identical rows; ticker-clustered bootstrap. Source:
+`analysis/Aston/AgentGenerated/brier_root_cause.py`.
 
 - Vol-forecast accuracy: HAR corr 0.62, MAE 10%, RMSE 13% vs
   market-implied corr 0.30, MAE 18%, RMSE 28%. HAR clearly better at
   forecasting realized σ.
-- Brier vs Kalshi settlement: HAR 0.188, Market 0.184. Market slightly
-  better, but well within sampling noise on n=61. Re-evaluate at 1,500+
-  markets.
-- Forecast accuracy doesn't fully translate to binary-outcome accuracy
-  yet — keep humble.
+- σ-bias: HAR mean σ 33.5% vs realized 32.5% (+1.0% — small over).
+  Market implied 37.9% (+5.4% — meaningfully cautious).
+- Brier vs Kalshi settlement (overall): HAR 0.125, Market 0.142.
+  Gap −0.017, 95% CI [−0.022, −0.012]. HAR beats Mid significantly.
+- Brier gap by offset: T-30s −0.062 (huge), T-2m −0.012,
+  T-5m/-10m/-14m all ≈ −0.003 to −0.004. **Most of the edge lives in
+  the last 30s** — HAR's late-market conviction vs cautious mid.
+- Brier by moneyness: excluding deep-OTM resolved markets (|z|>2.0),
+  gap is essentially zero (mean −0.0004, CI [−0.005, +0.005]). The
+  overall edge is concentrated in deep-OTM markets where HAR correctly
+  forecasts ~0 and mid stays at 0.069. In the ATM/near-ATM regime
+  where you actually quote, HAR and Mid are tied.
+- TWAP-aware theo: no measurable improvement over plain N(d2).
 
 ## Data layout
 
