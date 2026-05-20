@@ -12,3 +12,4 @@ analysis/backtesting/data/
 Aston/.claude/
 analysis/backtesting/_s3_cache/
 analysis/Aston/.settlements_cache.json
+analysis/backtesting/_trades_cache/
