@@ -92,6 +92,9 @@ class KalshiAPI:
     def cancel_orders_batched_async(self, order_ids: list):
         return self._executor.submit(self.cancel_orders_batched, order_ids)
 
+    def get_orders_async(self, status: str = "resting"):
+        return self._executor.submit(self.get_orders, status)
+
     def _sign(self, timestamp_ms: int, method: str, path: str) -> str:
         """RSA-PSS signature of {timestamp}{method}{path}."""
         message = f"{timestamp_ms}{method}{path}"

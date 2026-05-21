@@ -32,6 +32,8 @@ from realized_vol import RealizedVolEstimator
 from har_rv import HARRVEstimator
 from theo_engine import compute_theo
 from strategy import Strategy
+from strategy2 import Strategy2
+from osm import OSM
 
 
 SETTINGS_PATH = Path(__file__).resolve().parent / "aston_settings.json"
@@ -221,9 +223,10 @@ class PositionSeedWorker(QThread):
 
 class AstonApp(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, strategy_version: int = 1):
         super().__init__()
-        self.setWindowTitle("Aston — 15-min MM")
+        self.strategy_version = strategy_version
+        self.setWindowTitle(f"Aston — 15-min MM (strategy v{strategy_version})")
         self.resize(720, 460)
 
         self.settings = _load_settings()
@@ -256,7 +259,10 @@ class AstonApp(QMainWindow):
         self.bid_size: int = 0
         self.ask_size: int = 0
         self.spot: float = 0.0
-        self.strategy: Strategy | None = None
+        self.strategy: Strategy | Strategy2 | None = None
+        # Only populated when strategy_version == 2.  OSM owns all
+        # Kalshi order I/O on behalf of Strategy2.
+        self.osm: OSM | None = None
         # Cached theo for display (recomputed on every spot tick)
         self._last_theo: float | None = None
         self._last_sigma: float | None = None
@@ -940,6 +946,7 @@ class AstonApp(QMainWindow):
         self.ws_feed = KalshiWsFeed(
             self.api, on_update=self._on_ws_update,
             on_fill=self._on_ws_fill,
+            on_fill_raw=self._osm_on_fill_raw,
         )
         self.ws_feed.start([self.ticker])
 
@@ -987,6 +994,9 @@ class AstonApp(QMainWindow):
             # Reflect the forced-off state in the toggle.
             self.toggle_btn.setChecked(False)
             self._apply_toggle_style(False)
+        if self.osm:
+            self.osm.stop()
+            self.osm = None
         if self.ws_feed:
             self.ws_feed.stop()
             self.ws_feed = None
@@ -1019,6 +1029,12 @@ class AstonApp(QMainWindow):
         self.bid_size = bid_size
         self.ask_size = ask_size
         self._recompute_and_trade()
+
+    def _osm_on_fill_raw(self, msg: dict):
+        """Raw fill-channel forward to OSM.  No-op if OSM isn't running
+        (legacy strategy_version=1)."""
+        if self.osm is not None:
+            self.osm.on_fill(msg)
 
     def _on_ws_fill(self, ticker: str, action: str, side: str,
                     price: float, count: int):
@@ -1101,11 +1117,15 @@ class AstonApp(QMainWindow):
         self._last_theo = theo
         self._last_sigma = sigma
         if self.strategy and theo is not None:
-            self.strategy.kalshi_bid = self.yes_bid
-            self.strategy.kalshi_ask = self.yes_ask
-            self.strategy.kalshi_bid_size = self.bid_size
-            self.strategy.kalshi_ask_size = self.ask_size
-            self.strategy.update_theo(theo)
+            if self.strategy_version == 2:
+                self.strategy.update_bbo((self.yes_bid, self.yes_ask))
+                self.strategy.update_theo(theo)
+            else:
+                self.strategy.kalshi_bid = self.yes_bid
+                self.strategy.kalshi_ask = self.yes_ask
+                self.strategy.kalshi_bid_size = self.bid_size
+                self.strategy.kalshi_ask_size = self.ask_size
+                self.strategy.update_theo(theo)
 
     # ------------------------------------------------------------------
     # Strategy start/stop
@@ -1122,18 +1142,41 @@ class AstonApp(QMainWindow):
                 self._apply_toggle_style(True)
                 return  # already running, just normalize visual state
             # Edges in the UI are in cents; strategy works in dollars.
-            self.strategy = Strategy(
-                ticker=self.ticker, strike=self.strike,
-                edge_bid=self.edge_bid_input.spin.value() / 100.0,
-                edge_ask=self.edge_ask_input.spin.value() / 100.0,
-                size_bid=self.size_bid_input.spin.value(),
-                size_ask=self.size_ask_input.spin.value(),
-                max_position=self.max_pos_input.spin.value(),
-                tolerance=self.tolerance_input.spin.value() / 100.0,
-                api=self.api,
-            )
-            self.strategy.position = self._position
-            self.strategy.start(bid=True, ask=True)
+            if self.strategy_version == 2:
+                # New path: OSM + Strategy2.  Construct OSM first; backfill
+                # its strategy_queue reference after Strategy2 exists.
+                self.osm = OSM(
+                    ticker=self.ticker,
+                    tolerance=self.tolerance_input.spin.value() / 100.0,
+                    api=self.api,
+                    strategy_queue=None,
+                )
+                self.strategy = Strategy2(
+                    ticker=self.ticker, strike=self.strike,
+                    edge_bid=self.edge_bid_input.spin.value() / 100.0,
+                    edge_ask=self.edge_ask_input.spin.value() / 100.0,
+                    size_bid=self.size_bid_input.spin.value(),
+                    size_ask=self.size_ask_input.spin.value(),
+                    max_position=self.max_pos_input.spin.value(),
+                    osm=self.osm,
+                )
+                self.osm.strategy_queue = self.strategy.queue
+                self.strategy.position = self._position
+                self.osm.start()
+                self.strategy.start()
+            else:
+                self.strategy = Strategy(
+                    ticker=self.ticker, strike=self.strike,
+                    edge_bid=self.edge_bid_input.spin.value() / 100.0,
+                    edge_ask=self.edge_ask_input.spin.value() / 100.0,
+                    size_bid=self.size_bid_input.spin.value(),
+                    size_ask=self.size_ask_input.spin.value(),
+                    max_position=self.max_pos_input.spin.value(),
+                    tolerance=self.tolerance_input.spin.value() / 100.0,
+                    api=self.api,
+                )
+                self.strategy.position = self._position
+                self.strategy.start(bid=True, ask=True)
             self._apply_toggle_style(True)
             self.status_label.setText(f"MM active on {self.ticker}")
             self._save_current_params()
@@ -1141,6 +1184,9 @@ class AstonApp(QMainWindow):
             if self.strategy:
                 self.strategy.stop()
                 self.strategy = None
+            if self.osm:
+                self.osm.stop()
+                self.osm = None
             self._apply_toggle_style(False)
             self.status_label.setText("MM stopped")
 
@@ -1168,6 +1214,9 @@ class AstonApp(QMainWindow):
         if self.strategy:
             self.strategy.stop()
             self.strategy = None
+        if self.osm:
+            self.osm.stop()
+            self.osm = None
         self.toggle_btn.setChecked(False)
         self._apply_toggle_style(False)
 
@@ -1444,10 +1493,25 @@ class AstonApp(QMainWindow):
             _set(1, "SELL", "#ef4444", None, 0)
             return
 
-        _set(0, "BUY",  "#22c55e",
-             strat.current_buy_price,  strat.resting_buy_count)
-        _set(1, "SELL", "#ef4444",
-             strat.current_sell_price, strat.resting_sell_count)
+        # Strategy2 keeps resting state in OSM; legacy Strategy keeps
+        # it on itself.  Branch on the presence of `osm` so both
+        # implementations render without needing isinstance checks.
+        osm = getattr(strat, "osm", None)
+        if osm is not None:
+            bid_q = osm.resting_bid
+            ask_q = osm.resting_ask
+            buy_price = bid_q.price if bid_q else None
+            buy_size = bid_q.size if bid_q else 0
+            sell_price = ask_q.price if ask_q else None
+            sell_size = ask_q.size if ask_q else 0
+        else:
+            buy_price = strat.current_buy_price
+            buy_size = strat.resting_buy_count
+            sell_price = strat.current_sell_price
+            sell_size = strat.resting_sell_count
+
+        _set(0, "BUY",  "#22c55e", buy_price,  buy_size)
+        _set(1, "SELL", "#ef4444", sell_price, sell_size)
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -1457,6 +1521,9 @@ class AstonApp(QMainWindow):
         if self.strategy:
             self.strategy.stop()
             self.strategy = None
+        if self.osm:
+            self.osm.stop()
+            self.osm = None
         if self.ws_feed:
             self.ws_feed.stop()
         if self.price_feed:
@@ -1469,8 +1536,14 @@ class AstonApp(QMainWindow):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-s", "--strategy", type=int, choices=[1, 2], default=1,
+                    help="1 = legacy Strategy, 2 = Strategy2 + OSM")
+    args, qt_argv = ap.parse_known_args()
+
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    app = QApplication(sys.argv)
+    app = QApplication(qt_argv)
     app.setApplicationName("Aston")
     # macOS Dock hover label is read from the bundle's CFBundleName, not
     # QApplication.setApplicationName — running a loose .py would otherwise
@@ -1511,7 +1584,7 @@ def main():
         except Exception:
             pass
 
-    window = AstonApp()
+    window = AstonApp(strategy_version=args.strategy)
     if icon_path.exists():
         window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
