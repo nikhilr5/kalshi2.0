@@ -1143,12 +1143,16 @@ class AstonApp(QMainWindow):
                 return  # already running, just normalize visual state
             # Edges in the UI are in cents; strategy works in dollars.
             if self.strategy_version == 2:
-                # New path: OSM + Strategy2.  Construct OSM first; backfill
-                # its strategy_queue reference after Strategy2 exists.
+                # New path: OSM + Strategy2.  Construct OSM first
+                # (with seeded position + max_position so the cap is
+                # correct from the first message), backfill strategy
+                # queue reference after Strategy2 exists.
                 self.osm = OSM(
                     ticker=self.ticker,
                     tolerance=self.tolerance_input.spin.value() / 100.0,
                     api=self.api,
+                    max_position=self.max_pos_input.spin.value(),
+                    position=self._position,
                     strategy_queue=None,
                 )
                 self.strategy = Strategy2(
@@ -1157,11 +1161,9 @@ class AstonApp(QMainWindow):
                     edge_ask=self.edge_ask_input.spin.value() / 100.0,
                     size_bid=self.size_bid_input.spin.value(),
                     size_ask=self.size_ask_input.spin.value(),
-                    max_position=self.max_pos_input.spin.value(),
                     osm=self.osm,
                 )
                 self.osm.strategy_queue = self.strategy.queue
-                self.strategy.position = self._position
                 self.osm.start()
                 self.strategy.start()
             else:

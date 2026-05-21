@@ -1,7 +1,9 @@
+import math
 import queue
 import threading
 import uuid
-from dataclasses import dataclass
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,15 +19,23 @@ class PendingOp:
     kind: str       # "place" | "cancel"
     side: str       # "bid" | "ask"
     price: float    # for "place"; not used for "cancel"
+    # The httpx Future from the api executor.  Retained so that
+    # `cancel_all_sync` can wait on any in-flight place at teardown
+    # and then cancel the resulting order_id — otherwise a place
+    # that lands AFTER the OSM worker exits leaves an orphan order
+    # on Kalshi.
+    future: Future | None = field(default=None, repr=False)
 
 
 class OSM:
 
-    def __init__(self, ticker, tolerance, api, strategy_queue=None):
+    def __init__(self, ticker, tolerance, api, max_position,
+                 position: int = 0, strategy_queue=None):
         self.ticker = ticker
         self.tolerance = tolerance
         self.api = api
-        self.queue = queue.Queue(maxsize=1024)
+        self.max_position = max_position
+        self.queue = queue.Queue()
         self.running = False
         # Strategy's queue — OSM forwards parsed fills here so Strategy
         # can update position without touching Kalshi WS schemas itself.
@@ -45,13 +55,19 @@ class OSM:
         self.pending_ops: dict[str, PendingOp] = {}
 
         # Net YES-equivalent position from fills OSM has observed.
-        # Source of truth for Strategy's max_position cap — OSM is the
-        # one process that already dedupes by trade_id, so position
-        # derived here can't double-count on WS reconnect.
-        self.position: int = 0
+        # Seeded from caller (e.g. REST position fetch on app restart) so
+        # the max_position cap is correct from the first message, not
+        # only after the first fill.  Dedupe by trade_id below ensures
+        # WS replays don't double-count on top of the seed.
+        self.position: int = int(position)
 
         # Dedupe — Kalshi can replay fills on WS reconnect.
         self._seen_trade_ids: set[str] = set()
+        # Set by cancel_all_sync().  When True, ENSURE_BID/ASK handlers
+        # become no-ops so a queued-but-not-yet-processed ENSURE_*
+        # (e.g. from Strategy2's last pre-stop tick) can't place a
+        # new order during teardown.
+        self._stopping: bool = False
         # Orphan fills — fill WS arrived before the matching place
         # response.  Keyed by order_id; drained in _handle_api_success
         # when the place lands.
@@ -67,6 +83,8 @@ class OSM:
 
     def stop(self):
         self.running = False
+        if hasattr(self, "_thread"):
+            self._thread.join(timeout=1.0)
 
     def run(self):
         while self.running:
@@ -79,6 +97,7 @@ class OSM:
                 elif header == "CANCEL_ASK":     self._handle_cancel_ask()
                 elif header == "CANCEL_ALL":     self._handle_cancel_all()
                 elif header == "UPDATE_TOLERANCE":  self._handle_update_tolerance(payload)
+                elif header == "UPDATE_MAX_POSITION": self._handle_update_max_position(payload)
                 # State updates from external sources
                 elif header == "FILL":           self._handle_fill(payload)
                 elif header == "API_RESPONSE":   self._handle_api_response(payload)
@@ -107,36 +126,67 @@ class OSM:
         self.queue.put(("CANCEL_ALL", None))
 
     def cancel_all_sync(self, timeout: float = 2.0):
-        """Synchronously cancel all currently-resting orders and block
-        until Kalshi responds (or `timeout` elapses).
+        """Synchronously drain in-flight places + cancel all resting
+        orders and block until Kalshi responds (or `timeout` elapses).
 
-        Bypasses the OSM command queue — instead of enqueueing
-        CANCEL_ALL and hoping the worker drains it before `stop()`
-        flips `running = False`, this submits cancel REST calls
-        directly to the shared API executor and waits for the futures.
+        Three-phase teardown:
+          1. **Set _stopping** so any new ENSURE_BID/ASK that arrives
+             during teardown (e.g. queued by Strategy2 just before its
+             worker exited) is ignored by the handlers.
+          2. **Wait for in-flight places to land** (with half the
+             timeout budget) and harvest their order_ids — these would
+             otherwise be orphan orders on Kalshi if the worker exits
+             before the place response is processed.
+          3. **Cancel all known + newly-landed order_ids** (with the
+             remaining budget) and clear local desired/resting state.
 
-        Use from `Strategy.stop()` (and any other teardown path that
-        needs cancels to definitively land) so resting orders aren't
-        left alive when we move to a new market or shut down.
-
-        Clears local resting/desired state at the end so subsequent
-        reconciles don't re-fire.
+        Caller (`Strategy2.stop()`) is expected to have already flipped
+        its own `running` flag and joined its worker thread, so no new
+        ENSURE_* messages will be enqueued during this teardown beyond
+        what was already in-flight at stop-time.
         """
         from concurrent.futures import wait
-        # Snapshot order_ids — OSM's worker can still mutate resting_*,
-        # so capture into locals before submitting.
-        ids = []
+        self._stopping = True
+
+        # --- Phase 1: snapshot in-flight place futures + resting ids ---
+        # Snapshot under no lock — worker thread can still mutate, but
+        # we'll be tolerant of partial state and let the timeout bound
+        # the wait.
+        place_futures = [
+            op.future for op in list(self.pending_ops.values())
+            if op.kind == "place" and op.future is not None
+        ]
+        ids_to_cancel = []
         if self.resting_bid is not None:
-            ids.append(self.resting_bid.order_id)
+            ids_to_cancel.append(self.resting_bid.order_id)
         if self.resting_ask is not None:
-            ids.append(self.resting_ask.order_id)
-        if not ids:
-            return
-        futures = [self.api.cancel_order_async(oid) for oid in ids]
-        wait(futures, timeout=timeout)
-        # Whatever the outcome (success / 404 / timeout) we treat the
-        # local state as cleared.  We're stopping; further reconciles
-        # off stale resting refs would only cause harm.
+            ids_to_cancel.append(self.resting_ask.order_id)
+
+        # --- Phase 2: wait for in-flight places, harvest order_ids ---
+        if place_futures:
+            place_budget = max(0.1, timeout / 2.0)
+            done, _ = wait(place_futures, timeout=place_budget)
+            for fut in done:
+                try:
+                    resp = fut.result()
+                    oid = (resp.get("order", {}) or {}).get("order_id")
+                    if oid:
+                        ids_to_cancel.append(oid)
+                except Exception:
+                    # Place errored — nothing to cancel for this one.
+                    pass
+
+        # --- Phase 3: cancel everything (resting + newly-landed) ---
+        if ids_to_cancel:
+            cancel_budget = max(0.1, timeout - (timeout / 2.0))
+            cancel_futures = [
+                self.api.cancel_order_async(oid) for oid in ids_to_cancel
+            ]
+            wait(cancel_futures, timeout=cancel_budget)
+
+        # Clear local state.  Whatever didn't land in time is a
+        # best-effort orphan — the next session's recorder + OSM
+        # probe-on-startup logic would surface it.
         self.resting_bid = None
         self.resting_ask = None
         self.desired_bid_price = None
@@ -144,6 +194,9 @@ class OSM:
     
     def update_tolerance(self, tolerance: float):
       self.queue.put(("UPDATE_TOLERANCE", tolerance))
+
+    def update_max_position(self, max_position: int):
+      self.queue.put(("UPDATE_MAX_POSITION", int(max_position)))
 
     # ------------------------------------------------------------------
     # Public read-only state (Strategy reads these)
@@ -172,16 +225,49 @@ class OSM:
     # Command handlers — update desired state, then reconcile
     # ------------------------------------------------------------------
     def _handle_ensure_bid(self, tup: tuple):
-        price, size = tup
+        # Strategy sends its desired size; OSM clamps to remaining
+        # capacity here, atomically against current position + resting
+        # state.  Single-threaded worker means no race vs fills.
+        if self._stopping:
+            # Teardown in progress — reject new placements.
+            return
+        price, requested_size = tup
+        sz = min(int(requested_size), self._remaining_bid_capacity())
+        if sz <= 0:
+            # No room left under max_position — drop any resting bid.
+            self.desired_bid_price = None
+            self.desired_bid_size = None
+            self._reconcile_bid()
+            return
         self.desired_bid_price = price
-        self.desired_bid_size = size
+        self.desired_bid_size = sz
         self._reconcile_bid()
 
     def _handle_ensure_ask(self, tup: tuple):
-        price, size = tup
+        if self._stopping:
+            return
+        price, requested_size = tup
+        sz = min(int(requested_size), self._remaining_ask_capacity())
+        if sz <= 0:
+            self.desired_ask_price = None
+            self.desired_ask_size = None
+            self._reconcile_ask()
+            return
         self.desired_ask_price = price
-        self.desired_ask_size = size
+        self.desired_ask_size = sz
         self._reconcile_ask()
+
+    def _remaining_bid_capacity(self) -> int:
+        # effective_long = current long + resting bid (would add to long)
+        resting = self.resting_bid.size if self.resting_bid else 0
+        effective_long = max(self.position, 0) + resting
+        return max(self.max_position - effective_long, 0)
+
+    def _remaining_ask_capacity(self) -> int:
+        # effective_short = current short + resting ask (would add to short)
+        resting = self.resting_ask.size if self.resting_ask else 0
+        effective_short = max(-self.position, 0) + resting
+        return max(self.max_position - effective_short, 0)
 
     def _handle_cancel_bid(self):
         self.desired_bid_price = None
@@ -207,6 +293,11 @@ class OSM:
       # Possibly reconcile in case the new tolerance makes a current
       # mismatch actionable that wasn't before
       self._reconcile_both()
+
+    def _handle_update_max_position(self, max_position):
+      self.max_position = int(max_position)
+      # Next ENSURE_BID/ASK will pick up the new cap automatically.
+      # No reconcile needed — resting sizes don't change retroactively.
 
     # ------------------------------------------------------------------
     # WS event handlers
@@ -465,9 +556,11 @@ class OSM:
     # API call primitives
     # ------------------------------------------------------------------
     def _send_place(self, side, price, size):
+        # Snap to Kalshi tick grid OUTWARD (bid floors, ask ceils) so
+        # we never accidentally cross the spread.  Single chokepoint
+        # to the Kalshi API means no path bypasses this.
+        snapped = self._round_to_tick(price, side)
         req_id = str(uuid.uuid4())
-        self.pending_ops[req_id] = PendingOp(
-            request_id=req_id, kind="place", side=side, price=price)
 
         def on_done(future):
             try:
@@ -479,22 +572,36 @@ class OSM:
         f = self.api.create_order_async(
             ticker=self.ticker, side="yes",
             action="buy" if side == "bid" else "sell",
-            price_dollars=f"{price:.3f}", count=size,
+            price_dollars=f"{snapped:.3f}", count=size,
             tag="aston", post_only=True,
         )
+        self.pending_ops[req_id] = PendingOp(
+            request_id=req_id, kind="place", side=side, price=snapped, future=f)
         f.add_done_callback(on_done)
+
+    @staticmethod
+    def _round_to_tick(price: float, side: str) -> float:
+        """Kalshi tick grid: 1¢ in the body [0.10, 0.90], 0.1¢ in the
+        wings (< 0.10 or > 0.90).  Bid floors, ask ceils, so neither
+        side accidentally crosses.  Clamped to (0.001, 0.999) so the
+        result is always a valid post-only price.
+        """
+        grid = 1000.0 if (price < 0.10 or price > 0.90) else 100.0
+        if side == "bid":
+            return max(math.floor(price * grid) / grid, 0.001)
+        return min(math.ceil(price * grid) / grid, 0.999)
 
     def _send_cancel(self, side, order_id):
         req_id = str(uuid.uuid4())
-        self.pending_ops[req_id] = PendingOp(
-            request_id=req_id, kind="cancel", side=side, price=0.0)
-        
+
         def on_done(future):
             try:
                 resp = future.result()
                 self.queue.put(("API_RESPONSE", (req_id, True, resp)))
             except Exception as e:
                 self.queue.put(("API_RESPONSE", (req_id, False, str(e))))
-        
+
         f = self.api.cancel_order_async(order_id)
+        self.pending_ops[req_id] = PendingOp(
+            request_id=req_id, kind="cancel", side=side, price=0.0, future=f)
         f.add_done_callback(on_done)
