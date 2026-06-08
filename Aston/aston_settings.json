@@ -1,10 +1,10 @@
 {
-  "edge_bid": 7.0,
+  "edge_bid": 9.0,
   "edge_ask": 5.0,
-  "size_bid": 1,
-  "size_ask": 1,
-  "max_position": 8,
+  "size_bid": 3,
+  "size_ask": 3,
+  "max_position": 30,
   "sigma_scalar": 0.85,
-  "tolerance": 1.0,
+  "tolerance": 0.3,
   "auto_mm_on": true
 }

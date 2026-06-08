@@ -35,7 +35,7 @@ SERIES_PREFIX     = 'KXETH15M'
 CUTOFF_DAY        = '26MAY15'
 CUTOFF_DATE       = parse_day_suffix(CUTOFF_DAY)
 MARKOUT_HORIZON   = 30
-REFRESH_SECONDS   = 300  # 5 min — compute can take 1-3 min, don't queue
+REFRESH_SECONDS   = 900  # 15 min — aligned with the 15-min market roll cadence
 PORT              = 8050
 CACHE_PATH        = ROOT / 'analysis/Aston/.settlements_cache.json'
 BOOTSTRAP_B       = 500   # was 2000 — 4x faster, CIs still tight at n>=200
@@ -617,39 +617,39 @@ def bleed_stats(cohort, bucket):
 # =============================================================================
 # Single compute, both tabs
 # =============================================================================
+def _bleed_views(adv: pd.DataFrame) -> tuple:
+    """Given a (possibly date-filtered) adv frame, returns
+    (cohort, bucket, breach_df) for the bleed tab."""
+    if adv.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+    cohort, bucket = bleed_compute(adv)
+    breach = adv[['ts', 'ticker', 'breach_duration_s', 'theo_drift_c',
+                   'mid_drift_30', 'realized_c']].dropna(
+                   subset=['breach_duration_s'])
+    return cohort, bucket, breach
+
+
 def compute_all():
-    """Loads SQLite once and returns (pnl_fills, adv_daily, bleed_cohort,
-    bleed_bucket, breach_df).  Populates `_SETTLE_CACHE` once per refresh."""
+    """PnL-only mode — loads `fills` across all days and skips the heavy
+    `kalshi_book`/`theo_state`/`order_events` tables to keep memory bounded."""
     global _SETTLE_CACHE
-    tables = load_readonly(('theo_state', 'kalshi_book', 'fills', 'order_events'))
-    theo, book, fills, events = (
-        tables['theo_state'], tables['kalshi_book'],
-        tables['fills'], tables['order_events'])
+    tables = load_readonly(('fills',))
+    fills = tables['fills']
 
     if fills.empty:
-        empty = pd.DataFrame()
-        return empty, empty, empty, empty, empty
+        return pd.DataFrame()
 
     _SETTLE_CACHE = fetch_settlements_from_api(
         list(fills['ticker'].unique()), api, cache_path=CACHE_PATH)
 
-    pnl_fills = compute_pnl(fills)
-    adv = enrich_fills(fills, theo, book, events)
-    adv = attach_settlements_adv(adv)
-    late = cancel_race(adv, events)
-    cohort, bucket = bleed_compute(adv)
-    # Tolerance-breach reconstruction — augments adv with breach_duration_s.
-    adv['breach_duration_s'] = reconstruct_breach_duration(adv, theo)
-    return (pnl_fills, adv_daily(adv, late), cohort, bucket,
-            adv[['ts', 'ticker', 'breach_duration_s', 'theo_drift_c',
-                  'mid_drift_30', 'realized_c']].dropna(
-                  subset=['breach_duration_s']))
+    return compute_pnl(fills)
 
 
 # =============================================================================
 # Dash app
 # =============================================================================
-app = Dash(__name__)
+app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Aston Live Dashboard"
 
 TAB_STYLE = {"backgroundColor": "#0a0e1a", "color": "#888",
@@ -664,14 +664,6 @@ app.layout = html.Div([
         html.Div(f"{SERIES_PREFIX} · refresh every {REFRESH_SECONDS}s",
                  style={"color": "#888"}),
     ], style={"padding": "10px 20px"}),
-    dcc.Tabs(id='tabs', value='pnl', children=[
-        dcc.Tab(label='P&L', value='pnl',
-                style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-        dcc.Tab(label='Adverse Selection', value='adv',
-                style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-        dcc.Tab(label='Bleed Decomposition', value='bleed',
-                style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-    ]),
     html.Div(id='tab-content', style={"padding": "10px 0"}),
     dcc.Interval(id='interval',
                  interval=REFRESH_SECONDS * 1000, n_intervals=0),
@@ -682,51 +674,25 @@ app.layout = html.Div([
 
 @app.callback(Output('store', 'data'), Input('interval', 'n_intervals'))
 def refresh_store(_):
-    """Recompute on each tick.  Returns a small marker; actual frames are
-    kept in module-state to avoid serialising large DFs to the browser."""
-    global _PNL_FILLS, _ADV_DAILY, _BLEED_COHORT, _BLEED_BUCKET, _BREACH
-    (_PNL_FILLS, _ADV_DAILY, _BLEED_COHORT,
-     _BLEED_BUCKET, _BREACH) = compute_all()
+    global _PNL_FILLS
+    _PNL_FILLS = compute_all()
     return datetime.now(timezone.utc).isoformat()
 
 
-_PNL_FILLS:    pd.DataFrame = pd.DataFrame()
-_ADV_DAILY:    pd.DataFrame = pd.DataFrame()
-_BLEED_COHORT: pd.DataFrame = pd.DataFrame()
-_BLEED_BUCKET: pd.DataFrame = pd.DataFrame()
-_BREACH:       pd.DataFrame = pd.DataFrame()
+_PNL_FILLS: pd.DataFrame = pd.DataFrame()
 
 
 @app.callback(
     Output('tab-content', 'children'),
-    Input('tabs', 'value'),
     Input('store', 'data'),
 )
-def render_tab(tab, _store_ts):
-    if tab == 'pnl':
-        return html.Div([
-            html.Div(pnl_stats(_PNL_FILLS),
-                     style={"width": "300px", "padding": "20px"}),
-            html.Div([dcc.Graph(figure=pnl_figure(_PNL_FILLS))],
-                     style={"flex": 1}),
-        ], style={"display": "flex"})
-    if tab == 'adv':
-        return html.Div([
-            html.Div(adv_stats(_ADV_DAILY),
-                     style={"width": "300px", "padding": "20px"}),
-            html.Div([dcc.Graph(figure=adv_figure(_ADV_DAILY))],
-                     style={"flex": 1}),
-        ], style={"display": "flex"})
-    if tab == 'bleed':
-        return html.Div([
-            html.Div(bleed_stats(_BLEED_COHORT, _BLEED_BUCKET),
-                     style={"width": "300px", "padding": "20px"}),
-            html.Div([dcc.Graph(figure=bleed_figure(_BLEED_COHORT,
-                                                     _BLEED_BUCKET,
-                                                     _BREACH))],
-                     style={"flex": 1}),
-        ], style={"display": "flex"})
-    return html.Div()
+def render_tab(_store_ts):
+    return html.Div([
+        html.Div(pnl_stats(_PNL_FILLS),
+                 style={"width": "300px", "padding": "20px"}),
+        html.Div([dcc.Graph(figure=pnl_figure(_PNL_FILLS))],
+                 style={"flex": 1}),
+    ], style={"display": "flex"})
 
 
 if __name__ == "__main__":

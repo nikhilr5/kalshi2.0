@@ -184,6 +184,33 @@ class StateRecorder:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_ts ON theo_state(ts)")
 
+        # order_attempts — populated by the recorder's JSONL tail-ingest
+        # thread reading what the app writes.  Captures the *intent* side
+        # (sent / ack / latency / reject reason), complementing the WS-
+        # confirmed `order_events` (placed / cancelled / filled).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS order_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_request TEXT NOT NULL,
+                ts_response TEXT,
+                latency_ms REAL,
+                client_order_id TEXT,
+                server_order_id TEXT,
+                ticker TEXT,
+                action TEXT,
+                side TEXT,
+                price REAL,
+                count REAL,
+                request_type TEXT,
+                http_status INTEGER,
+                success INTEGER,
+                error_code TEXT,
+                error_msg TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_oa_ts ON order_attempts(ts_request)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_oa_coid ON order_attempts(client_order_id)")
+
         conn.commit()
         self._conns[path] = conn
         return conn
@@ -287,6 +314,39 @@ class StateRecorder:
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (now, ticker, spot, strike, seconds_to_expiry,
                   sigma, theo, rv_15m, rv_30m, rv_4h, rv_24h))
+            conn.commit()
+
+    def write_order_attempt(self, series_ticker: str, event: dict):
+        """Write one order-attempt row.  `event` is the dict the app
+        produced when it sent the API call (deserialized from the JSONL
+        line by the tail-ingest loop)."""
+        with self._lock:
+            conn = self._conn_now(series_ticker)
+            conn.execute("""
+                INSERT INTO order_attempts (
+                    ts_request, ts_response, latency_ms,
+                    client_order_id, server_order_id,
+                    ticker, action, side, price, count,
+                    request_type, http_status, success,
+                    error_code, error_msg
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                event.get("ts_request"),
+                event.get("ts_response"),
+                event.get("latency_ms"),
+                event.get("client_order_id"),
+                event.get("server_order_id"),
+                event.get("ticker"),
+                event.get("action"),
+                event.get("side"),
+                event.get("price"),
+                event.get("count"),
+                event.get("request_type"),
+                event.get("http_status"),
+                event.get("success"),
+                event.get("error_code"),
+                event.get("error_msg"),
+            ))
             conn.commit()
 
     def close(self):
@@ -427,6 +487,7 @@ class StandaloneRecorder:
         self._stop_event = threading.Event()
         self._discovery_thread: threading.Thread | None = None
         self._rotation_thread: threading.Thread | None = None
+        self._attempt_ingest_thread: threading.Thread | None = None
 
     # ---- startup / shutdown ----
 
@@ -472,6 +533,17 @@ class StandaloneRecorder:
             name="recorder-rotation")
         self._rotation_thread.start()
 
+        # Order-attempt JSONL tail-ingest thread.  Reads the per-day
+        # JSONL files the app writes (one event per API call: place /
+        # cancel attempt + response timing) and writes them as rows in
+        # the per-day SQLite's `order_attempts` table.  Picks up
+        # whatever's accumulated since the last offset, so recorder
+        # downtime just delays ingest — no data loss.
+        self._attempt_ingest_thread = threading.Thread(
+            target=self._attempt_ingest_loop, daemon=True,
+            name="recorder-attempt-ingest")
+        self._attempt_ingest_thread.start()
+
         print("[Recorder] Running.  Ctrl-C to stop.")
         while not self._stop_event.is_set():
             time.sleep(1)
@@ -494,6 +566,128 @@ class StandaloneRecorder:
         except Exception:
             pass
         print("[Recorder] Done")
+
+    # ---- order-attempt JSONL tail-ingest (app writes JSONL, we ingest to DB) ----
+
+    ATTEMPT_INGEST_INTERVAL_S = 30
+    ATTEMPT_OFFSETS_FILENAME = ".ingest_offsets.json"
+    ATTEMPT_FILE_PATTERN = "order_attempts-*.jsonl"
+    # YYMONDD regex on the date suffix of the JSONL filename
+    ATTEMPT_DATE_RE = re.compile(r"order_attempts-(\d{2}[A-Z]{3}\d{2})\.jsonl$")
+
+    def _attempt_ingest_loop(self):
+        """Every ATTEMPT_INGEST_INTERVAL_S seconds, drain new lines
+        from each order_attempts JSONL file into the per-day
+        order_attempts SQLite table.  Offsets persisted to
+        ATTEMPT_OFFSETS_FILENAME so recorder restarts don't double-
+        ingest."""
+        # Slight startup delay so logs aren't crowded.
+        self._stop_event.wait(15)
+        while not self._stop_event.is_set():
+            try:
+                self._do_attempt_ingest_pass()
+            except Exception as e:
+                print(f"[ingest] pass failed: {e}")
+            self._stop_event.wait(self.ATTEMPT_INGEST_INTERVAL_S)
+
+    def _do_attempt_ingest_pass(self):
+        import json
+        data_dir = self.state.base_dir
+        offsets_path = data_dir / self.ATTEMPT_OFFSETS_FILENAME
+
+        # Load offsets (filename → last-ingested byte position)
+        offsets: dict[str, int] = {}
+        if offsets_path.exists():
+            try:
+                offsets = json.loads(offsets_path.read_text())
+            except Exception as e:
+                print(f"[ingest] offsets read failed: {e}; resetting")
+                offsets = {}
+
+        today_suffix = self._today_suffix()
+        ingested_total = 0
+
+        for jsonl_path in sorted(data_dir.glob(self.ATTEMPT_FILE_PATTERN)):
+            name = jsonl_path.name
+            m = self.ATTEMPT_DATE_RE.search(name)
+            if not m:
+                continue
+            file_date = m.group(1)
+            last_offset = offsets.get(name, 0)
+            try:
+                size = jsonl_path.stat().st_size
+            except FileNotFoundError:
+                continue
+            if last_offset >= size:
+                # Already up to date; possibly delete if past-date and
+                # fully consumed.
+                if file_date != today_suffix and last_offset == size:
+                    try:
+                        jsonl_path.unlink()
+                        offsets.pop(name, None)
+                        print(f"[ingest] deleted fully-ingested {name}")
+                    except Exception as e:
+                        print(f"[ingest] delete failed for {name}: {e}")
+                continue
+
+            # Read new bytes; split on \n; ingest only complete lines
+            # (any trailing fragment without \n is left for next pass).
+            try:
+                with jsonl_path.open("rb") as f:
+                    f.seek(last_offset)
+                    chunk = f.read()
+            except Exception as e:
+                print(f"[ingest] read failed for {name}: {e}")
+                continue
+
+            if not chunk:
+                continue
+            # last_newline_pos: index of the final '\n' in chunk
+            last_nl = chunk.rfind(b"\n")
+            if last_nl < 0:
+                # No complete line yet
+                continue
+            complete = chunk[: last_nl + 1].decode("utf-8", errors="replace")
+            new_offset = last_offset + (last_nl + 1)
+
+            n_ok = 0
+            for line in complete.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                # Cancel events carry no ticker (the cancel API only
+                # knows order_id).  Fall back to the recorder's series
+                # since this recorder is pinned to one anyway.
+                series = (_series_from_ticker(event.get("ticker") or "")
+                          or self.series)
+                if not series:
+                    continue
+                try:
+                    self.state.write_order_attempt(series, event)
+                    n_ok += 1
+                except Exception as e:
+                    print(f"[ingest] write failed: {e}")
+
+            offsets[name] = new_offset
+            ingested_total += n_ok
+
+        # Persist offsets
+        if ingested_total > 0 or not offsets_path.exists():
+            try:
+                offsets_path.write_text(json.dumps(offsets))
+            except Exception as e:
+                print(f"[ingest] offsets write failed: {e}")
+            if ingested_total > 0:
+                print(f"[ingest] {ingested_total} attempt row(s) added")
+
+    def _today_suffix(self) -> str:
+        """Match the recorder's YYMONDD filename convention."""
+        d = datetime.now(tz=timezone.utc)
+        return f"{d.year % 100:02d}{_MONTHS[d.month]}{d.day:02d}"
 
     # ---- daily-rotation to S3 (in-process; inherits Terminal TCC grant) ----
 

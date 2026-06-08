@@ -5,15 +5,65 @@ IMPORTANT: Signing uses the full path /trade-api/v2/... not just /...
 This is required for authenticated endpoints (orders, portfolio).
 """
 
+import json
+import queue
+import threading
 import time
 import base64
 import uuid
 import httpx
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
+
+
+_MONTHS_UC = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+              "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+
+def _attempt_log_path(base_dir: Path) -> Path:
+    """`order_attempts-{YYMONDD}.jsonl` in the recorder's data dir."""
+    d = datetime.now(tz=timezone.utc)
+    suffix = f"{d.year % 100:02d}{_MONTHS_UC[d.month - 1]}{d.day:02d}"
+    return base_dir / f"order_attempts-{suffix}.jsonl"
+
+
+def _attempt_log_drain(q: queue.Queue, base_dir: Path):
+    """Background daemon thread: pulls events off the queue and writes
+    them to today's order_attempts JSONL.  Reopens the file when UTC
+    date rolls over.  Long-running app sessions stay correct without
+    a restart.  None on the queue is the shutdown sentinel."""
+    fh = None
+    current_path: Path | None = None
+    while True:
+        event = q.get()
+        if event is None:
+            break
+        try:
+            path = _attempt_log_path(base_dir)
+            if fh is None or path != current_path:
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fh = open(path, "a", buffering=1)   # line-buffered
+                current_path = path
+            fh.write(json.dumps(event) + "\n")
+        except Exception as e:
+            # Never raise from the logger.  Print and continue so the
+            # producer side keeps draining.
+            print(f"[attempt-log] write failed: {e}")
+    # Shutdown: flush + close.
+    if fh is not None:
+        try:
+            fh.close()
+        except Exception:
+            pass
 
 
 class KalshiAPI:
@@ -22,7 +72,7 @@ class KalshiAPI:
     ACCESS_KEY = "73e2b386-6ca6-4ed8-beaf-f58404c6bba0"
     PRIVATE_KEY_PATH = Path.home() / "private_key.pem"
 
-    def __init__(self):
+    def __init__(self, attempt_log_dir: Path | None = None):
         with open(self.PRIVATE_KEY_PATH, "rb") as f:
             self.private_key = serialization.load_pem_private_key(f.read(), password=None)
         self.on_rate_limit = None  # callback(remaining, limit, reset_ts)
@@ -51,9 +101,43 @@ class KalshiAPI:
         # Each entry: (monotonic_ts, method, path, rtt_ms).
         self._rtt_log: deque = deque(maxlen=10000)
 
+        # ---- Async order-attempt logger (off the hot path) ----
+        # Producer: create_order / cancel_order put_nowait an event dict.
+        # Consumer: a single daemon thread drains the queue and writes
+        # one JSON line per event to a daily-rotated JSONL in the
+        # recorder's data dir.  Recorder tails this file and ingests
+        # into the per-day SQLite's order_attempts table.
+        self._attempt_log_queue: queue.Queue | None = None
+        self._attempt_log_writer: threading.Thread | None = None
+        if attempt_log_dir is not None:
+            self._attempt_log_queue = queue.Queue()
+            self._attempt_log_writer = threading.Thread(
+                target=_attempt_log_drain,
+                args=(self._attempt_log_queue, Path(attempt_log_dir)),
+                daemon=True, name="attempt-log-writer",
+            )
+            self._attempt_log_writer.start()
+
+    def _enqueue_attempt(self, event: dict):
+        """Producer-side: push event onto the logger queue.  Returns
+        instantly (~microseconds); never blocks the trading path."""
+        if self._attempt_log_queue is not None:
+            try:
+                self._attempt_log_queue.put_nowait(event)
+            except Exception:
+                pass  # never let logging break trading
+
     def shutdown(self):
         """Wait for in-flight async writes to complete, then stop the pool."""
         self._executor.shutdown(wait=True)
+        # Drain attempt-log queue cleanly before exit.
+        if self._attempt_log_queue is not None:
+            try:
+                self._attempt_log_queue.put_nowait(None)  # sentinel
+                if self._attempt_log_writer is not None:
+                    self._attempt_log_writer.join(timeout=5.0)
+            except Exception:
+                pass
         try:
             self.session.close()
         except Exception:
@@ -292,20 +376,63 @@ class KalshiAPI:
         post_only: if True, exchange rejects the order if it would cross.
         """
         prefix = f"{tag}_" if tag else ""
+        client_order_id = f"{prefix}{uuid.uuid4()}"
         body = {
             "ticker": ticker,
             "side": side,
             "action": action,
             "yes_price_dollars": price_dollars,
             "count": count,
-            "client_order_id": f"{prefix}{uuid.uuid4()}",
+            "client_order_id": client_order_id,
             "type": "limit",
             "time_in_force": time_in_force,
         }
         if post_only:
             body["post_only"] = True
         self._log_write(10)  # create_order = default 10 tokens
-        return self._post("/portfolio/orders", body)
+
+        t0 = time.perf_counter()
+        ts_request = datetime.now(tz=timezone.utc).isoformat()
+        http_status = 0
+        success = 0
+        error_code: str | None = None
+        error_msg: str | None = None
+        server_order_id: str | None = None
+        try:
+            resp = self._post("/portfolio/orders", body)
+            success = 1
+            http_status = 200
+            if isinstance(resp, dict):
+                server_order_id = (resp.get("order") or {}).get("order_id")
+            return resp
+        except httpx.HTTPStatusError as e:
+            http_status = e.response.status_code if e.response else 0
+            error_code = f"http_{http_status}"
+            error_msg = (e.response.text[:200]
+                         if e.response is not None else str(e))[:500]
+            raise
+        except Exception as e:
+            error_code = "exception"
+            error_msg = str(e)[:500]
+            raise
+        finally:
+            self._enqueue_attempt({
+                "ts_request": ts_request,
+                "ts_response": datetime.now(tz=timezone.utc).isoformat(),
+                "latency_ms": (time.perf_counter() - t0) * 1000.0,
+                "client_order_id": client_order_id,
+                "server_order_id": server_order_id,
+                "ticker": ticker,
+                "action": action,
+                "side": side,
+                "price": float(price_dollars) if price_dollars else None,
+                "count": count,
+                "request_type": "create",
+                "http_status": http_status,
+                "success": success,
+                "error_code": error_code,
+                "error_msg": error_msg,
+            })
 
     def get_order(self, order_id: str) -> dict:
         """Fetch a single order by ID."""
@@ -313,7 +440,46 @@ class KalshiAPI:
 
     def cancel_order(self, order_id: str) -> dict:
         self._log_write(2)  # cancel_order = 2 tokens
-        return self._delete(f"/portfolio/orders/{order_id}")
+
+        t0 = time.perf_counter()
+        ts_request = datetime.now(tz=timezone.utc).isoformat()
+        http_status = 0
+        success = 0
+        error_code: str | None = None
+        error_msg: str | None = None
+        try:
+            resp = self._delete(f"/portfolio/orders/{order_id}")
+            success = 1
+            http_status = 200
+            return resp
+        except httpx.HTTPStatusError as e:
+            http_status = e.response.status_code if e.response else 0
+            error_code = f"http_{http_status}"
+            error_msg = (e.response.text[:200]
+                         if e.response is not None else str(e))[:500]
+            raise
+        except Exception as e:
+            error_code = "exception"
+            error_msg = str(e)[:500]
+            raise
+        finally:
+            self._enqueue_attempt({
+                "ts_request": ts_request,
+                "ts_response": datetime.now(tz=timezone.utc).isoformat(),
+                "latency_ms": (time.perf_counter() - t0) * 1000.0,
+                "client_order_id": None,         # cancel works on server_order_id
+                "server_order_id": order_id,
+                "ticker": None,                   # not in the cancel call signature
+                "action": None,
+                "side": None,
+                "price": None,
+                "count": None,
+                "request_type": "cancel",
+                "http_status": http_status,
+                "success": success,
+                "error_code": error_code,
+                "error_msg": error_msg,
+            })
 
     def cancel_orders_batched(self, order_ids: list) -> dict:
         """Batch cancel — DELETE /portfolio/orders/batched.

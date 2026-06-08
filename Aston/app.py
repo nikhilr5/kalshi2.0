@@ -231,8 +231,13 @@ class AstonApp(QMainWindow):
 
         self.settings = _load_settings()
 
-        # Core services
-        self.api = KalshiAPI()
+        # Core services.  Hand KalshiAPI the recorder's data dir so
+        # every create_order / cancel_order call gets logged off-thread
+        # to a daily-rotated JSONL.  Recorder tails those files and
+        # ingests into the per-day `order_attempts` table.  Zero
+        # latency cost on the trading path (queue put_nowait).
+        from recorder import DEFAULT_DATA_DIR as _ATTEMPT_LOG_DIR
+        self.api = KalshiAPI(attempt_log_dir=_ATTEMPT_LOG_DIR)
         self.price_feed: CryptoPriceFeed | None = None
         self.ws_feed: KalshiWsFeed | None = None
         self.vol_est = RealizedVolEstimator(

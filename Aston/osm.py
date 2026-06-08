@@ -390,6 +390,25 @@ class OSM:
                         or "502" in err
                         or "503" in err
                         or "connection" in err)
+        # EAGAIN/EWOULDBLOCK on the local socket write — the HTTP request
+        # was very likely sent to Kalshi and accepted before the kernel
+        # raised the local error.  Treated as ORPHAN_RISK: for place
+        # ops, probe Kalshi to discover any order that landed without
+        # our seeing the server_order_id.  Without the probe these
+        # become invisible resting orders that get picked off on
+        # adverse theo drift (see 2026-05-22 stale-no-cancel analysis).
+        is_orphan_risk = ("errno 35" in err
+                        or "errno 11" in err               # EAGAIN linux
+                        or "temporarily unavailable" in err)
+
+        # NOTE: probe path is disabled (2026-05-21).  It was clearing
+        # `resting_*` based on transient get_orders snapshots from
+        # Kalshi (which sometimes omit orders mid-transition), causing
+        # orphaned orders on Kalshi when OSM placed a fresh order on
+        # top of an already-resting one.  Self-healing via natural
+        # retry on the next reconcile cycle is now the recovery path
+        # for cancel transients; place transients accept a small risk
+        # of duplicate order until the next reconcile cycle re-cancels.
 
         if op.kind == "cancel":
             if is_terminal:
@@ -397,14 +416,14 @@ class OSM:
                 # cancelled).  Clear resting state for this side.
                 self._clear_resting(op.side)
             elif is_transient:
-                # Ambiguous — Kalshi may have cancelled it.  Probe ground truth
-                # asynchronously via get_order; until then, leave resting in
-                # place.  Next reconcile will see resting still set and retry
-                # the cancel if needed.
-                self._schedule_probe(op.side)
+                # Ambiguous — leave resting in place; the next reconcile
+                # will re-issue the cancel naturally on the next theo tick.
+                # Self-healing without the probe race.
+                print(f"[OSM] transient cancel error (will retry): {error}")
             else:
-                print(f"[OSM] unexpected cancel error: {error}")
-                self._schedule_probe(op.side)
+                # Unknown error — same path as transient: leave state alone,
+                # let next reconcile handle it.
+                print(f"[OSM] unexpected cancel error (will retry): {error}")
 
         elif op.kind == "place":
             if is_terminal:
@@ -412,13 +431,30 @@ class OSM:
                 # No order created.  Resting stays None; reconcile will retry
                 # if desired is still set.
                 pass
-            elif is_transient:
-                # Ambiguous — order may or may not have been placed.  Probe.
-                # Otherwise we risk double-placing on retry.
+            elif is_orphan_risk:
+                # EAGAIN/local-socket error: the POST almost certainly hit
+                # Kalshi before the kernel raised the error.  Probe to find
+                # any order that landed under op.price so we can record
+                # the server_order_id (and cancel it on the next reprice).
+                # Scoped to this failure mode so the probe doesn't run on
+                # every reconcile — the original disable-reason (2026-05-21)
+                # was probe-vs-place races during normal flow, which this
+                # narrow trigger avoids.
+                print(f"[OSM] orphan-risk place error → probing {op.side}: {error}")
                 self._schedule_probe(op.side, expected_price=op.price)
+            elif is_transient:
+                # Ambiguous — order may or may not have been placed.  Without
+                # a probe we can't tell.  If it landed, the next reconcile
+                # cycle will see resting=None locally but a desired price,
+                # fire another place → double order.  Mitigated by: (a) this
+                # path is rare since places are post-only and usually return
+                # 200 or 400, and (b) the next reconcile will fire a cancel
+                # against the duplicate as soon as a fresh BBO tick reveals
+                # the price gap.  See periodic-sweep TODO if this becomes
+                # an observed issue.
+                print(f"[OSM] transient place error (may duplicate): {error}")
             else:
                 print(f"[OSM] unexpected place error: {error}")
-                self._schedule_probe(op.side, expected_price=op.price)
 
 
     def _handle_api_success(self, op: PendingOp, response: dict):
@@ -451,29 +487,73 @@ class OSM:
             # Cancel succeeded — resting is gone.
             self._clear_resting(op.side)
 
-    def _schedule_probe(self, side: str, expected_price: float | None = None):
-        """Query Kalshi for ground truth on `side`.  Submits get_orders
-        to the api's executor so it doesn't block the OSM worker; on
-        completion enqueues PROBE_RESULT for the worker to apply."""
-        def on_done(future):
-            try:
-                orders = future.result()
-                self.queue.put(("PROBE_RESULT", (side, orders)))
-            except Exception as e:
-                print(f"[OSM] probe failed for {side}: {e}")
+    # Delay before the probe fires.  Kalshi's get_orders endpoint has
+    # eventual consistency vs order acceptance — observed 2026-05-22:
+    # orphan landed at T+0, didn't appear in get_orders until ~T+200ms
+    # (WS placed event arrived T+190ms; REST is slightly behind that).
+    # Probing too early returns empty → probe handler clears resting →
+    # reconcile fires duplicate retry → orphan stays invisible.
+    _PROBE_DELAY_S = 0.5
 
-        f = self.api.get_orders_async("resting")
-        f.add_done_callback(on_done)
+    def _schedule_probe(self, side: str, expected_price: float | None = None):
+        """Query Kalshi for ground truth on `side`, after a short delay.
+
+        Two-step:
+          1. Register a synthetic PendingOp(kind="probe") for `side`
+             immediately so `_reconcile_{bid,ask}`'s in-flight guard
+             suppresses the duplicate-place that `_reconcile_both`
+             (called by `_handle_api_response` right after this) would
+             otherwise fire.
+          2. After `_PROBE_DELAY_S`, submit get_orders_async.  The
+             delay lets Kalshi's REST view catch up with the orphan
+             that was accepted but isn't yet visible via get_orders.
+        """
+        req_id = str(uuid.uuid4())
+        self.pending_ops[req_id] = PendingOp(
+            request_id=req_id, kind="probe", side=side,
+            price=expected_price if expected_price is not None else 0.0,
+            future=None)
+
+        def submit_probe():
+            def on_done(future):
+                try:
+                    orders = future.result()
+                    self.queue.put(("PROBE_RESULT", (req_id, side, orders)))
+                except Exception as e:
+                    # Probe HTTP failed.  Pop the placeholder so the
+                    # next reconcile can act; without this the side
+                    # stays blocked forever.
+                    self.pending_ops.pop(req_id, None)
+                    self.queue.put(("PROBE_RESULT", (req_id, side, [])))
+                    print(f"[OSM] probe failed for {side}: {e}")
+
+            f = self.api.get_orders_async("resting")
+            # Re-attach the future to the placeholder so cancel_all_sync
+            # can wait on it during teardown if needed.
+            existing_op = self.pending_ops.get(req_id)
+            if existing_op is not None:
+                existing_op.future = f
+            f.add_done_callback(on_done)
+
+        # Fire-and-forget timer; daemon so it doesn't block shutdown.
+        threading.Timer(self._PROBE_DELAY_S, submit_probe).start()
 
     def _handle_probe_result(self, payload):
         """Reconcile local resting_*_id against what Kalshi actually has.
-        If anything is in flight for this side, the probe is stale (the
-        in-flight op will determine state) — drop it.
+        Payload is (req_id, side, orders).  req_id is the synthetic
+        PendingOp placeholder registered by `_schedule_probe`; we pop
+        it BEFORE the in-flight check so this probe's own placeholder
+        doesn't make the result look stale.
         """
-        side, orders = payload
+        req_id, side, orders = payload
+        op = self.pending_ops.pop(req_id, None)
+        expected_price = op.price if op is not None else None
 
-        if any(op.side == side for op in self.pending_ops.values()):
-            print(f"[OSM] probe result for {side} stale (pending ops in flight)")
+        # If something OTHER than this probe is in flight for this side
+        # (e.g. a fill-triggered cancel landed concurrently), defer —
+        # the in-flight op will decide state.
+        if any(o.side == side for o in self.pending_ops.values()):
+            print(f"[OSM] probe result for {side} stale (other op in flight)")
             return
 
         action = "buy" if side == "bid" else "sell"
@@ -492,15 +572,56 @@ class OSM:
                       f"(was {self.resting_ask})")
                 self.resting_ask = None
         else:
-            # Kalshi has an order — adopt it as the source of truth.
-            o = ours[0]
+            # Kalshi has at least one order on this side.  EAGAIN'd
+            # creates produce duplicates at the SAME price as the
+            # successful retry (theo barely moves between attempts),
+            # so price matching alone can't pick the orphan.  Use
+            # order_id: the orphan is the order OSM doesn't already
+            # know about (not in resting_*).
+            existing = self.resting_bid if side == "bid" else self.resting_ask
+            known_id = existing.order_id if existing is not None else None
+            unknown = [o for o in ours if o.get("order_id") != known_id]
+
+            if not unknown:
+                # All orders on this side are already tracked — probe
+                # raced the orphan's landing (Kalshi snapshot pre-orphan)
+                # or false-positive.  Leave state untouched.
+                print(f"[OSM] probe: all {len(ours)} order(s) on {side} "
+                      f"already tracked; no orphan adopted")
+                self._reconcile_both()
+                return
+
+            # Pick the unknown order to adopt.  If multiple unknowns,
+            # prefer one matching expected_price.
+            chosen = None
+            if expected_price is not None:
+                for o in unknown:
+                    try:
+                        p = float(o.get("yes_price_dollars", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if abs(p - expected_price) < 1e-6:
+                        chosen = o
+                        break
+            if chosen is None:
+                chosen = unknown[0]
+
             try:
-                order_id = o.get("order_id")
-                price = float(o.get("yes_price_dollars", 0) or 0)
-                remaining = int(float(o.get("remaining_count_fp", 0) or 0))
+                order_id = chosen.get("order_id")
+                price = float(chosen.get("yes_price_dollars", 0) or 0)
+                remaining = int(float(chosen.get("remaining_count_fp", 0) or 0))
             except (TypeError, ValueError):
                 return
             q = Quote(order_id=order_id, price=price, size=remaining)
+
+            # If we're displacing an already-tracked order from
+            # resting_*, that order is now unowned — cancel it
+            # directly so it doesn't become a NEW orphan.
+            if existing is not None and existing.order_id != order_id:
+                print(f"[OSM] probe: adopting orphan {q}; "
+                      f"cancelling displaced {existing.order_id[:8]}")
+                self._send_cancel(side, existing.order_id)
+
             if side == "bid":
                 self.resting_bid = q
             else:
