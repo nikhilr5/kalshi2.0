@@ -36,10 +36,18 @@ class OSM:
     SWEEP_INTERVAL_S = 60.0
 
     def __init__(self, ticker, tolerance, api, max_position,
-                 position: int = 0, strategy_queue=None):
+                 position: int = 0, strategy_queue=None, gateway=None):
         self.ticker = ticker
         self.tolerance = tolerance
         self.api = api
+        # Exchange-interaction policy layer (token budget, response
+        # normalization).  app.py should inject a process-lifetime
+        # instance so the budget survives per-market OSM rebuilds;
+        # the fallback here keeps OSM constructible standalone.
+        if gateway is None:
+            from order_gateway import OrderGateway
+            gateway = OrderGateway(api)
+        self.gateway = gateway
         self.max_position = max_position
         self.queue = queue.Queue()
         self.running = False 
@@ -410,9 +418,10 @@ class OSM:
         elif status_code == 409:
             print(f'[OSM] ConflictError on {op.kind} {op.side}: {message}')
         elif status_code == 429:
-            # api.is_rate_limited() is set inside _check_rate_limit on the
-            # 429 response.  Subsequent _send_place calls are gated until
-            # cooldown elapses; nothing extra to do here.
+            # The local budget model said we could afford this; Kalshi
+            # disagreed.  Snap the model to empty so it re-syncs —
+            # refill math then paces retries naturally (~333ms/create).
+            self.gateway.on_rate_limited()
             print(f'[OSM] RateLimitError on {op.kind} {op.side}: {message}')
         elif status_code == 500:
             print(f'[OSM] InternalServerError on {op.kind} {op.side}: {message}')
@@ -504,55 +513,33 @@ class OSM:
     # API call primitives
     # ------------------------------------------------------------------
     def _send_place(self, side, price, size):
-        # Global API rate-limit gate
-        if self.api.is_rate_limited():
-            return
-        
         req_id = str(uuid.uuid4())
-
-        # callback once we get a response
-        # handle errors or successes approiately 
-        def on_done(future):
-            try:
-                resp = future.result()
-                self.queue.put(("API_RESPONSE", (req_id, resp)))
-            except Exception as e:
-                error = {}
-                error['message'] = f"{type(e).__name__}: {e}"
-                error['status_code'] = 0
-                self.queue.put(("API_RESPONSE", (req_id, error)))
-
-        f = self.api.create_order_async(
+        f = self.gateway.place(
+            lambda env: self.queue.put(("API_RESPONSE", (req_id, env))),
             ticker=self.ticker, side="yes",
             action="buy" if side == "bid" else "sell",
             price_dollars=f"{price:.3f}", count=size,
             tag="aston", post_only=True,
         )
+        if f is None:
+            # Budget can't afford a create right now — skip; the next
+            # BBO/theo tick retries once tokens have refilled.
+            print('[OSM] Budget spent cannot place order')
+            return
         self.pending_ops[req_id] = PendingOp(
             request_id=req_id, kind="place", side=side, price=price, future=f)
-        f.add_done_callback(on_done)
 
     def _send_cancel(self, side, order_id):
-        # Cancels are not rate-gated.  Risk management (clearing stale
-        # orders) takes priority over rate-limit hygiene; cancels also
-        # cost only 2 tokens vs 10 for places.  A rejected cancel will
-        # naturally re-fire on the next reconcile cycle.
+        # Cancels always go out — risk management (clearing stale
+        # orders) takes priority over budget hygiene.  The gateway
+        # debits the cost but never blocks a cancel.
         req_id = str(uuid.uuid4())
-
-        def on_done(future):
-            try:
-                resp = future.result()
-                self.queue.put(("API_RESPONSE", (req_id, resp)))
-            except Exception as e:
-                error = {}
-                error['message'] = f"{type(e).__name__}: {e}"
-                error['status_code'] = 0
-                self.queue.put(("API_RESPONSE", (req_id, error)))
-
-        f = self.api.cancel_order_async(order_id)
+        f = self.gateway.cancel(
+            order_id,
+            lambda env: self.queue.put(("API_RESPONSE", (req_id, env))),
+        )
         self.pending_ops[req_id] = PendingOp(
             request_id=req_id, kind="cancel", side=side, price=0.0, future=f)
-        f.add_done_callback(on_done)
 
     # ------------------------------------------------------------------
     # Detect forgetten orders 
@@ -585,7 +572,8 @@ class OSM:
           oid = order.get("order_id")
           if oid and oid not in known:
               print(f"[OSM] sweep: cancelling orphan {oid}")
-              self.api.cancel_order_async(oid)
+              # Through the gateway so the 20-token cost is accounted.
+              self.gateway.cancel(oid, lambda env: None)
 
     # ------------------------------------------------------------------
     # Static helper

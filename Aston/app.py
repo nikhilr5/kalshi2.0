@@ -238,6 +238,11 @@ class AstonApp(QMainWindow):
         # latency cost on the trading path (queue put_nowait).
         from recorder import DEFAULT_DATA_DIR as _ATTEMPT_LOG_DIR
         self.api = KalshiAPI(attempt_log_dir=_ATTEMPT_LOG_DIR)
+        # Process-lifetime exchange-policy layer (write-token budget).
+        # Shared across every OSM rebuild so the budget survives the
+        # 15-minute market rolls.
+        from order_gateway import OrderGateway
+        self.gateway = OrderGateway(self.api)
         self.price_feed: CryptoPriceFeed | None = None
         self.ws_feed: KalshiWsFeed | None = None
         self.vol_est = RealizedVolEstimator(
@@ -392,6 +397,20 @@ class AstonApp(QMainWindow):
             "color:#22c55e;background:transparent;border:none;")
         portfolio_box.addWidget(self.portfolio_label)
         header.addLayout(portfolio_box)
+
+        # Write-token budget — live read of the gateway's bucket mirror.
+        # Refreshed on the 250ms UI tick; read-only, thread-safe.
+        tokens_box = QVBoxLayout()
+        tokens_box.setSpacing(4)
+        tt = QLabel("TOKENS")
+        tt.setObjectName("metricTitle")
+        tokens_box.addWidget(tt)
+        self.tokens_label = QLabel("--")
+        self.tokens_label.setFont(QFont("Menlo", 18, QFont.Weight.Bold))
+        self.tokens_label.setStyleSheet(
+            "color:#22c55e;background:transparent;border:none;")
+        tokens_box.addWidget(self.tokens_label)
+        header.addLayout(tokens_box)
 
         header.addStretch()
 
@@ -1175,6 +1194,7 @@ class AstonApp(QMainWindow):
                     max_position=self.max_pos_input.spin.value(),
                     position=self._position,
                     strategy_queue=None,
+                    gateway=self.gateway,
                 )
                 self.strategy = Strategy2(
                     ticker=self.ticker, strike=self.strike,
@@ -1305,6 +1325,14 @@ class AstonApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _refresh_ui(self):
+        # Token budget — green when healthy, yellow under half, red when
+        # a create (100) is no longer affordable.
+        toks = self.gateway.tokens_remaining()
+        color = "#22c55e" if toks >= 300 else ("#facc15" if toks >= 100 else "#dc2626")
+        self.tokens_label.setText(f"{toks:.0f}/600")
+        self.tokens_label.setStyleSheet(
+            f"color:{color};background:transparent;border:none;")
+
         # Spot / Strike
         self.spot_card.value.setText(
             f"${self.spot:,.2f}" if self.spot > 0 else "--")

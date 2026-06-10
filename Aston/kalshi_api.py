@@ -23,6 +23,9 @@ from cryptography.hazmat.primitives.asymmetric import padding
 _MONTHS_UC = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
+_CANCEL_TOKEN_COST = 20
+_CREATE_TOKEN_COST = 100
+
 
 def _attempt_log_path(base_dir: Path) -> Path:
     """`order_attempts-{YYMONDD}.jsonl` in the recorder's data dir."""
@@ -75,8 +78,6 @@ class KalshiAPI:
     def __init__(self, attempt_log_dir: Path | None = None):
         with open(self.PRIVATE_KEY_PATH, "rb") as f:
             self.private_key = serialization.load_pem_private_key(f.read(), password=None)
-        self.on_rate_limit = None  # callback(remaining, limit, reset_ts)
-        self.rate_limited_until = 0  # timestamp when rate limit expires
         # Persistent Session — reuses TCP + TLS across calls.  Saves
         # ~22ms per request vs a fresh client (which opens a new TCP+TLS
         # connection each time).  At 2-4 REST calls per reprice cycle,
@@ -103,9 +104,6 @@ class KalshiAPI:
         self._executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="kalshi-rest"
         )
-        # Rolling log of write-token consumption — used to compute
-        # tokens/sec for display.  Each entry: (monotonic_ts, tokens).
-        self._write_log: deque = deque()
         # Rolling RTT log (per-call wall time in ms) for latency analysis.
         # Each entry: (monotonic_ts, method, path, rtt_ms).
         self._rtt_log: deque = deque(maxlen=10000)
@@ -152,28 +150,6 @@ class KalshiAPI:
         except Exception:
             pass
 
-    # --- Write throughput tracking ---
-
-    def _log_write(self, tokens: int):
-        """Record a write call's token cost for tokens/sec computation."""
-        now = time.monotonic()
-        self._write_log.append((now, tokens))
-        # Keep at most ~5s of history — plenty for 1s windows
-        while self._write_log and now - self._write_log[0][0] > 5.0:
-            self._write_log.popleft()
-
-    def write_tokens_per_sec(self, window: float = 1.0) -> tuple:
-        """Return (tokens, calls) used in the last `window` seconds."""
-        now = time.monotonic()
-        cutoff = now - window
-        tokens = 0
-        calls = 0
-        for ts, t in self._write_log:
-            if ts >= cutoff:
-                tokens += t
-                calls += 1
-        return tokens, calls
-
     # --- Async wrappers — return a Future immediately, work runs on the pool ---
 
     def create_order_async(self, **kwargs):
@@ -218,31 +194,6 @@ class KalshiAPI:
             "KALSHI-ACCESS-TIMESTAMP": str(ts),
         }
 
-    def is_rate_limited(self) -> bool:
-        """Check if we're currently in a rate limit cooldown."""
-        return time.time() < self.rate_limited_until
-
-    def _check_rate_limit(self, resp):
-        """Check response for rate limit headers and 429 status."""
-        # Check headers (may or may not be present depending on Kalshi's API)
-        remaining = resp.headers.get("X-Ratelimit-Remaining") or resp.headers.get("Ratelimit-Remaining")
-        limit = resp.headers.get("X-Ratelimit-Limit") or resp.headers.get("Ratelimit-Limit")
-        reset = resp.headers.get("X-Ratelimit-Reset") or resp.headers.get("Ratelimit-Reset")
-        if remaining is not None and self.on_rate_limit:
-            try:
-                self.on_rate_limit(int(remaining), int(limit or 0), int(reset or 0))
-            except (ValueError, TypeError):
-                pass
-        if resp.status_code == 429:
-            # Back off for 10 seconds on rate limit
-            self.rate_limited_until = time.time() + 10
-            # httpx Request has no path_url; raw_path includes query string,
-            # which is what requests' path_url returned.
-            endpoint = f"{resp.request.method} {resp.request.url.raw_path.decode('ascii', 'replace')}"
-            if self.on_rate_limit:
-                self.on_rate_limit(0, int(limit or 0), int(reset or 0), endpoint=endpoint)
-            print(f"[API] RATE LIMITED on {endpoint} — backing off 10s")
-
     def _log_http_version(self, resp):
         """One-shot print of the negotiated HTTP version.  Smoke test
         that http2=True is actually being honored end-to-end (Kalshi's
@@ -280,7 +231,6 @@ class KalshiAPI:
         resp = self.session.get(f"{self.BASE_URL}{path}", headers=headers, params=params)
         self._log_rtt("GET", path, t0)
         self._log_http_version(resp)
-        self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -293,7 +243,6 @@ class KalshiAPI:
         resp = self.session.post(f"{self.BASE_URL}{path}", headers=headers, json=body)
         self._log_rtt("POST", path, t0)
         self._log_http_version(resp)
-        self._check_rate_limit(resp)
         if resp.status_code != 201:
             print(f"[API ERROR] {resp.status_code}: {resp.text}")
         try:
@@ -315,7 +264,6 @@ class KalshiAPI:
         )
         self._log_rtt("DELETE", path, t0)
         self._log_http_version(resp)
-        self._check_rate_limit(resp)
         if resp.status_code >= 400:
             print(f"[API ERROR] DELETE {resp.status_code}: {resp.text}")
         try:
@@ -400,8 +348,6 @@ class KalshiAPI:
         }
         if post_only:
             body["post_only"] = True
-        self._log_write(10)  # create_order = default 10 tokens
-
         t0 = time.perf_counter()
         ts_request = datetime.now(tz=timezone.utc).isoformat()
         http_status = 0
@@ -451,8 +397,6 @@ class KalshiAPI:
         return self._get(f"/portfolio/orders/{order_id}")
 
     def cancel_order(self, order_id: str) -> dict:
-        self._log_write(2)  # cancel_order = 2 tokens
-
         t0 = time.perf_counter()
         ts_request = datetime.now(tz=timezone.utc).isoformat()
         http_status = 0
@@ -508,7 +452,6 @@ class KalshiAPI:
         if not ids:
             return {"orders": []}
         body = {"orders": [{"order_id": oid} for oid in ids]}
-        self._log_write(2 * len(ids))  # 2 tokens per order in the batch
         return self._delete("/portfolio/orders/batched", body)
 
     def get_orders(self, status: str = "resting") -> list:
