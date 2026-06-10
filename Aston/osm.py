@@ -1,6 +1,7 @@
 import math
 import queue
 import threading
+import time
 import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -29,6 +30,11 @@ class PendingOp:
 
 class OSM:
 
+    SUCCESSFUL_CODES = frozenset({200, 201})
+
+    #how often to check for forgetten orders
+    SWEEP_INTERVAL_S = 60.0
+
     def __init__(self, ticker, tolerance, api, max_position,
                  position: int = 0, strategy_queue=None):
         self.ticker = ticker
@@ -36,10 +42,7 @@ class OSM:
         self.api = api
         self.max_position = max_position
         self.queue = queue.Queue()
-        self.running = False
-        # Strategy's queue — OSM forwards parsed fills here so Strategy
-        # can update position without touching Kalshi WS schemas itself.
-        self.strategy_queue = strategy_queue
+        self.running = False 
 
         # What Strategy wants
         self.desired_bid_price: float | None = None
@@ -73,6 +76,9 @@ class OSM:
         # when the place lands.
         self._orphan_fills: dict[str, list[dict]] = {}
 
+        #forgotten orders last checked time
+        self._last_sweep = time.time()
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -101,11 +107,17 @@ class OSM:
                 # State updates from external sources
                 elif header == "FILL":           self._handle_fill(payload)
                 elif header == "API_RESPONSE":   self._handle_api_response(payload)
-                # Self-driven recovery
-                elif header == "PROBE_RESULT":   self._handle_probe_result(payload)
-                elif header == "RECONCILE":      self._reconcile_both()
+                #pushed by self when the queue is sempty
+                elif header == "SWEEP_RESULT":  self._handle_sweep_result(payload)
             except queue.Empty:
+                if time.time() - self._last_sweep > self.SWEEP_INTERVAL_S:
+                    try:
+                        self._start_sweep()
+                    except Exception as e:
+                        print(f"[OSM] sweep error: {e}")
                 continue
+            except Exception as e:
+              print(f"[OSM] handler error on {header}: {e}")
 
     # ------------------------------------------------------------------
     # Public commands (Strategy calls these)
@@ -186,7 +198,6 @@ class OSM:
 
         # Clear local state.  Whatever didn't land in time is a
         # best-effort orphan — the next session's recorder + OSM
-        # probe-on-startup logic would surface it.
         self.resting_bid = None
         self.resting_ask = None
         self.desired_bid_price = None
@@ -232,7 +243,7 @@ class OSM:
             # Teardown in progress — reject new placements.
             return
         price, requested_size = tup
-        sz = min(int(requested_size), self._remaining_bid_capacity())
+        sz = self._get_bid_size(requested_size)
         if sz <= 0:
             # No room left under max_position — drop any resting bid.
             self.desired_bid_price = None
@@ -247,7 +258,7 @@ class OSM:
         if self._stopping:
             return
         price, requested_size = tup
-        sz = min(int(requested_size), self._remaining_ask_capacity())
+        sz = self._get_ask_size(requested_size)
         if sz <= 0:
             self.desired_ask_price = None
             self.desired_ask_size = None
@@ -257,17 +268,19 @@ class OSM:
         self.desired_ask_size = sz
         self._reconcile_ask()
 
-    def _remaining_bid_capacity(self) -> int:
+    def _get_bid_size(self, requested_size) -> int:
         # effective_long = current long + resting bid (would add to long)
         resting = self.resting_bid.size if self.resting_bid else 0
         effective_long = max(self.position, 0) + resting
-        return max(self.max_position - effective_long, 0)
+        available_capacity =  max(self.max_position - effective_long, 0)
+        return min(int(requested_size), available_capacity)
 
-    def _remaining_ask_capacity(self) -> int:
+    def _get_ask_size(self, requested_size) -> int:
         # effective_short = current short + resting ask (would add to short)
         resting = self.resting_ask.size if self.resting_ask else 0
         effective_short = max(-self.position, 0) + resting
-        return max(self.max_position - effective_short, 0)
+        available_capacity =  max(self.max_position - effective_short, 0)
+        return min(int(requested_size), available_capacity)
 
     def _handle_cancel_bid(self):
         self.desired_bid_price = None
@@ -307,6 +320,7 @@ class OSM:
         # 1. Dedupe by trade_id — WS reconnects can replay events.
         trade_id = msg.get("trade_id", "")
         if trade_id and trade_id in self._seen_trade_ids:
+            print(f"[OSM], _handle_fill, Already seen trade id: {trade_id}")
             return
         if trade_id:
             self._seen_trade_ids.add(trade_id)
@@ -321,8 +335,10 @@ class OSM:
         try:
             count = float(msg.get("count_fp", 0) or 0)
         except (TypeError, ValueError):
+            print(f"[OSM], _handle_fill, unable to parse count for order id: {order_id}")
             return
         if count <= 0:
+            print(f"[OSM], _handle_fill, count less than 0 for order id: {order_id}, count={count}")
             return
 
         # 4. Match against resting bid/ask by order_id; otherwise buffer
@@ -334,29 +350,17 @@ class OSM:
         else:
             self._orphan_fills.setdefault(order_id, []).append(msg)
 
-        # 5. Update net position.  Aston only trades the yes side, so
-        #    BUY adds and SELL subtracts.  Dedupe at step 1 ensures this
-        #    is increment-once-per-fill even on WS replays.
+        # 5. Update net position.
         action = (msg.get("action") or "").lower()
         if action == "buy":
             self.position += int(count)
         elif action == "sell":
             self.position -= int(count)
 
-        # 6. Forward clean derived event to Strategy for any
-        #    fill-driven logic (Strategy itself reads position from
-        #    osm.position now; this hook is retained for diagnostics).
-        if self.strategy_queue is not None:
-            self.strategy_queue.put(("FILL", {
-                "action": msg.get("action", ""),
-                "count":  count,
-                "price":  float(msg.get("yes_price_dollars", 0) or 0),
-            }))
-
         self._reconcile_both()
 
     def _apply_fill_to_side(self, side: str, count: float):
-        """Decrement resting size; clear the side if fully consumed."""
+        #Decrement resting size; clear the side if fully consumed
         quote = self.resting_bid if side == "bid" else self.resting_ask
         if quote is None:
             return
@@ -368,93 +372,54 @@ class OSM:
                 self.resting_ask = None
 
     def _handle_api_response(self, payload):
-        req_id, ok, response_or_error = payload
+        req_id, response_or_error = payload
         op = self.pending_ops.pop(req_id, None)
         if op is None:
             return
-
-        if ok:
+        
+        if int(response_or_error['status_code']) in self.SUCCESSFUL_CODES:
+            # Success path: state advanced (resting set on place, resting
+            # cleared on cancel) — reconcile immediately so the next step
+            # in the cancel→place sequence fires without waiting for a
+            # BBO/theo tick.
             self._handle_api_success(op, response_or_error)
+            self._reconcile_both()
         else:
-            self._handle_api_failure(op, response_or_error)
-        self._reconcile_both()
+            self._handle_api_error(op, response_or_error)
 
-    def _handle_api_failure(self, op: PendingOp, error: str):
-        err = error.lower()
-        is_terminal = ("404" in err
-                        or "400" in err
-                        or "not_found" in err
-                        or "already" in err)          # already filled/cancelled
-        is_transient = ("timeout" in err
-                        or "500" in err
-                        or "502" in err
-                        or "503" in err
-                        or "connection" in err)
-        # EAGAIN/EWOULDBLOCK on the local socket write — the HTTP request
-        # was very likely sent to Kalshi and accepted before the kernel
-        # raised the local error.  Treated as ORPHAN_RISK: for place
-        # ops, probe Kalshi to discover any order that landed without
-        # our seeing the server_order_id.  Without the probe these
-        # become invisible resting orders that get picked off on
-        # adverse theo drift (see 2026-05-22 stale-no-cancel analysis).
-        is_orphan_risk = ("errno 35" in err
-                        or "errno 11" in err               # EAGAIN linux
-                        or "temporarily unavailable" in err)
+    def _handle_api_error(self, op: PendingOp, error_payload: dict):
+        status_code = error_payload['status_code']
+        # Kalshi wraps most errors as {"error": {"code": ..., "message": ...}}.
+        # CDN/gateway responses and our network-exception envelope put the
+        # fields at top level — fall through to that shape too.
+        err = error_payload.get('error') or error_payload
+        message = err.get('message', '') if isinstance(err, dict) else str(err)
 
-        # NOTE: probe path is disabled (2026-05-21).  It was clearing
-        # `resting_*` based on transient get_orders snapshots from
-        # Kalshi (which sometimes omit orders mid-transition), causing
-        # orphaned orders on Kalshi when OSM placed a fresh order on
-        # top of an already-resting one.  Self-healing via natural
-        # retry on the next reconcile cycle is now the recovery path
-        # for cancel transients; place transients accept a small risk
-        # of duplicate order until the next reconcile cycle re-cancels.
+        # 404 on cancel means Kalshi has no record of this order (already
+        # filled or already cancelled).  Clear local resting state so we
+        # don't ghost-cancel it on every BBO tick.
+        if op.kind == "cancel" and status_code == 404:
+            self._clear_resting(op.side)
 
-        if op.kind == "cancel":
-            if is_terminal:
-                # Kalshi confirms the order is gone (already filled or already
-                # cancelled).  Clear resting state for this side.
-                self._clear_resting(op.side)
-            elif is_transient:
-                # Ambiguous — leave resting in place; the next reconcile
-                # will re-issue the cancel naturally on the next theo tick.
-                # Self-healing without the probe race.
-                print(f"[OSM] transient cancel error (will retry): {error}")
-            else:
-                # Unknown error — same path as transient: leave state alone,
-                # let next reconcile handle it.
-                print(f"[OSM] unexpected cancel error (will retry): {error}")
-
-        elif op.kind == "place":
-            if is_terminal:
-                # Place rejected (invalid price, post-only would cross, etc.).
-                # No order created.  Resting stays None; reconcile will retry
-                # if desired is still set.
-                pass
-            elif is_orphan_risk:
-                # EAGAIN/local-socket error: the POST almost certainly hit
-                # Kalshi before the kernel raised the error.  Probe to find
-                # any order that landed under op.price so we can record
-                # the server_order_id (and cancel it on the next reprice).
-                # Scoped to this failure mode so the probe doesn't run on
-                # every reconcile — the original disable-reason (2026-05-21)
-                # was probe-vs-place races during normal flow, which this
-                # narrow trigger avoids.
-                print(f"[OSM] orphan-risk place error → probing {op.side}: {error}")
-                self._schedule_probe(op.side, expected_price=op.price)
-            elif is_transient:
-                # Ambiguous — order may or may not have been placed.  Without
-                # a probe we can't tell.  If it landed, the next reconcile
-                # cycle will see resting=None locally but a desired price,
-                # fire another place → double order.  Mitigated by: (a) this
-                # path is rare since places are post-only and usually return
-                # 200 or 400, and (b) the next reconcile will fire a cancel
-                # against the duplicate as soon as a fresh BBO tick reveals
-                # the price gap.  See periodic-sweep TODO if this becomes
-                # an observed issue.
-                print(f"[OSM] transient place error (may duplicate): {error}")
-            else:
-                print(f"[OSM] unexpected place error: {error}")
+        if status_code == 400:
+            print(f'[OSM] BadRequestError on {op.kind} {op.side}: {message}')
+        elif status_code == 401:
+            print(f'[OSM] UnauthorizedError on {op.kind} {op.side}: {message}')
+        elif status_code == 404:
+            print(f'[OSM] NotFoundError on {op.kind} {op.side}: {message}')
+        elif status_code == 409:
+            print(f'[OSM] ConflictError on {op.kind} {op.side}: {message}')
+        elif status_code == 429:
+            # api.is_rate_limited() is set inside _check_rate_limit on the
+            # 429 response.  Subsequent _send_place calls are gated until
+            # cooldown elapses; nothing extra to do here.
+            print(f'[OSM] RateLimitError on {op.kind} {op.side}: {message}')
+        elif status_code == 500:
+            print(f'[OSM] InternalServerError on {op.kind} {op.side}: {message}')
+        elif status_code == 0:
+            print(f'[OSM] network exception on {op.kind} {op.side}: {message}')
+        else:
+            print(f'[OSM] unexpected status {status_code} on {op.kind} {op.side}: {error_payload}')
 
 
     def _handle_api_success(self, op: PendingOp, response: dict):
@@ -487,149 +452,6 @@ class OSM:
             # Cancel succeeded — resting is gone.
             self._clear_resting(op.side)
 
-    # Delay before the probe fires.  Kalshi's get_orders endpoint has
-    # eventual consistency vs order acceptance — observed 2026-05-22:
-    # orphan landed at T+0, didn't appear in get_orders until ~T+200ms
-    # (WS placed event arrived T+190ms; REST is slightly behind that).
-    # Probing too early returns empty → probe handler clears resting →
-    # reconcile fires duplicate retry → orphan stays invisible.
-    _PROBE_DELAY_S = 0.5
-
-    def _schedule_probe(self, side: str, expected_price: float | None = None):
-        """Query Kalshi for ground truth on `side`, after a short delay.
-
-        Two-step:
-          1. Register a synthetic PendingOp(kind="probe") for `side`
-             immediately so `_reconcile_{bid,ask}`'s in-flight guard
-             suppresses the duplicate-place that `_reconcile_both`
-             (called by `_handle_api_response` right after this) would
-             otherwise fire.
-          2. After `_PROBE_DELAY_S`, submit get_orders_async.  The
-             delay lets Kalshi's REST view catch up with the orphan
-             that was accepted but isn't yet visible via get_orders.
-        """
-        req_id = str(uuid.uuid4())
-        self.pending_ops[req_id] = PendingOp(
-            request_id=req_id, kind="probe", side=side,
-            price=expected_price if expected_price is not None else 0.0,
-            future=None)
-
-        def submit_probe():
-            def on_done(future):
-                try:
-                    orders = future.result()
-                    self.queue.put(("PROBE_RESULT", (req_id, side, orders)))
-                except Exception as e:
-                    # Probe HTTP failed.  Pop the placeholder so the
-                    # next reconcile can act; without this the side
-                    # stays blocked forever.
-                    self.pending_ops.pop(req_id, None)
-                    self.queue.put(("PROBE_RESULT", (req_id, side, [])))
-                    print(f"[OSM] probe failed for {side}: {e}")
-
-            f = self.api.get_orders_async("resting")
-            # Re-attach the future to the placeholder so cancel_all_sync
-            # can wait on it during teardown if needed.
-            existing_op = self.pending_ops.get(req_id)
-            if existing_op is not None:
-                existing_op.future = f
-            f.add_done_callback(on_done)
-
-        # Fire-and-forget timer; daemon so it doesn't block shutdown.
-        threading.Timer(self._PROBE_DELAY_S, submit_probe).start()
-
-    def _handle_probe_result(self, payload):
-        """Reconcile local resting_*_id against what Kalshi actually has.
-        Payload is (req_id, side, orders).  req_id is the synthetic
-        PendingOp placeholder registered by `_schedule_probe`; we pop
-        it BEFORE the in-flight check so this probe's own placeholder
-        doesn't make the result look stale.
-        """
-        req_id, side, orders = payload
-        op = self.pending_ops.pop(req_id, None)
-        expected_price = op.price if op is not None else None
-
-        # If something OTHER than this probe is in flight for this side
-        # (e.g. a fill-triggered cancel landed concurrently), defer —
-        # the in-flight op will decide state.
-        if any(o.side == side for o in self.pending_ops.values()):
-            print(f"[OSM] probe result for {side} stale (other op in flight)")
-            return
-
-        action = "buy" if side == "bid" else "sell"
-        ours = [o for o in orders
-                if o.get("ticker") == self.ticker
-                and o.get("action") == action]
-
-        if not ours:
-            # Kalshi has no order for us on this side — clear stale state.
-            if side == "bid" and self.resting_bid is not None:
-                print(f"[OSM] probe: clearing stale resting_bid "
-                      f"(was {self.resting_bid})")
-                self.resting_bid = None
-            elif side == "ask" and self.resting_ask is not None:
-                print(f"[OSM] probe: clearing stale resting_ask "
-                      f"(was {self.resting_ask})")
-                self.resting_ask = None
-        else:
-            # Kalshi has at least one order on this side.  EAGAIN'd
-            # creates produce duplicates at the SAME price as the
-            # successful retry (theo barely moves between attempts),
-            # so price matching alone can't pick the orphan.  Use
-            # order_id: the orphan is the order OSM doesn't already
-            # know about (not in resting_*).
-            existing = self.resting_bid if side == "bid" else self.resting_ask
-            known_id = existing.order_id if existing is not None else None
-            unknown = [o for o in ours if o.get("order_id") != known_id]
-
-            if not unknown:
-                # All orders on this side are already tracked — probe
-                # raced the orphan's landing (Kalshi snapshot pre-orphan)
-                # or false-positive.  Leave state untouched.
-                print(f"[OSM] probe: all {len(ours)} order(s) on {side} "
-                      f"already tracked; no orphan adopted")
-                self._reconcile_both()
-                return
-
-            # Pick the unknown order to adopt.  If multiple unknowns,
-            # prefer one matching expected_price.
-            chosen = None
-            if expected_price is not None:
-                for o in unknown:
-                    try:
-                        p = float(o.get("yes_price_dollars", 0) or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    if abs(p - expected_price) < 1e-6:
-                        chosen = o
-                        break
-            if chosen is None:
-                chosen = unknown[0]
-
-            try:
-                order_id = chosen.get("order_id")
-                price = float(chosen.get("yes_price_dollars", 0) or 0)
-                remaining = int(float(chosen.get("remaining_count_fp", 0) or 0))
-            except (TypeError, ValueError):
-                return
-            q = Quote(order_id=order_id, price=price, size=remaining)
-
-            # If we're displacing an already-tracked order from
-            # resting_*, that order is now unowned — cancel it
-            # directly so it doesn't become a NEW orphan.
-            if existing is not None and existing.order_id != order_id:
-                print(f"[OSM] probe: adopting orphan {q}; "
-                      f"cancelling displaced {existing.order_id[:8]}")
-                self._send_cancel(side, existing.order_id)
-
-            if side == "bid":
-                self.resting_bid = q
-            else:
-                self.resting_ask = q
-            print(f"[OSM] probe: resting_{side} = {q}")
-
-        self._reconcile_both()
-
     # ------------------------------------------------------------------
     # Reconcile — drive resting toward desired (level-triggered)
     # ------------------------------------------------------------------
@@ -648,13 +470,19 @@ class OSM:
     def _reconcile_ask(self):
         if any(op.side == 'ask' for op in self.pending_ops.values()):
             return #something still  in flight
-        
+
         d, r, s = self.desired_ask_price, self.resting_ask, self.desired_ask_size
         self._reconcile_action("ask", d, r, s)
 
     def _reconcile_action(self, side: str, d: float, r: Quote, s: int):
         # No desired orders nor resting orders
         if d is None and r is None:
+            return
+
+        # Snap once so all comparisons (memo + price-equality with resting)
+        # use the value Kalshi will actually see.
+        snapped_d = self._round_to_tick(d, side) if d is not None else None
+        if snapped_d is not None and r is not None and snapped_d == r.price:
             return
         
         #if the desired price does not differ from resting price by more than tolerance
@@ -667,8 +495,7 @@ class OSM:
             #no order desired so cancel resting order
             self._send_cancel(side, r.order_id)
         elif d is not None and r is None:
-            #good to place new order since we have no resting orders
-            self._send_place(side, d, s)
+            self._send_place(side, snapped_d, s)
         elif d is not None and r is not None:
             # Want to cancel the resting order and place a new order at the desired price
             self._send_cancel(side, r.order_id)
@@ -677,28 +504,92 @@ class OSM:
     # API call primitives
     # ------------------------------------------------------------------
     def _send_place(self, side, price, size):
-        # Snap to Kalshi tick grid OUTWARD (bid floors, ask ceils) so
-        # we never accidentally cross the spread.  Single chokepoint
-        # to the Kalshi API means no path bypasses this.
-        snapped = self._round_to_tick(price, side)
+        # Global API rate-limit gate
+        if self.api.is_rate_limited():
+            return
+        
+        req_id = str(uuid.uuid4())
+
+        # callback once we get a response
+        # handle errors or successes approiately 
+        def on_done(future):
+            try:
+                resp = future.result()
+                self.queue.put(("API_RESPONSE", (req_id, resp)))
+            except Exception as e:
+                error = {}
+                error['message'] = f"{type(e).__name__}: {e}"
+                error['status_code'] = 0
+                self.queue.put(("API_RESPONSE", (req_id, error)))
+
+        f = self.api.create_order_async(
+            ticker=self.ticker, side="yes",
+            action="buy" if side == "bid" else "sell",
+            price_dollars=f"{price:.3f}", count=size,
+            tag="aston", post_only=True,
+        )
+        self.pending_ops[req_id] = PendingOp(
+            request_id=req_id, kind="place", side=side, price=price, future=f)
+        f.add_done_callback(on_done)
+
+    def _send_cancel(self, side, order_id):
+        # Cancels are not rate-gated.  Risk management (clearing stale
+        # orders) takes priority over rate-limit hygiene; cancels also
+        # cost only 2 tokens vs 10 for places.  A rejected cancel will
+        # naturally re-fire on the next reconcile cycle.
         req_id = str(uuid.uuid4())
 
         def on_done(future):
             try:
                 resp = future.result()
-                self.queue.put(("API_RESPONSE", (req_id, True, resp)))
+                self.queue.put(("API_RESPONSE", (req_id, resp)))
             except Exception as e:
-                self.queue.put(("API_RESPONSE", (req_id, False, str(e))))
+                error = {}
+                error['message'] = f"{type(e).__name__}: {e}"
+                error['status_code'] = 0
+                self.queue.put(("API_RESPONSE", (req_id, error)))
 
-        f = self.api.create_order_async(
-            ticker=self.ticker, side="yes",
-            action="buy" if side == "bid" else "sell",
-            price_dollars=f"{snapped:.3f}", count=size,
-            tag="aston", post_only=True,
-        )
+        f = self.api.cancel_order_async(order_id)
         self.pending_ops[req_id] = PendingOp(
-            request_id=req_id, kind="place", side=side, price=snapped, future=f)
+            request_id=req_id, kind="cancel", side=side, price=0.0, future=f)
         f.add_done_callback(on_done)
+
+    # ------------------------------------------------------------------
+    # Detect forgetten orders 
+    # ------------------------------------------------------------------
+
+    def _start_sweep(self):
+        #update time for last time we swept through and checked
+        self._last_sweep = time.time()
+        # An in-flight place is live on Kalshi but not yet in resting_* —
+        # it would look like an orphan.  Skip this round; retry in 60s.
+        if self.pending_ops:
+            return
+
+        def on_done(future):
+            try:
+                self.queue.put(("SWEEP_RESULT", future.result()))
+            except Exception:
+                pass  # best-effort; next interval retries
+        print(f"[OSM] Starting Sweep...")
+        f = self.api.get_orders_async(status="resting")
+        f.add_done_callback(on_done)
+
+    def _handle_sweep_result(self, orders):
+      if self.pending_ops:
+          return  # state moved while the fetch was in flight; skip
+      known = {q.order_id for q in (self.resting_bid, self.resting_ask) if q}
+      for order in orders:
+          if order.get("ticker") != self.ticker:        # only OUR market
+              continue
+          oid = order.get("order_id")
+          if oid and oid not in known:
+              print(f"[OSM] sweep: cancelling orphan {oid}")
+              self.api.cancel_order_async(oid)
+
+    # ------------------------------------------------------------------
+    # Static helper
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _round_to_tick(price: float, side: str) -> float:
@@ -711,18 +602,3 @@ class OSM:
         if side == "bid":
             return max(math.floor(price * grid) / grid, 0.001)
         return min(math.ceil(price * grid) / grid, 0.999)
-
-    def _send_cancel(self, side, order_id):
-        req_id = str(uuid.uuid4())
-
-        def on_done(future):
-            try:
-                resp = future.result()
-                self.queue.put(("API_RESPONSE", (req_id, True, resp)))
-            except Exception as e:
-                self.queue.put(("API_RESPONSE", (req_id, False, str(e))))
-
-        f = self.api.cancel_order_async(order_id)
-        self.pending_ops[req_id] = PendingOp(
-            request_id=req_id, kind="cancel", side=side, price=0.0, future=f)
-        f.add_done_callback(on_done)

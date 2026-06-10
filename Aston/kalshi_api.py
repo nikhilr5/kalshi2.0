@@ -83,16 +83,25 @@ class KalshiAPI:
         # that's 40-100ms saved per cycle.  httpx.Client with http2=True
         # also multiplexes concurrent requests over a single connection,
         # cutting head-of-line blocking vs HTTP/1.1.
-        self.session = httpx.Client(http2=True, timeout=10.0)
+        # Connection limits bound how many sockets a burst can pressure —
+        # errno 35 (EAGAIN) orphans came from bursts saturating the
+        # connection's TCP buffers.
+        self.session = httpx.Client(
+            http2=True,
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+            timeout=10.0,
+        )
         # One-shot flag — prints negotiated HTTP version on the first
         # response so we can confirm HTTP/2 is actually in use rather
         # than silently falling back to HTTP/1.1.
         self._http_version_logged = False
         # Worker pool for non-blocking order writes (cancel/place).
-        # Sized for concurrent reprices across strikes — one round-trip per
-        # call, mostly idle on network IO so threads are cheap.
+        # Legitimate concurrency is ~3-5 requests (OSM in-flight guard
+        # allows ~2 order ops + sweep read + occasional position fetch);
+        # 8 leaves headroom while capping how hard a burst can hit the
+        # socket (20 workers let 429-resume herds trigger EAGAIN).
         self._executor = ThreadPoolExecutor(
-            max_workers=20, thread_name_prefix="kalshi-rest"
+            max_workers=8, thread_name_prefix="kalshi-rest"
         )
         # Rolling log of write-token consumption — used to compute
         # tokens/sec for display.  Each entry: (monotonic_ts, tokens).
@@ -278,7 +287,8 @@ class KalshiAPI:
     def _post(self, path: str, body: dict) -> dict:
         full_path = f"/trade-api/v2{path}"
         headers = self._headers("POST", full_path)
-        print(f"[API POST] {path} body={body}")
+        ts = datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds")
+        print(f"[API POST] {ts} {path} body={body}")
         t0 = time.perf_counter()
         resp = self.session.post(f"{self.BASE_URL}{path}", headers=headers, json=body)
         self._log_rtt("POST", path, t0)
@@ -286,16 +296,12 @@ class KalshiAPI:
         self._check_rate_limit(resp)
         if resp.status_code != 201:
             print(f"[API ERROR] {resp.status_code}: {resp.text}")
-            # Include the response body in the raised exception so the
-            # cause is visible in logs without inspecting `resp.text`
-            # separately.  Default raise_for_status() drops the body
-            # and leaves only the status line.
-            raise httpx.HTTPStatusError(
-                f"{resp.status_code} {resp.reason_phrase} for {full_path}: {resp.text}",
-                request=resp.request,
-                response=resp,
-            )
-        return resp.json()
+        try:
+            payload = resp.json()
+        except Exception:
+            # HTML 400s from the CDN, or any non-JSON response body.
+            payload = {"raw": resp.text}
+        return {"status_code": resp.status_code, **payload}
 
     def _delete(self, path: str, body: dict = None) -> dict:
         """DELETE request with full-path signing."""
@@ -310,8 +316,13 @@ class KalshiAPI:
         self._log_rtt("DELETE", path, t0)
         self._log_http_version(resp)
         self._check_rate_limit(resp)
-        resp.raise_for_status()
-        return resp.json()
+        if resp.status_code >= 400:
+            print(f"[API ERROR] DELETE {resp.status_code}: {resp.text}")
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
+        return {"status_code": resp.status_code, **payload}
 
     # --- Orderbook ---
 
@@ -400,19 +411,20 @@ class KalshiAPI:
         server_order_id: str | None = None
         try:
             resp = self._post("/portfolio/orders", body)
-            success = 1
-            http_status = 200
-            if isinstance(resp, dict):
-                server_order_id = (resp.get("order") or {}).get("order_id")
+            http_status = int(resp['status_code'])
+
+            #look at status code to determine if success placed post
+            if http_status != 201:
+                error_code = http_status
+                error_msg = json.dumps(resp or {"code": resp.get("code"), "message": resp.get("message")})[:500]
+                success = 0
+            else: 
+                success = 1
+                if isinstance(resp, dict):
+                    server_order_id = (resp.get("order") or {}).get("order_id")
             return resp
-        except httpx.HTTPStatusError as e:
-            http_status = e.response.status_code if e.response else 0
-            error_code = f"http_{http_status}"
-            error_msg = (e.response.text[:200]
-                         if e.response is not None else str(e))[:500]
-            raise
         except Exception as e:
-            error_code = "exception"
+            error_code = 0
             error_msg = str(e)[:500]
             raise
         finally:
@@ -449,17 +461,16 @@ class KalshiAPI:
         error_msg: str | None = None
         try:
             resp = self._delete(f"/portfolio/orders/{order_id}")
-            success = 1
-            http_status = 200
+            http_status = resp['status_code']
+            if http_status != 200:
+                error_code = http_status
+                error_msg = json.dumps(resp or {"code": resp.get("code"), "message": resp.get("message")})[:500]
+                success = 0
+            else: 
+                success = 1
             return resp
-        except httpx.HTTPStatusError as e:
-            http_status = e.response.status_code if e.response else 0
-            error_code = f"http_{http_status}"
-            error_msg = (e.response.text[:200]
-                         if e.response is not None else str(e))[:500]
-            raise
         except Exception as e:
-            error_code = "exception"
+            error_code = 0
             error_msg = str(e)[:500]
             raise
         finally:

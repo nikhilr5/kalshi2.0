@@ -157,6 +157,12 @@ def pnl_stats(fills):
               "lineHeight": "1.7"})
 
 
+# 2026-06-09: v2 strategy (OSM rewrite) + 3-lot orders + cap 30 went live
+# (edges stayed at the 7c/5c baseline).  Data left of this line is the
+# old config: v1 engine, 1-lot, cap 8-10.
+CONFIG_CHANGE_DATE = "2026-06-09"
+
+
 def pnl_figure(fills):
     if fills.empty:
         return go.Figure().update_layout(
@@ -183,6 +189,13 @@ def pnl_figure(fills):
     fig.add_trace(go.Bar(
         x=fills_per_day.index, y=fills_per_day.values,
         marker_color='#a78bfa'), row=3, col=1)
+    for row in (1, 2, 3):
+        fig.add_vline(x=CONFIG_CHANGE_DATE, line=dict(color='#facc15', width=2),
+                      row=row, col=1)
+    fig.add_annotation(x=CONFIG_CHANGE_DATE, y=1, yref='paper',
+                       text="v2 + 3-lot", showarrow=False,
+                       font=dict(color='#facc15', size=11),
+                       xanchor='left', yanchor='top')
     fig.update_yaxes(title_text='$', row=1, col=1)
     fig.update_yaxes(title_text='$', row=2, col=1)
     fig.update_yaxes(title_text='fills', row=3, col=1)

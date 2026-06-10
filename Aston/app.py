@@ -349,6 +349,22 @@ class AstonApp(QMainWindow):
         series_box.addWidget(self.series_combo)
         header.addLayout(series_box)
 
+        # STRATEGY badge — bright, unmissable indicator of which engine
+        # is driving orders.  v1 = legacy Strategy, v2 = Strategy2 + OSM.
+        strat_box = QVBoxLayout()
+        strat_box.setSpacing(4)
+        strat_title = QLabel("STRATEGY")
+        strat_title.setObjectName("metricTitle")
+        strat_box.addWidget(strat_title)
+        self.strategy_badge = QLabel(f"v{self.strategy_version}")
+        self.strategy_badge.setFont(QFont("Menlo", 18, QFont.Weight.Bold))
+        badge_color = "#22c55e" if self.strategy_version == 2 else "#facc15"
+        self.strategy_badge.setStyleSheet(
+            f"color:{badge_color};background:transparent;border:1px solid {badge_color};"
+            "border-radius:4px;padding:2px 10px;")
+        strat_box.addWidget(self.strategy_badge)
+        header.addLayout(strat_box)
+
         # Cash — pulled from /portfolio/balance every 60s.
         cash_box = QVBoxLayout()
         cash_box.setSpacing(4)
@@ -1544,10 +1560,15 @@ class AstonApp(QMainWindow):
 
 def main():
     import argparse
+    from pathlib import Path
+    from tee_log import install
+    install("aston", Path(__file__).resolve().parents[1] / "logs" / "Aston")
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("-s", "--strategy", type=int, choices=[1, 2], default=1,
+    ap.add_argument("-s", "--strategy", type=int, choices=[1, 2], default=2,
                     help="1 = legacy Strategy, 2 = Strategy2 + OSM")
     args, qt_argv = ap.parse_known_args()
+    print(f"[Aston] launching with Strategy v{args.strategy}")
 
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(qt_argv)
