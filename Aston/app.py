@@ -499,8 +499,8 @@ class AstonApp(QMainWindow):
         # so price/size update synchronously with quote placement.  No
         # REST polling.
         self.orders_table = QTableWidget()
-        self.orders_table.setColumnCount(3)
-        self.orders_table.setHorizontalHeaderLabels(["Side", "Price", "Size"])
+        self.orders_table.setColumnCount(4)
+        self.orders_table.setHorizontalHeaderLabels(["Side", "Price", "Size", "Age"])
         self.orders_table.setRowCount(2)
         self.orders_table.verticalHeader().setVisible(False)
         self.orders_table.setEditTriggers(
@@ -509,7 +509,7 @@ class AstonApp(QMainWindow):
             QTableWidget.SelectionBehavior.SelectRows)
         oh = self.orders_table.horizontalHeader()
         oh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for i, w in enumerate([90, 110, 90]):
+        for i, w in enumerate([90, 110, 90, 80]):
             self.orders_table.setColumnWidth(i, w)
         self.orders_table.setMaximumHeight(96)
         self.orders_table.setMinimumHeight(80)
@@ -579,16 +579,23 @@ class AstonApp(QMainWindow):
             tol_cents *= 100
         self.tolerance_input = self._make_compact_double_spin(
             "Tolerance (¢)", tol_cents, 0.0, 20.0, 0.1, decimals=1)
+        # Dwell — min seconds a resting quote lives before it may be
+        # cancel-replaced (reprice churn damper; pulls unaffected).
+        self.dwell_input = self._make_compact_double_spin(
+            "Dwell (s)", float(self.settings.get("dwell_s", 1.0)),
+            0.0, 10.0, 0.1, decimals=1)
 
         for w in (self.edge_bid_input, self.edge_ask_input,
                   self.size_bid_input, self.size_ask_input,
-                  self.max_pos_input, self.tolerance_input):
+                  self.max_pos_input, self.tolerance_input,
+                  self.dwell_input):
             sp.addLayout(w)
         sp.addStretch()
 
         for spin in (self.edge_bid_input.spin, self.edge_ask_input.spin,
                      self.size_bid_input.spin, self.size_ask_input.spin,
-                     self.max_pos_input.spin, self.tolerance_input.spin):
+                     self.max_pos_input.spin, self.tolerance_input.spin,
+                     self.dwell_input.spin):
             spin.valueChanged.connect(self._on_param_changed)
 
         self.settings_panel.setVisible(False)
@@ -1003,8 +1010,11 @@ class AstonApp(QMainWindow):
             return
         self._position = position
         self._avg_entry = avg_entry
-        if self.strategy:
-            self.strategy.position = position
+        # v2: OSM owns position.  If it's already running (always-on
+        # auto-engage racing this REST fetch on restart), push the seed
+        # through its queue — applied only if no WS fills arrived yet.
+        if self.osm:
+            self.osm.seed_position(position)
         if position != 0:
             print(f"[Seed] {self.ticker} pos={position:+d} "
                   f"avg={avg_entry*100:.1f}¢")
@@ -1205,6 +1215,7 @@ class AstonApp(QMainWindow):
                 size_ask=self.size_ask_input.spin.value(),
                 max_position=self.max_pos_input.spin.value(),
                 tolerance=self.tolerance_input.spin.value() / 100.0,
+                dwell_s=self.dwell_input.spin.value(),
             )
 
     def _save_current_params(self):
@@ -1214,6 +1225,7 @@ class AstonApp(QMainWindow):
         self.settings["size_ask"] = self.size_ask_input.spin.value()
         self.settings["max_position"] = self.max_pos_input.spin.value()
         self.settings["tolerance"] = self.tolerance_input.spin.value()
+        self.settings["dwell_s"] = self.dwell_input.spin.value()
         _save_settings(self.settings)
 
     # ------------------------------------------------------------------
@@ -1265,11 +1277,14 @@ class AstonApp(QMainWindow):
             self.time_card.bottom.setText("--")
 
         # Yes bid / ask in CENTS — 1 decimal so tenths-of-cent ticks
-        # are visible.  Internal `self.yes_bid` stays in dollar units.
+        # are visible, with the resting size at that level in parens.
+        # Internal `self.yes_bid` stays in dollar units.
+        bid_sz = f" ({self.bid_size})" if self.bid_size > 0 else ""
+        ask_sz = f" ({self.ask_size})" if self.ask_size > 0 else ""
         self.bid_card.value.setText(
-            f"{self.yes_bid * 100:.1f}¢" if self.yes_bid > 0 else "--")
+            f"{self.yes_bid * 100:.1f}¢{bid_sz}" if self.yes_bid > 0 else "--")
         self.ask_card.value.setText(
-            f"{self.yes_ask * 100:.1f}¢" if self.yes_ask > 0 else "--")
+            f"{self.yes_ask * 100:.1f}¢{ask_sz}" if self.yes_ask > 0 else "--")
 
         # Theo in cents
         if self._last_theo is not None:
@@ -1418,8 +1433,14 @@ class AstonApp(QMainWindow):
         """
         strat = self.strategy
 
+        def _fmt_age(age_s: float | None) -> str:
+            if age_s is None or age_s < 0:
+                return "--"
+            return f"{age_s * 1000:,.0f}ms"
+
         def _set(row: int, side_label: str, side_color: str,
-                 price_dollars: float | None, size: int):
+                 price_dollars: float | None, size: int,
+                 age_s: float | None = None):
             price_text = (f"{price_dollars * 100:.1f}¢"
                           if price_dollars and price_dollars > 0 else "--")
             size_text = f"{size}" if size > 0 else "--"
@@ -1427,6 +1448,7 @@ class AstonApp(QMainWindow):
                 (side_label, side_color, True),
                 (price_text, "#facc15", False),
                 (size_text, "#c8cdd5", False),
+                (_fmt_age(age_s), "#8b95a5", False),
             ]
             for c, (text, color, bold) in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -1445,20 +1467,25 @@ class AstonApp(QMainWindow):
         # implementations render without needing isinstance checks.
         osm = getattr(strat, "osm", None)
         if osm is not None:
+            now = time.time()
+            def _age(q):
+                return (now - q.placed_at) if (q and q.placed_at > 0) else None
             bid_q = osm.resting_bid
             ask_q = osm.resting_ask
             buy_price = bid_q.price if bid_q else None
             buy_size = bid_q.size if bid_q else 0
             sell_price = ask_q.price if ask_q else None
             sell_size = ask_q.size if ask_q else 0
+            buy_age, sell_age = _age(bid_q), _age(ask_q)
         else:
             buy_price = strat.current_buy_price
             buy_size = strat.resting_buy_count
             sell_price = strat.current_sell_price
             sell_size = strat.resting_sell_count
+            buy_age = sell_age = None
 
-        _set(0, "BUY",  "#22c55e", buy_price,  buy_size)
-        _set(1, "SELL", "#ef4444", sell_price, sell_size)
+        _set(0, "BUY",  "#22c55e", buy_price,  buy_size,  buy_age)
+        _set(1, "SELL", "#ef4444", sell_price, sell_size, sell_age)
 
     # ------------------------------------------------------------------
     # Shutdown

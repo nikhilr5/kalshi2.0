@@ -23,9 +23,6 @@ from cryptography.hazmat.primitives.asymmetric import padding
 _MONTHS_UC = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
-_CANCEL_TOKEN_COST = 20
-_CREATE_TOKEN_COST = 100
-
 
 def _attempt_log_path(base_dir: Path) -> Path:
     """`order_attempts-{YYMONDD}.jsonl` in the recorder's data dir."""

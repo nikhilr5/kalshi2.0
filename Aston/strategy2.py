@@ -49,11 +49,12 @@ class Strategy2:
         self.queue.put(('THEO', theo))
 
     def update_params(self, edge_bid, edge_ask, size_bid, size_ask,
-                    max_position, tolerance=0.01):
+                    max_position, tolerance=0.01, dwell_s=1.0):
       self.queue.put(('SETTINGS', {
           "edge_bid": edge_bid, "edge_ask": edge_ask,
           "size_bid": size_bid, "size_ask": size_ask,
           "max_position": max_position, "tolerance": tolerance,
+          "dwell_s": dwell_s,
       }))
 
     def update_bbo(self, bbo: tuple):
@@ -135,3 +136,4 @@ class Strategy2:
       # tolerance + max_position live in OSM — forward via its queue.
       self.osm.update_tolerance(payload["tolerance"])
       self.osm.update_max_position(payload["max_position"])
+      self.osm.update_dwell(payload.get("dwell_s", 1.0))

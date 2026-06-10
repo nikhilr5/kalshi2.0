@@ -12,6 +12,7 @@ class Quote:
     order_id: str
     price: float
     size: int
+    placed_at: float = 0.0   # time.time() when the place response landed
 
 
 @dataclass
@@ -36,9 +37,13 @@ class OSM:
     SWEEP_INTERVAL_S = 60.0
 
     def __init__(self, ticker, tolerance, api, max_position,
-                 position: int = 0, strategy_queue=None, gateway=None):
+                 position: int = 0, strategy_queue=None, gateway=None,
+                 dwell_s: float = 1.0):
         self.ticker = ticker
         self.tolerance = tolerance
+        # Min rest time before a quote may be cancel-replaced (reprice
+        # only — risk pulls are never dwell-gated).  UI-adjustable.
+        self.dwell_s = float(dwell_s)
         self.api = api
         # Exchange-interaction policy layer (token budget, response
         # normalization).  app.py should inject a process-lifetime
@@ -111,7 +116,9 @@ class OSM:
                 elif header == "CANCEL_ASK":     self._handle_cancel_ask()
                 elif header == "CANCEL_ALL":     self._handle_cancel_all()
                 elif header == "UPDATE_TOLERANCE":  self._handle_update_tolerance(payload)
+                elif header == "UPDATE_DWELL":   self._handle_update_dwell(payload)
                 elif header == "UPDATE_MAX_POSITION": self._handle_update_max_position(payload)
+                elif header == "SEED_POSITION":  self._handle_seed_position(payload)
                 # State updates from external sources
                 elif header == "FILL":           self._handle_fill(payload)
                 elif header == "API_RESPONSE":   self._handle_api_response(payload)
@@ -217,6 +224,16 @@ class OSM:
     def update_max_position(self, max_position: int):
       self.queue.put(("UPDATE_MAX_POSITION", int(max_position)))
 
+    def update_dwell(self, dwell_s: float):
+      self.queue.put(("UPDATE_DWELL", float(dwell_s)))
+
+    def seed_position(self, position: int):
+        """Late position seed from a REST fetch that finished after this
+        OSM was constructed (restart + always-on race).  Applied on the
+        worker thread, and only if no WS fills have arrived yet — fills
+        are the live source of truth once they start flowing."""
+        self.queue.put(("SEED_POSITION", int(position)))
+
     # ------------------------------------------------------------------
     # Public read-only state (Strategy reads these)
     # ------------------------------------------------------------------
@@ -315,10 +332,20 @@ class OSM:
       # mismatch actionable that wasn't before
       self._reconcile_both()
 
+    def _handle_update_dwell(self, dwell_s):
+      self.dwell_s = float(dwell_s)
+
     def _handle_update_max_position(self, max_position):
       self.max_position = int(max_position)
       # Next ENSURE_BID/ASK will pick up the new cap automatically.
       # No reconcile needed — resting sizes don't change retroactively.
+
+    def _handle_seed_position(self, position):
+        # Only apply if WS fills haven't already established the truth.
+        if self.position == 0 and not self._seen_trade_ids:
+            self.position = int(position)
+            if position != 0:
+                print(f"[OSM] position seeded from REST: {position:+d}")
 
     # ------------------------------------------------------------------
     # WS event handlers
@@ -437,7 +464,8 @@ class OSM:
             order_id = order.get("order_id")
             remaining = int(float(order.get("remaining_count_fp", 0) or 0))
             if remaining > 0:
-                q = Quote(order_id=order_id, price=op.price, size=remaining)
+                q = Quote(order_id=order_id, price=op.price, size=remaining,
+                          placed_at=time.time())
                 if op.side == "bid":  self.resting_bid = q
                 else:                 self.resting_ask = q
                 # Drain any orphan fills buffered for this order_id (fill
@@ -506,7 +534,11 @@ class OSM:
         elif d is not None and r is None:
             self._send_place(side, snapped_d, s)
         elif d is not None and r is not None:
-            # Want to cancel the resting order and place a new order at the desired price
+            # Reprice — let a fresh quote rest (dwell) before chasing
+            # theo.  Pulls (d is None) above are never dwell-gated.
+            if time.time() - r.placed_at < self.dwell_s:
+                print('[OSM], _reconcile_action, Letting quote dwell so not placing order=$', snapped_d, ' side=', side)
+                return
             self._send_cancel(side, r.order_id)
 
     # ------------------------------------------------------------------

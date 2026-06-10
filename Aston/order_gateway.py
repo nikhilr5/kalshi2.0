@@ -18,10 +18,12 @@ Lives for the whole process (app.py owns it), so the budget survives
 the per-market OSM teardown/rebuild at every 15-minute roll.
 """
 
-from kalshi_api import _CREATE_TOKEN_COST, _CANCEL_TOKEN_COST
 from token_bucket import TokenBucket
 
 
+_CANCEL_TOKEN_COST = 20
+_CREATE_TOKEN_COST = 100
+_CANCEL_RESERVE = 40
 class OrderGateway:
 
     def __init__(self, api):
@@ -46,10 +48,11 @@ class OrderGateway:
     # Writes
     # ------------------------------------------------------------------
     def place(self, callback, **order_kwargs):
-        """Budget-gated create.  Returns the Future if sent, None if the
-        bucket can't afford it (caller skips; next tick retries).
-        `callback` receives the normalized envelope when the response
-        lands."""
+        # Require headroom for this create AND its eventual cancel —
+      # never place an order you couldn't immediately pull.
+        if self.budget.remaining() < _CREATE_TOKEN_COST + _CANCEL_RESERVE:
+          return None
+
         if not self.budget.spend(_CREATE_TOKEN_COST):
             return None
         f = self.api.create_order_async(**order_kwargs)
