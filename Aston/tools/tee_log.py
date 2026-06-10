@@ -2,7 +2,7 @@
 
 Usage (top of main(), before anything prints):
 
-    from tee_log import install
+    from tools.tee_log import install
     install("aston", Path(__file__).parents[1] / "logs/Aston")
 
 Writes logs/Aston/{prefix}-{YYMONDD}_{HHMMSS}.log where the timestamp is

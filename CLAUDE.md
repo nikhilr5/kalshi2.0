@@ -7,8 +7,14 @@ parts:
 
 - **Aston/** — live PyQt6 MM app. Quotes both sides of a Kalshi 15-min
   contract around a HAR-RV-driven theo. Hold-to-close strategy (no
-  flatten layer); positions ride to TWAP settlement.
-- **Aston/recorder.py** — standalone process that writes per-day SQLite
+  flatten layer); positions ride to TWAP settlement. Layout: entrypoint
+  `app.py` + trading core (`strategy2.py`, `osm.py`, `order_gateway.py`,
+  `token_bucket.py`, `kalshi_api.py`) at the root; `feeds/` (crypto,
+  kalshi WS, market discovery), `pricing/` (theo, HAR-RV, har_fit),
+  `settings/` (aston_settings.json, har_coefficients.json), `tools/`
+  (recorder, tee_log, scripts/). v1 strategy was deleted 2026-06-10.
+- **Aston/tools/recorder.py** — standalone process (run as
+  `python3 tools/recorder.py` from Aston/) that writes per-day SQLite
   files into `analysis/backtesting/data/`. Captures fills, order events,
   spot ticks, kalshi book updates, and theo/sigma state every recompute.
 - **PositionManager/** — read-only viewer over those DBs (trade table,
@@ -106,9 +112,10 @@ scored on identical rows; ticker-clustered bootstrap. Source:
 ## Operational health checks (daily, ~60 seconds)
 
 ```bash
-# Aston running? — visual on the app
+# Aston running? — visual on the app (TOKENS display green = budget healthy)
 # Recorder running?
 ps aux | grep recorder.py | grep -v grep
+# Stdout logs (app + future recorder): Kalshi2.0/logs/Aston/, 2-day retention
 # S3 rotate working?
 launchctl list | grep aston
 tail ~/Library/Logs/aston-daily-rotate.log

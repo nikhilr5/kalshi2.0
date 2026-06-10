@@ -35,7 +35,7 @@ from pathlib import Path
 
 import requests
 
-DEFAULT_DATA_DIR = (Path(__file__).resolve().parent.parent
+DEFAULT_DATA_DIR = (Path(__file__).resolve().parents[2]
                     / "analysis" / "backtesting" / "data")
 
 _MONTHS = {1: "JAN", 2: "FEB", 3: "MAR", 4: "APR", 5: "MAY", 6: "JUN",
@@ -429,10 +429,10 @@ class StandaloneRecorder:
         # (`from recorder import StateRecorder`) stay free of GUI / WS
         # dependencies.
         from kalshi_api import KalshiAPI
-        from ws_feed import KalshiWsFeed, UserOrdersWsFeed
-        from crypto_feed import CryptoPriceFeed
-        from har_rv import HARRVEstimator
-        from market_discovery import get_active_market, parse_strike
+        from feeds.ws_feed import KalshiWsFeed, UserOrdersWsFeed
+        from feeds.crypto_feed import CryptoPriceFeed
+        from pricing.har_rv import HARRVEstimator
+        from feeds.market_discovery import get_active_market, parse_strike
 
         self.series = series_ticker
         self.product = SERIES_TO_PRODUCT.get(series_ticker)
@@ -456,7 +456,7 @@ class StandaloneRecorder:
 
         # Theo + vol — same classes the app uses.
         self.har_est = HARRVEstimator(
-            coef_path=Path(__file__).resolve().parent / "har_coefficients.json"
+            coef_path=Path(__file__).resolve().parents[1] / "settings" / "har_coefficients.json"
         )
 
         # Refs to live feeds (book WS rolls per 15-min cycle).
@@ -481,7 +481,7 @@ class StandaloneRecorder:
         self._seen_trades: set[str] = set()
 
         # seconds_to_close lives in market_discovery — pull lazily.
-        from market_discovery import seconds_to_close
+        from feeds.market_discovery import seconds_to_close
         self._secs_to_close = seconds_to_close
 
         self._stop_event = threading.Event()
@@ -865,7 +865,7 @@ class StandaloneRecorder:
         row per call.  Skipped if any input isn't ready yet."""
         if not self.current_market or self.strike <= 0 or self.spot <= 0:
             return
-        from theo_engine import compute_theo
+        from pricing.theo_engine import compute_theo
         sigma = self.har_est.get_annualized_vol()
         secs = self._secs_to_close(self.current_market)
         theo = compute_theo(self.spot, self.strike, sigma or 0.0, secs) \
@@ -1025,7 +1025,9 @@ class StandaloneRecorder:
 # =============================================================================
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    # Aston root on sys.path so feeds/ + pricing/ subpackages resolve
+    # when launched as `python3 tools/recorder.py`.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     ap = argparse.ArgumentParser()
     ap.add_argument("--series", default="KXETH15M",
                     choices=list(SERIES_TO_PRODUCT.keys()),

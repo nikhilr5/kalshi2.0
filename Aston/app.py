@@ -18,25 +18,24 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QMainWindow, QMenu, QPushButton, QSpinBox, QTableWidget,
+    QLabel, QMainWindow, QMenu, QSpinBox, QTableWidget,
     QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from kalshi_api import KalshiAPI
-from crypto_feed import CryptoPriceFeed
-from ws_feed import KalshiWsFeed
-from market_discovery import (
+from feeds.crypto_feed import CryptoPriceFeed
+from feeds.ws_feed import KalshiWsFeed
+from feeds.market_discovery import (
     SERIES_15M, get_active_market, parse_strike, seconds_to_close,
 )
-from realized_vol import RealizedVolEstimator
-from har_rv import HARRVEstimator
-from theo_engine import compute_theo
-from strategy import Strategy
+from pricing.realized_vol import RealizedVolEstimator
+from pricing.har_rv import HARRVEstimator
+from pricing.theo_engine import compute_theo
 from strategy2 import Strategy2
 from osm import OSM
 
 
-SETTINGS_PATH = Path(__file__).resolve().parent / "aston_settings.json"
+SETTINGS_PATH = Path(__file__).resolve().parent / "settings" / "aston_settings.json"
 
 
 def _load_settings() -> dict:
@@ -223,10 +222,9 @@ class PositionSeedWorker(QThread):
 
 class AstonApp(QMainWindow):
 
-    def __init__(self, strategy_version: int = 1):
+    def __init__(self):
         super().__init__()
-        self.strategy_version = strategy_version
-        self.setWindowTitle(f"Aston — 15-min MM (strategy v{strategy_version})")
+        self.setWindowTitle("Aston — 15-min MM (strategy v2)")
         self.resize(720, 460)
 
         self.settings = _load_settings()
@@ -236,7 +234,7 @@ class AstonApp(QMainWindow):
         # to a daily-rotated JSONL.  Recorder tails those files and
         # ingests into the per-day `order_attempts` table.  Zero
         # latency cost on the trading path (queue put_nowait).
-        from recorder import DEFAULT_DATA_DIR as _ATTEMPT_LOG_DIR
+        from tools.recorder import DEFAULT_DATA_DIR as _ATTEMPT_LOG_DIR
         self.api = KalshiAPI(attempt_log_dir=_ATTEMPT_LOG_DIR)
         # Process-lifetime exchange-policy layer (write-token budget).
         # Shared across every OSM rebuild so the budget survives the
@@ -254,7 +252,7 @@ class AstonApp(QMainWindow):
         # coefficients to predict the next 15 minutes of RV.  Falls
         # back to vol_est until 24h of history is seeded.
         self.har_est = HARRVEstimator(
-            coef_path=Path(__file__).resolve().parent / "har_coefficients.json"
+            coef_path=Path(__file__).resolve().parent / "settings" / "har_coefficients.json"
         )
         self._har_seed_worker: HarSeedWorker | None = None
         # Fill persistence is delegated to the standalone `recorder.py`
@@ -270,7 +268,7 @@ class AstonApp(QMainWindow):
         self.ask_size: int = 0
         self.spot: float = 0.0
         self.strategy: Strategy | Strategy2 | None = None
-        # Only populated when strategy_version == 2.  OSM owns all
+        # OSM owns all
         # Kalshi order I/O on behalf of Strategy2.
         self.osm: OSM | None = None
         # Cached theo for display (recomputed on every spot tick)
@@ -361,9 +359,9 @@ class AstonApp(QMainWindow):
         strat_title = QLabel("STRATEGY")
         strat_title.setObjectName("metricTitle")
         strat_box.addWidget(strat_title)
-        self.strategy_badge = QLabel(f"v{self.strategy_version}")
+        self.strategy_badge = QLabel("v2")
         self.strategy_badge.setFont(QFont("Menlo", 18, QFont.Weight.Bold))
-        badge_color = "#22c55e" if self.strategy_version == 2 else "#facc15"
+        badge_color = "#22c55e"
         self.strategy_badge.setStyleSheet(
             f"color:{badge_color};background:transparent;border:1px solid {badge_color};"
             "border-radius:4px;padding:2px 10px;")
@@ -429,21 +427,6 @@ class AstonApp(QMainWindow):
         self._apply_toggle_style(False)
         header.addWidget(self.toggle_btn)
 
-        # FLATTEN: emergency button that turns MM off and crosses the
-        # spread (IOC taker against the opposite-side BBO) to close any
-        # open position immediately.  Distinct from MM orders, which
-        # are always post-only.
-        self.flatten_btn = QPushButton("FLATTEN")
-        self.flatten_btn.setMinimumWidth(110)
-        self.flatten_btn.setMinimumHeight(46)
-        self.flatten_btn.setStyleSheet("""
-            QPushButton{background:#7c2d12;color:#fff;font-weight:bold;
-                        font-size:13px;letter-spacing:2px;border:none;
-                        border-radius:23px;padding:0 16px;}
-            QPushButton:hover{background:#9a3412;}
-        """)
-        self.flatten_btn.clicked.connect(self._on_flatten_clicked)
-        header.addWidget(self.flatten_btn)
         outer.addLayout(header)
 
         # =============================================================
@@ -898,7 +881,7 @@ class AstonApp(QMainWindow):
             sample_seconds=float(self.settings.get("vol_sample_sec", 10.0)),
         )
         self.har_est = HARRVEstimator(
-            coef_path=Path(__file__).resolve().parent / "har_coefficients.json"
+            coef_path=Path(__file__).resolve().parent / "settings" / "har_coefficients.json"
         )
         # Kick off the 25h candle seed in the background.  The forecast
         # stays None until the worker completes and seed_from_candles
@@ -1072,7 +1055,7 @@ class AstonApp(QMainWindow):
 
     def _osm_on_fill_raw(self, msg: dict):
         """Raw fill-channel forward to OSM.  No-op if OSM isn't running
-        (legacy strategy_version=1)."""
+        (defensive — OSM is rebuilt at every market roll)."""
         if self.osm is not None:
             self.osm.on_fill(msg)
 
@@ -1157,15 +1140,8 @@ class AstonApp(QMainWindow):
         self._last_theo = theo
         self._last_sigma = sigma
         if self.strategy and theo is not None:
-            if self.strategy_version == 2:
-                self.strategy.update_bbo((self.yes_bid, self.yes_ask))
-                self.strategy.update_theo(theo)
-            else:
-                self.strategy.kalshi_bid = self.yes_bid
-                self.strategy.kalshi_ask = self.yes_ask
-                self.strategy.kalshi_bid_size = self.bid_size
-                self.strategy.kalshi_ask_size = self.ask_size
-                self.strategy.update_theo(theo)
+            self.strategy.update_bbo((self.yes_bid, self.yes_ask))
+            self.strategy.update_theo(theo)
 
     # ------------------------------------------------------------------
     # Strategy start/stop
@@ -1182,44 +1158,29 @@ class AstonApp(QMainWindow):
                 self._apply_toggle_style(True)
                 return  # already running, just normalize visual state
             # Edges in the UI are in cents; strategy works in dollars.
-            if self.strategy_version == 2:
-                # New path: OSM + Strategy2.  Construct OSM first
-                # (with seeded position + max_position so the cap is
-                # correct from the first message), backfill strategy
-                # queue reference after Strategy2 exists.
-                self.osm = OSM(
-                    ticker=self.ticker,
-                    tolerance=self.tolerance_input.spin.value() / 100.0,
-                    api=self.api,
-                    max_position=self.max_pos_input.spin.value(),
-                    position=self._position,
-                    strategy_queue=None,
-                    gateway=self.gateway,
-                )
-                self.strategy = Strategy2(
-                    ticker=self.ticker, strike=self.strike,
-                    edge_bid=self.edge_bid_input.spin.value() / 100.0,
-                    edge_ask=self.edge_ask_input.spin.value() / 100.0,
-                    size_bid=self.size_bid_input.spin.value(),
-                    size_ask=self.size_ask_input.spin.value(),
-                    osm=self.osm,
-                )
-                self.osm.strategy_queue = self.strategy.queue
-                self.osm.start()
-                self.strategy.start()
-            else:
-                self.strategy = Strategy(
-                    ticker=self.ticker, strike=self.strike,
-                    edge_bid=self.edge_bid_input.spin.value() / 100.0,
-                    edge_ask=self.edge_ask_input.spin.value() / 100.0,
-                    size_bid=self.size_bid_input.spin.value(),
-                    size_ask=self.size_ask_input.spin.value(),
-                    max_position=self.max_pos_input.spin.value(),
-                    tolerance=self.tolerance_input.spin.value() / 100.0,
-                    api=self.api,
-                )
-                self.strategy.position = self._position
-                self.strategy.start(bid=True, ask=True)
+            # Construct OSM first (with seeded position + max_position
+            # so the cap is correct from the first message), backfill
+            # strategy queue reference after Strategy2 exists.
+            self.osm = OSM(
+                ticker=self.ticker,
+                tolerance=self.tolerance_input.spin.value() / 100.0,
+                api=self.api,
+                max_position=self.max_pos_input.spin.value(),
+                position=self._position,
+                strategy_queue=None,
+                gateway=self.gateway,
+            )
+            self.strategy = Strategy2(
+                ticker=self.ticker, strike=self.strike,
+                edge_bid=self.edge_bid_input.spin.value() / 100.0,
+                edge_ask=self.edge_ask_input.spin.value() / 100.0,
+                size_bid=self.size_bid_input.spin.value(),
+                size_ask=self.size_ask_input.spin.value(),
+                osm=self.osm,
+            )
+            self.osm.strategy_queue = self.strategy.queue
+            self.osm.start()
+            self.strategy.start()
             self._apply_toggle_style(True)
             self.status_label.setText(f"MM active on {self.ticker}")
             self._save_current_params()
@@ -1232,71 +1193,6 @@ class AstonApp(QMainWindow):
                 self.osm = None
             self._apply_toggle_style(False)
             self.status_label.setText("MM stopped")
-
-    def _on_flatten_clicked(self):
-        """Aggressive flatten: turn off MM, then take liquidity to close
-        the open position.  Sends a single IOC limit order priced at
-        the opposite-side BBO so it crosses immediately, with
-        post_only=False so the exchange accepts it as a taker.  This
-        is the ONLY path in the app that takes — every MM order in
-        strategy.py uses post_only=True.
-        """
-        pos = self._position
-        if pos == 0:
-            self.status_label.setText("Already flat")
-            return
-        if not self.ticker:
-            self.status_label.setText("No active market")
-            return
-
-        # Turn MM off first so the strategy doesn't immediately re-open
-        # the position on the next tick.  stop() cancels resting MM
-        # orders asynchronously — the flatten taker can race them
-        # safely since they're on opposite sides of the book from
-        # the cross direction.
-        if self.strategy:
-            self.strategy.stop()
-            self.strategy = None
-        if self.osm:
-            self.osm.stop()
-            self.osm = None
-        self.toggle_btn.setChecked(False)
-        self._apply_toggle_style(False)
-
-        if pos > 0:
-            # Long → sell into the bid
-            if self.yes_bid <= 0:
-                self.status_label.setText("No bid to hit — can't flatten")
-                return
-            price = self.yes_bid
-            action = "sell"
-        else:
-            # Short → buy from the ask
-            if self.yes_ask <= 0:
-                self.status_label.setText("No ask to lift — can't flatten")
-                return
-            price = self.yes_ask
-            action = "buy"
-        count = abs(pos)
-
-        # BBO prices come from the WS feed already on the valid Kalshi
-        # tick grid, so no need to re-round.  3-decimal format covers
-        # both cent-tick and sub-cent prices.
-        print(f"[Flatten] {action.upper()} {count}@{price*100:.1f}¢ "
-              f"(IOC taker)")
-        try:
-            self.api.create_order_async(
-                ticker=self.ticker, side="yes", action=action,
-                price_dollars=f"{price:.3f}", count=count,
-                tag="flatten",
-                time_in_force="immediate_or_cancel",
-                post_only=False,
-            )
-            self.status_label.setText(
-                f"Flatten {action.upper()} {count}@{price*100:.1f}¢ sent")
-        except Exception as e:
-            print(f"[Flatten] submit failed: {e}")
-            self.status_label.setText(f"Flatten failed: {e}")
 
     def _on_param_changed(self, _value):
         """Push parameter changes to a running strategy without restart."""
@@ -1589,14 +1485,12 @@ class AstonApp(QMainWindow):
 def main():
     import argparse
     from pathlib import Path
-    from tee_log import install
+    from tools.tee_log import install
     install("aston", Path(__file__).resolve().parents[1] / "logs" / "Aston")
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("-s", "--strategy", type=int, choices=[1, 2], default=2,
-                    help="1 = legacy Strategy, 2 = Strategy2 + OSM")
     args, qt_argv = ap.parse_known_args()
-    print(f"[Aston] launching with Strategy v{args.strategy}")
+    print("[Aston] launching with Strategy v2")
 
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(qt_argv)
@@ -1615,7 +1509,7 @@ def main():
     except Exception:
         pass
 
-    icon_path = Path(__file__).resolve().parent / "icon.png"
+    icon_path = Path(__file__).resolve().parent / "tools/icon.png"
     # Self-heal: if the user hasn't dropped an icon.png next to app.py,
     # generate a default Aston-style emblem and save it.  Subsequent
     # launches pick up the saved file, and the user can overwrite it
@@ -1640,7 +1534,7 @@ def main():
         except Exception:
             pass
 
-    window = AstonApp(strategy_version=args.strategy)
+    window = AstonApp()
     if icon_path.exists():
         window.setWindowIcon(QIcon(str(icon_path)))
     window.show()

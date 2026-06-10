@@ -214,7 +214,9 @@ def main():
         "days_back": args.days,
         "fit_at":    datetime.now(timezone.utc).isoformat(),
     }
-    path = Path(__file__).resolve().parent / "har_coefficients.json"
+    # Coefficients live in Aston/settings/ (next to aston_settings.json) —
+    # app.py and recorder.py load them from there.
+    path = Path(__file__).resolve().parents[1] / "settings" / "har_coefficients.json"
     with path.open("w") as f:
         json.dump(out, f, indent=2)
 

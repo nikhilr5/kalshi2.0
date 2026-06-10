@@ -30,7 +30,7 @@ dd=$(date -u +%d)
 suffix="${yy}$(month_abbr "$mm")${dd}"
 db_path="$DATA_DIR/${SERIES_PREFIX}-${suffix}.db"
 
-EMAIL_SCRIPT="/Users/nikhilr5/Desktop/Kalshi2.0/Aston/scripts/send_alert_email.py"
+EMAIL_SCRIPT="/Users/nikhilr5/Desktop/Kalshi2.0/Aston/tools/scripts/send_alert_email.py"
 
 notify() {
   local title="$1"
