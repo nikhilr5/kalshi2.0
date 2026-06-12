@@ -556,7 +556,6 @@ class OSM:
         if f is None:
             # Budget can't afford a create right now — skip; the next
             # BBO/theo tick retries once tokens have refilled.
-            print('[OSM] Budget spent cannot place order')
             return
         self.pending_ops[req_id] = PendingOp(
             request_id=req_id, kind="place", side=side, price=price, future=f)

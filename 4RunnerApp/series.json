@@ -1,6 +1,0 @@
-[
-  {"ticker": "KXBTC",  "name": "Bitcoin",  "coinbase_product": "BTC-USD"},
-  {"ticker": "KXETH",  "name": "Ethereum", "coinbase_product": "ETH-USD"},
-  {"ticker": "KXSOL",  "name": "Solana",   "coinbase_product": "SOL-USD"},
-  {"ticker": "KXDOGE", "name": "Doge",     "coinbase_product": "DOGE-USD"}
-]
