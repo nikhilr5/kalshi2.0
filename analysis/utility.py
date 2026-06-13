@@ -122,6 +122,223 @@ def list_eligible_dbs(series_prefix: str, cutoff: str,
     return sorted(paths.values(), key=lambda p: p.name)
 
 
+def day_to_suffix(d) -> str:
+    """`date(2026,6,10)` / `'2026-06-10'` / `'26JUN10'` → `'26JUN10'`."""
+    if isinstance(d, str):
+        if parse_day_suffix(d) is not None:        # already a suffix
+            return d.upper()
+        d = pd.Timestamp(d).date()                 # ISO / loose string
+    elif isinstance(d, (datetime, pd.Timestamp)):
+        d = d.date() if hasattr(d, "date") else d
+    inv = {v: k for k, v in _MONTHS.items()}
+    return f"{d.year % 100:02d}{inv[d.month]}{d.day:02d}"
+
+
+def _to_date(d) -> date:
+    """date / ISO string / YYMONDD suffix / 'today' → datetime.date."""
+    if isinstance(d, str):
+        if d.lower() == "today":
+            return datetime.now(timezone.utc).date()
+        sd = parse_day_suffix(d)
+        if sd is not None:
+            return sd
+        return pd.Timestamp(d).date()
+    if isinstance(d, (datetime, pd.Timestamp)):
+        return d.date()
+    return d
+
+
+def day_range(start, until) -> list[str]:
+    """Inclusive list of YYMONDD suffixes from `start` to `until`.
+
+    Each arg is a date, ISO string, YYMONDD suffix, or 'today'.  Used to
+    drive multi-day loads day-by-day so one corrupt day can't kill the
+    whole range."""
+    d0, d1 = _to_date(start), _to_date(until)
+    if d1 < d0:
+        d0, d1 = d1, d0
+    out, cur = [], d0
+    while cur <= d1:
+        out.append(day_to_suffix(cur))
+        cur += pd.Timedelta(days=1).to_pytimedelta()
+    return out
+
+
+def _resolve_day_db(series_prefix: str, suffix: str, table: str,
+                    local_dir: Path, s3_cache_dir: Path,
+                    s3_bucket: str) -> Path | None:
+    """Find the per-day DB for one day that actually has `table`.
+
+    The daily rotate can leave a 0-byte stub in `local_dir` shadowing the
+    real (often larger) copy in `s3_cache_dir`; corrupt days can have the
+    file but no/empty b-trees.  We gather every candidate path for the day
+    (downloading from S3 if neither dir has it), then return the first
+    that is non-empty AND contains `table`, preferring the largest file.
+    Returns None if no candidate is usable."""
+    name = f"{series_prefix}-{suffix}.db"
+    candidates = []
+    for d in (local_dir, s3_cache_dir):
+        p = d / name
+        if p.exists():
+            candidates.append(p)
+    if not candidates:                              # pull from S3 on demand
+        s3_cache_dir.mkdir(parents=True, exist_ok=True)
+        target = s3_cache_dir / name
+        cp = subprocess.run(
+            ["aws", "s3", "cp", f"{s3_bucket}/{name}", str(target),
+             "--only-show-errors"], capture_output=True, text=True)
+        if cp.returncode == 0 and target.exists():
+            candidates.append(target)
+    # largest first — the real day beats a truncated stub
+    candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+    for p in candidates:
+        if p.stat().st_size == 0:
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            try:
+                has = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,)).fetchone()
+                if has:
+                    return p
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            continue                                # corrupt file — skip
+    return None
+
+
+def _load_day_table(series_prefix: str, day, table: str, columns: str,
+                    start=None, end=None,
+                    local_dir: Path = DEFAULT_LOCAL_DIR,
+                    s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+                    s3_bucket: str = DEFAULT_S3_BUCKET) -> pd.DataFrame:
+    """Read `columns` from `table` for a single day, with `ts` parsed to
+    UTC.  Optional `start`/`end` (anything pd.Timestamp accepts) bound the
+    ts range, pushed into SQL as text compares (ts is sortable UTC ISO).
+    Returns an empty frame (right columns) if the day is missing/corrupt
+    rather than raising."""
+    suffix = day_to_suffix(day)
+    col_list = [c.strip() for c in columns.split(",")]
+    empty = pd.DataFrame(columns=col_list)
+    if "ts" in col_list:                            # keep the contract uniform:
+        empty["ts"] = pd.Series(dtype="datetime64[ns, UTC]")  # ts is always tz-aware
+
+    p = _resolve_day_db(series_prefix, suffix, table,
+                        local_dir, s3_cache_dir, s3_bucket)
+    if p is None:
+        print(f"[load] {series_prefix}-{suffix}: no usable {table} — skipped")
+        return empty
+
+    where, params = [], []
+    if start is not None:
+        where.append("ts >= ?")
+        params.append(pd.Timestamp(start, tz="UTC").isoformat())
+    if end is not None:
+        where.append("ts < ?")
+        params.append(pd.Timestamp(end, tz="UTC").isoformat())
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+    try:
+        df = pd.read_sql(f"SELECT {columns} FROM {table}{clause}",
+                         conn, params=params or None)
+    except (sqlite3.DatabaseError, pd.errors.DatabaseError) as e:
+        print(f"[load] {series_prefix}-{suffix}: {table} read failed ({e}) — skipped")
+        return empty
+    finally:
+        conn.close()
+    if "ts" in df.columns:
+        if len(df):
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+        else:
+            df["ts"] = df["ts"].astype("datetime64[ns, UTC]")
+    return df
+
+
+def load_theo(day, series_prefix: str = "KXETH15M", start=None, end=None,
+              until=None,
+              local_dir: Path = DEFAULT_LOCAL_DIR,
+              s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+              s3_bucket: str = DEFAULT_S3_BUCKET) -> pd.DataFrame:
+    """theo_state rows.  `day` is a date, ISO string, or `YYMONDD` suffix.
+
+    By default loads just `day`.  Pass `until` (a date / ISO / suffix /
+    'today') to load every day from `day` THROUGH `until` inclusive,
+    concatenated.  Optional `start`/`end` bound the ts range within each
+    day.
+
+    Robust to the rotate's 0-byte stub, missing tables, and corrupt days
+    (those are skipped, no raise).  `ts` parsed to UTC.
+
+        theo = load_theo("2026-06-10")                       # one day
+        theo = load_theo("2026-06-10", until="2026-06-12")   # 6/10..6/12
+        theo = load_theo("2026-06-10", until="today")        # 6/10..latest
+    """
+    cols = ("ts,ticker,spot,strike,sigma,theo,seconds_to_expiry,"
+            "rv_15m,rv_30m,rv_4h,rv_24h")
+    if until is None:
+        return _load_day_table(series_prefix, day, "theo_state", cols,
+                               start, end, local_dir, s3_cache_dir, s3_bucket)
+    parts = [_load_day_table(series_prefix, d, "theo_state", cols, start, end,
+                             local_dir, s3_cache_dir, s3_bucket)
+             for d in day_range(day, until)]
+    return pd.concat(parts, ignore_index=True)
+
+
+def load_book(day, series_prefix: str = "KXETH15M", start=None, end=None,
+              until=None, drop_crossed: bool = True,
+              local_dir: Path = DEFAULT_LOCAL_DIR,
+              s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+              s3_bucket: str = DEFAULT_S3_BUCKET) -> pd.DataFrame:
+    """kalshi_book rows with a `mid` column added.  Same args / robustness
+    as load_theo, including `until` for a multi-day range.  By default
+    drops empty/crossed books (yes_bid<=0, yes_ask<=0, ask<bid) so `mid`
+    is meaningful.
+
+        book = load_book("2026-06-10")
+        book = load_book("2026-06-10", until="2026-06-12")
+    """
+    cols = "ts,ticker,yes_bid,yes_ask,bid_size,ask_size"
+    if until is None:
+        df = _load_day_table(series_prefix, day, "kalshi_book", cols,
+                             start, end, local_dir, s3_cache_dir, s3_bucket)
+    else:
+        df = pd.concat(
+            [_load_day_table(series_prefix, d, "kalshi_book", cols, start, end,
+                             local_dir, s3_cache_dir, s3_bucket)
+             for d in day_range(day, until)], ignore_index=True)
+    if df.empty:
+        return df.assign(mid=pd.Series(dtype=float))
+    if drop_crossed:
+        df = df[(df.yes_bid > 0) & (df.yes_ask > 0)
+                & (df.yes_ask >= df.yes_bid)].copy()
+    df["mid"] = (df.yes_bid + df.yes_ask) / 2
+    return df
+
+
+def load_fills(day, series_prefix: str = "KXETH15M", start=None, end=None,
+               until=None,
+               local_dir: Path = DEFAULT_LOCAL_DIR,
+               s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+               s3_bucket: str = DEFAULT_S3_BUCKET) -> pd.DataFrame:
+    """fills rows.  Same args / robustness as load_theo, including `until`
+    for a multi-day range.  `ts` parsed to UTC; `kalshi_ts` left as text.
+
+        fills = load_fills("2026-06-10")
+        fills = load_fills("2026-06-10", until="today")
+    """
+    cols = ("ts,ticker,action,side,count,price,strike,spot_bid,spot_ask,"
+            "kalshi_yes_bid,kalshi_yes_ask,fee,is_taker,client_order_id,kalshi_ts")
+    if until is None:
+        return _load_day_table(series_prefix, day, "fills", cols,
+                               start, end, local_dir, s3_cache_dir, s3_bucket)
+    parts = [_load_day_table(series_prefix, d, "fills", cols, start, end,
+                             local_dir, s3_cache_dir, s3_bucket)
+             for d in day_range(day, until)]
+    return pd.concat(parts, ignore_index=True)
+
+
 def load_all_data(series_prefix: str, cutoff: str,
                   local_dir: Path = DEFAULT_LOCAL_DIR,
                   s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,

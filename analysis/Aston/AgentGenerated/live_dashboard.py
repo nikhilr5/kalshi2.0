@@ -1,8 +1,8 @@
 """Aston Live Dashboard — browser, two tabs, auto-refresh.
 
-  Tab 1 — P&L:                cumulative + daily + fill count
-  Tab 2 — Adverse Selection:  markout@30s, late-cancel detector,
-                              theo drift while resting
+  Tab 1 — P&L:         cumulative + daily + fill count
+  Tab 2 — Moneyness:   realized fill P&L per side, bucketed by entry
+                       price (OTM -> ITM)
 
 Read-only SQLite over the recorder DBs (no contention with the live
 writer).  Refresh on a single timer; both tabs update together.
@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'analysis'))
 sys.path.insert(0, str(ROOT / 'Aston'))
 from utility import (
-    bootstrap_ci, fetch_settlements_from_api, list_eligible_dbs,
-    parse_day_suffix,
+    bootstrap_ci, day_range, fetch_settlements_from_api, list_eligible_dbs,
+    load_book, load_fills, parse_day_suffix,
 )
 from kalshi_api import KalshiAPI
 
@@ -159,8 +159,12 @@ def pnl_stats(fills):
 
 # 2026-06-09: v2 strategy (OSM rewrite) + 3-lot orders + cap 30 went live
 # (edges stayed at the 7c/5c baseline).  Data left of this line is the
-# old config: v1 engine, 1-lot, cap 8-10.
-CONFIG_CHANGE_DATE = "2026-06-09"
+# old config: v1 engine, 1-lot, cap 8-10.  Moneyness + Markout tabs scope
+# to this window (current config); P&L tab marks it with the yellow line.
+CONFIG_CHANGE_DATE = "2026-06-09"          # string for the P&L vline
+CONFIG_CHANGE_DAY  = "26JUN09"             # suffix for day_range
+CONFIG_CHANGE_D    = parse_day_suffix(CONFIG_CHANGE_DAY)   # date for filtering
+CONFIG_CHANGE_LABEL = "v2 + 3-lot"
 
 
 def pnl_figure(fills):
@@ -201,6 +205,279 @@ def pnl_figure(fills):
     fig.update_yaxes(title_text='fills', row=3, col=1)
     fig.update_layout(template='plotly_dark', height=850, showlegend=False)
     return fig
+
+
+# =============================================================================
+# Moneyness tab — fill P&L by side, bucketed by entry price (OTM -> ITM)
+# =============================================================================
+PX_EDGES  = [0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+PX_LABELS = ['0-20', '20-30', '30-40', '40-50', '50-60',
+             '60-70', '70-80', '80-90', '90-100']
+SIDE_COLOR = {'buy': '#22c55e', 'sell': '#ef4444'}   # match app LIVE ORDERS
+
+
+def _post_change(fills: pd.DataFrame) -> pd.DataFrame:
+    """Restrict to the current-config window (>= CONFIG_CHANGE_D)."""
+    if fills.empty or 'date' not in fills.columns:
+        return fills
+    return fills[fills['date'] >= CONFIG_CHANGE_D]
+
+
+def moneyness_breakdown(fills: pd.DataFrame) -> pd.DataFrame:
+    """Per (price-bucket, side): mean c/fill, total $, fill count.  The YES
+    fill price is the moneyness axis — low=OTM, high=ITM.  Scoped to the
+    post-change window so it reflects the current config, not old fills."""
+    fills = _post_change(fills)
+    if fills.empty:
+        return pd.DataFrame()
+    f = fills.copy()
+    f['px_bin'] = pd.cut(f['price'], bins=PX_EDGES, labels=PX_LABELS,
+                         include_lowest=True)
+    return (f.groupby(['px_bin', 'action'], observed=True)
+              .agg(cpf=('realized_c', 'mean'),
+                   total=('realized_c', lambda s: s.sum() / 100),
+                   n=('realized_c', 'count'))
+              .reset_index())
+
+
+def moneyness_figure(fills: pd.DataFrame):
+    g = moneyness_breakdown(fills)
+    if g.empty:
+        return go.Figure().update_layout(
+            template='plotly_dark', height=700,
+            annotations=[dict(text="no fills yet", x=0.5, y=0.5,
+                              showarrow=False)])
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        subplot_titles=("Realized edge per fill (c) by entry price & side",
+                        "Fill count (thin buckets are noisy)"))
+    for side in ('buy', 'sell'):
+        s = g[g['action'] == side]
+        fig.add_trace(go.Bar(
+            x=s['px_bin'], y=s['cpf'], name=side.upper(),
+            marker_color=SIDE_COLOR[side],
+            text=[f"{v:+.1f}" for v in s['cpf']], textposition='outside'),
+            row=1, col=1)
+        fig.add_trace(go.Bar(
+            x=s['px_bin'], y=s['n'], marker_color=SIDE_COLOR[side],
+            showlegend=False), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color='#666', dash='dot'), row=1, col=1)
+    fig.update_yaxes(title_text='c/fill', row=1, col=1)
+    fig.update_yaxes(title_text='fills', row=2, col=1)
+    fig.update_xaxes(title_text='YES fill price (c) — OTM → ITM', row=2, col=1)
+    fig.update_layout(template='plotly_dark', height=750, barmode='group',
+                      legend=dict(orientation='h', y=1.06))
+    return fig
+
+
+def _window_label(fills: pd.DataFrame) -> str:
+    f = _post_change(fills)
+    if f.empty:
+        return f"{CONFIG_CHANGE_DATE} → (no fills yet)"
+    return (f"{CONFIG_CHANGE_DATE} → {f['date'].max()}  "
+            f"({CONFIG_CHANGE_LABEL})")
+
+
+def moneyness_panel(fills: pd.DataFrame):
+    g = moneyness_breakdown(fills)
+    if g.empty:
+        return html.Div("No fills yet in window.", style={"color": "#888"})
+
+    window = html.Div(f"Window: {_window_label(fills)}",
+                      style={"color": "#facc15", "marginBottom": "10px",
+                             "fontSize": "0.85em"})
+    summary = []
+    for side in ('buy', 'sell'):
+        s = g[g['action'] == side]
+        tot = float(s['total'].sum())
+        n = int(s['n'].sum())
+        cpf = (tot * 100 / n) if n else 0.0
+        summary.append(html.Div([
+            html.B(side.upper(), style={"color": SIDE_COLOR[side]}),
+            html.Span(f"  ${tot:+.2f}  ·  {cpf:+.2f}c/fill  ·  {n} fills"),
+        ]))
+
+    header = html.Tr([html.Th(h, style={"textAlign": "right",
+                                        "padding": "2px 8px"})
+                      for h in ("Price", "Side", "c/fill", "Total $", "n")])
+    rows = [header]
+    for _, r in g.iterrows():
+        color = SIDE_COLOR[r['action']]
+        cells = [r['px_bin'], r['action'].upper(),
+                 f"{r['cpf']:+.2f}", f"${r['total']:+.2f}", int(r['n'])]
+        rows.append(html.Tr([
+            html.Td(c, style={"textAlign": "right", "padding": "2px 8px",
+                              "color": color if i == 1 else "#e0e0e0"})
+            for i, c in enumerate(cells)]))
+
+    return html.Div([
+        window,
+        html.H3("By side", style={"marginBottom": "6px"}),
+        *summary,
+        html.Hr(),
+        html.Table(rows, style={"borderCollapse": "collapse"}),
+        html.Div("Bucket = YES fill price; low = OTM, high = ITM. "
+                 "c/fill is realized edge net of nothing (maker, ~0 fee).",
+                 style={"color": "#666", "fontSize": "0.8em",
+                        "marginTop": "10px", "maxWidth": "340px"}),
+    ], style={"fontFamily": "monospace", "fontSize": "0.95em",
+              "lineHeight": "1.6"})
+
+
+# =============================================================================
+# Markout tab — short-horizon adverse selection, built lean:
+#   * post-change window only (a few days, not the full ~4 weeks)
+#   * entry mid comes FROM the fills table (book@fill already recorded),
+#     so only the *later* mid needs book
+#   * book loaded one day at a time, reduced to a few floats per fill
+#   * computed lazily (only when the tab is viewed) + cached per refresh
+# =============================================================================
+MARKOUT_HORIZONS = (30, 60, 120)
+
+
+def _markouts_for_day(day: str) -> pd.DataFrame:
+    fills = load_fills(day, series_prefix=SERIES_PREFIX)
+    if fills.empty:
+        return pd.DataFrame()
+    fills = fills[fills['side'] == 'yes'].copy()
+    fills = fills[(fills['kalshi_yes_bid'] > 0) & (fills['kalshi_yes_ask'] > 0)]
+    if fills.empty:
+        return pd.DataFrame()
+    book = load_book(day, series_prefix=SERIES_PREFIX)
+    if book.empty:
+        return pd.DataFrame()
+    book = book[['ts', 'ticker', 'mid']].dropna().sort_values('ts')
+    fills = fills.reset_index(drop=True)
+    fills['fid'] = np.arange(len(fills))
+    fills['entry_mid'] = (fills['kalshi_yes_bid'] + fills['kalshi_yes_ask']) / 2
+    fills['sgn'] = np.where(fills['action'] == 'buy', 1, -1)
+    res = fills[['fid', 'ts', 'ticker', 'action', 'sgn',
+                 'entry_mid', 'price']].copy()
+    for h in MARKOUT_HORIZONS:
+        tgt = res[['fid', 'ticker', 'entry_mid', 'sgn']].copy()
+        tgt['ts_h'] = res['ts'] + pd.Timedelta(seconds=h)
+        tgt = tgt.sort_values('ts_h')
+        j = pd.merge_asof(
+            tgt, book.rename(columns={'ts': 'bts', 'mid': 'mid_h'}),
+            left_on='ts_h', right_on='bts', by='ticker',
+            direction='backward', tolerance=pd.Timedelta(seconds=30))
+        j[f'mk{h}'] = j['sgn'] * (j['mid_h'] - j['entry_mid']) * 100
+        res = res.merge(j[['fid', f'mk{h}']], on='fid', how='left')
+    res['date'] = parse_day_suffix(day)
+    return res[['date', 'action', 'price'] + [f'mk{h}' for h in MARKOUT_HORIZONS]]
+
+
+# Completed days never change, so their markouts are cached two ways:
+#   in-memory (hot, within a session) + on-disk (survives dashboard restarts).
+# Bump MARKOUT_VER if the markout computation ever changes — old files are
+# then ignored (stale by version) and can be deleted.
+MARKOUT_VER = "v1"
+MARKOUT_CACHE_DIR = Path(__file__).resolve().parent / "_markout_cache"
+_MARKOUT_DAY_CACHE: dict = {}
+
+
+def _day_cache_path(day: str) -> Path:
+    return MARKOUT_CACHE_DIR / f"markout-{MARKOUT_VER}-{day}.pkl"
+
+
+def compute_markouts() -> pd.DataFrame:
+    days = day_range(CONFIG_CHANGE_DAY, "today")
+    today = days[-1] if days else None        # partial — never cached
+    frames = []
+    for day in days:
+        if day in _MARKOUT_DAY_CACHE:                       # hot (in-memory)
+            frames.append(_MARKOUT_DAY_CACHE[day])
+            continue
+        path = _day_cache_path(day)
+        if day != today and path.exists():                 # warm (on-disk)
+            try:
+                d = pd.read_pickle(path)
+                _MARKOUT_DAY_CACHE[day] = d
+                frames.append(d)
+                continue
+            except Exception:
+                pass                                        # unreadable → recompute
+        d = _markouts_for_day(day)                          # cold (compute)
+        if day != today and not d.empty:                   # cache completed days
+            _MARKOUT_DAY_CACHE[day] = d
+            try:
+                MARKOUT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                d.to_pickle(path)
+            except Exception:
+                pass                                        # cache is best-effort
+        if not d.empty:
+            frames.append(d)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def markout_figure(mk: pd.DataFrame):
+    if mk.empty:
+        return go.Figure().update_layout(
+            template='plotly_dark', height=600,
+            annotations=[dict(text="no markout data in window", x=.5, y=.5,
+                              showarrow=False)])
+    xs = [f'{h}s' for h in MARKOUT_HORIZONS]
+    fig = go.Figure()
+    for side in ('buy', 'sell'):
+        s = mk[mk['action'] == side]
+        ys = [s[f'mk{h}'].mean() for h in MARKOUT_HORIZONS]
+        fig.add_trace(go.Bar(x=xs, y=ys, name=side.upper(),
+                             marker_color=SIDE_COLOR[side],
+                             text=[f'{v:+.2f}' for v in ys],
+                             textposition='outside'))
+    fig.add_hline(y=0, line=dict(color='#666', dash='dot'))
+    fig.update_yaxes(title_text='mean markout (c/contract)')
+    fig.update_xaxes(title_text='horizon after fill')
+    fig.update_layout(
+        template='plotly_dark', height=600, barmode='group',
+        title='Markout by side — positive = mid moved your way',
+        legend=dict(orientation='h', y=1.1))
+    return fig
+
+
+def markout_panel(mk: pd.DataFrame):
+    if mk.empty:
+        return html.Div("No markout data in window.", style={"color": "#888"})
+    window = html.Div(
+        f"Window: {CONFIG_CHANGE_DATE} → {mk['date'].max()}  ({CONFIG_CHANGE_LABEL})",
+        style={"color": "#facc15", "marginBottom": "10px", "fontSize": "0.85em"})
+    head = html.Tr([html.Th(h, style={"textAlign": "right", "padding": "2px 8px"})
+                    for h in ('Side', '30s', '60s', '120s', 'n')])
+    rows = [head]
+    for side in ('buy', 'sell'):
+        s = mk[mk['action'] == side]
+        cells = ([side.upper()]
+                 + [f"{s[f'mk{h}'].mean():+.2f}" for h in MARKOUT_HORIZONS]
+                 + [int(s[f'mk{MARKOUT_HORIZONS[0]}'].notna().sum())])
+        color = SIDE_COLOR[side]
+        rows.append(html.Tr([
+            html.Td(c, style={"textAlign": "right", "padding": "2px 8px",
+                              "color": color if i == 0 else "#e0e0e0"})
+            for i, c in enumerate(cells)]))
+    return html.Div([
+        window,
+        html.H3("Markout (c/contract)", style={"marginBottom": "6px"}),
+        html.Table(rows, style={"borderCollapse": "collapse"}),
+        html.Div("Positive = market moved in your favor after the fill. "
+                 "Entry mid is the book at fill time (from the fills row); "
+                 "later mid is asof fill+horizon. Buy bleed / sell-clean is "
+                 "the structural adverse-selection signature.",
+                 style={"color": "#666", "fontSize": "0.8em",
+                        "marginTop": "10px", "maxWidth": "340px"}),
+    ], style={"fontFamily": "monospace", "fontSize": "0.95em",
+              "lineHeight": "1.6"})
+
+
+_MARKOUT_CACHE = {'ts': None, 'df': pd.DataFrame()}
+
+
+def get_markouts(store_ts):
+    """Compute markouts at most once per refresh — the heavy book load only
+    runs when the Markout tab is actually viewed."""
+    if _MARKOUT_CACHE['ts'] != store_ts:
+        _MARKOUT_CACHE['df'] = compute_markouts()
+        _MARKOUT_CACHE['ts'] = store_ts
+    return _MARKOUT_CACHE['df']
 
 
 # =============================================================================
@@ -677,6 +954,14 @@ app.layout = html.Div([
         html.Div(f"{SERIES_PREFIX} · refresh every {REFRESH_SECONDS}s",
                  style={"color": "#888"}),
     ], style={"padding": "10px 20px"}),
+    dcc.Tabs(id='tabs', value='pnl', children=[
+        dcc.Tab(label='P&L', value='pnl',
+                style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+        dcc.Tab(label='Moneyness', value='moneyness',
+                style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+        dcc.Tab(label='Markout', value='markout',
+                style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+    ]),
     html.Div(id='tab-content', style={"padding": "10px 0"}),
     dcc.Interval(id='interval',
                  interval=REFRESH_SECONDS * 1000, n_intervals=0),
@@ -698,8 +983,24 @@ _PNL_FILLS: pd.DataFrame = pd.DataFrame()
 @app.callback(
     Output('tab-content', 'children'),
     Input('store', 'data'),
+    Input('tabs', 'value'),
 )
-def render_tab(_store_ts):
+def render_tab(_store_ts, tab):
+    if tab == 'moneyness':
+        return html.Div([
+            html.Div(moneyness_panel(_PNL_FILLS),
+                     style={"width": "380px", "padding": "20px"}),
+            html.Div([dcc.Graph(figure=moneyness_figure(_PNL_FILLS))],
+                     style={"flex": 1}),
+        ], style={"display": "flex"})
+    if tab == 'markout':
+        mk = get_markouts(_store_ts)
+        return html.Div([
+            html.Div(markout_panel(mk),
+                     style={"width": "380px", "padding": "20px"}),
+            html.Div([dcc.Graph(figure=markout_figure(mk))],
+                     style={"flex": 1}),
+        ], style={"display": "flex"})
     return html.Div([
         html.Div(pnl_stats(_PNL_FILLS),
                  style={"width": "300px", "padding": "20px"}),

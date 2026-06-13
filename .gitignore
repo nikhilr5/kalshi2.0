@@ -13,3 +13,4 @@ Aston/.claude/
 analysis/backtesting/_s3_cache/
 analysis/Aston/.settlements_cache.json
 analysis/backtesting/_trades_cache/
+analysis/Aston/AgentGenerated/_markout_cache/
