@@ -1436,7 +1436,11 @@ class AstonApp(QMainWindow):
         def _fmt_age(age_s: float | None) -> str:
             if age_s is None or age_s < 0:
                 return "--"
-            return f"{age_s * 1000:,.0f}ms"
+            if age_s < 10:
+                return f"{age_s:.1f}s"
+            if age_s < 120:
+                return f"{age_s:.0f}s"
+            return f"{age_s / 60:.0f}m{age_s % 60:02.0f}s"
 
         def _set(row: int, side_label: str, side_color: str,
                  price_dollars: float | None, size: int,

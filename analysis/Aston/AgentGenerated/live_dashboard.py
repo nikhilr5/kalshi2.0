@@ -116,6 +116,20 @@ def pnl_stats(fills):
     today_pnl   = float(today['realized_c'].sum() / 100)
     today_fills = len(today)
     last_7 = daily.tail(7).sum()
+    # Post-change (v2 + 3-lot) window t-stat — current config only; the
+    # all-days t-stat above blends old + new config and isn't the one to
+    # judge the live strategy on.
+    pc = _post_change(fills)
+    if not pc.empty:
+        pc_daily = pc.groupby('date')['realized_c'].sum() / 100
+        pc_n = len(pc_daily)
+        pc_mean = float(pc_daily.mean())
+        pc_std = float(pc_daily.std(ddof=1)) if pc_n > 1 else 0.0
+        pc_t = ((pc_mean / (pc_std / (pc_n ** 0.5)))
+                if (pc_std > 0 and pc_n > 1) else float('nan'))
+        pc_total = float(pc_daily.sum())
+    else:
+        pc_n, pc_mean, pc_t, pc_total = 0, 0.0, float('nan'), 0.0
     color_total = '#22c55e' if total >= 0 else '#dc2626'
     color_today = '#22c55e' if today_pnl >= 0 else '#dc2626'
     return html.Div([
@@ -140,13 +154,21 @@ def pnl_stats(fills):
             html.Div([html.B("Daily SD: "), html.Span(f"${std:.2f}")]),
             html.Div([html.B("Sharpe (annualized): "),
                       html.Span(f"{sharpe:+.2f}")]),
-            html.Div([html.B("t-stat (daily PnL > 0): "),
+            html.Div([html.B("t-stat (all days): "),
                       html.Span(f"{tstat:+.2f}",
                                 style={"color": ("#22c55e" if tstat > 2
                                                   else "#facc15" if tstat > 1
                                                   else "#dc2626")}
                                 if tstat == tstat else {}),
                       html.Span(f"  (n={n_days} days)",
+                                style={"color": "#888"})]),
+            html.Div([html.B(f"t-stat ({CONFIG_CHANGE_LABEL}): "),
+                      html.Span(f"{pc_t:+.2f}",
+                                style={"color": ("#22c55e" if pc_t > 2
+                                                  else "#facc15" if pc_t > 1
+                                                  else "#dc2626")}
+                                if pc_t == pc_t else {"color": "#888"}),
+                      html.Span(f"  (${pc_total:+.0f}, n={pc_n} days)",
                                 style={"color": "#888"})]),
             html.Div([html.B("Max drawdown: "), html.Span(f"${max_dd:.2f}")]),
         ]),

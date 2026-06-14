@@ -171,6 +171,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--product", default="BTC-USD")
     ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Fit and print coefficients but do NOT overwrite "
+                         "settings/har_coefficients.json (read-only research).")
     args = ap.parse_args()
 
     print(f"Pulling {args.days} days of {args.product} 1-minute candles…")
@@ -217,11 +220,14 @@ def main():
     # Coefficients live in Aston/settings/ (next to aston_settings.json) —
     # app.py and recorder.py load them from there.
     path = Path(__file__).resolve().parents[1] / "settings" / "har_coefficients.json"
-    with path.open("w") as f:
-        json.dump(out, f, indent=2)
-
-    print()
-    print(f"Wrote {path}")
+    if args.dry_run:
+        print()
+        print("DRY RUN — not written (live coefficients untouched)")
+    else:
+        with path.open("w") as f:
+            json.dump(out, f, indent=2)
+        print()
+        print(f"Wrote {path}")
     print(f"  β0    = {out['beta0']:+.4f}")
     print(f"  β_15  = {out['beta_15']:+.4f}")
     print(f"  β_30  = {out['beta_30']:+.4f}")

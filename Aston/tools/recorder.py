@@ -424,7 +424,13 @@ class StandaloneRecorder:
     SQLite serializes writes via StateRecorder's internal lock.
     """
 
-    def __init__(self, series_ticker: str):
+    def __init__(self, series_ticker: str, ingest_attempts: bool = True):
+        # ingest_attempts=False for a secondary recorder (e.g. BTC) so it
+        # doesn't touch the shared order-attempt pipeline — that JSONL +
+        # its .ingest_offsets.json are written/deleted by the trading
+        # (ETH) recorder, and two recorders would race + delete each
+        # other's data.  A non-trading series has no order attempts anyway.
+        self.ingest_attempts = ingest_attempts
         # Imports inside __init__ so the library imports
         # (`from recorder import StateRecorder`) stay free of GUI / WS
         # dependencies.
@@ -539,10 +545,16 @@ class StandaloneRecorder:
         # the per-day SQLite's `order_attempts` table.  Picks up
         # whatever's accumulated since the last offset, so recorder
         # downtime just delays ingest — no data loss.
-        self._attempt_ingest_thread = threading.Thread(
-            target=self._attempt_ingest_loop, daemon=True,
-            name="recorder-attempt-ingest")
-        self._attempt_ingest_thread.start()
+        # Skipped on a secondary (non-trading) recorder so two instances
+        # don't race the shared offset file / delete each other's JSONL.
+        if self.ingest_attempts:
+            self._attempt_ingest_thread = threading.Thread(
+                target=self._attempt_ingest_loop, daemon=True,
+                name="recorder-attempt-ingest")
+            self._attempt_ingest_thread.start()
+        else:
+            print("[Recorder] order-attempt ingestion DISABLED "
+                  "(secondary recorder)")
 
         print("[Recorder] Running.  Ctrl-C to stop.")
         while not self._stop_event.is_set():
@@ -1032,5 +1044,10 @@ if __name__ == "__main__":
     ap.add_argument("--series", default="KXETH15M",
                     choices=list(SERIES_TO_PRODUCT.keys()),
                     help="Which 15-min series to record (default: KXETH15M)")
+    ap.add_argument("--no-attempt-ingest", action="store_true",
+                    help="Skip the order-attempt JSONL ingestion.  Use for a "
+                         "secondary recorder (e.g. BTC) so it doesn't race the "
+                         "trading recorder's shared offset file / JSONL.")
     args = ap.parse_args()
-    StandaloneRecorder(args.series).start()
+    StandaloneRecorder(args.series,
+                       ingest_attempts=not args.no_attempt_ingest).start()

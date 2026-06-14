@@ -294,17 +294,17 @@ class OSM:
         self._reconcile_ask()
 
     def _get_bid_size(self, requested_size) -> int:
-        # effective_long = current long + resting bid (would add to long)
-        resting = self.resting_bid.size if self.resting_bid else 0
-        effective_long = max(self.position, 0) + resting
-        available_capacity =  max(self.max_position - effective_long, 0)
+        # Capacity for the single maintained bid.  Do NOT subtract the
+        # resting bid — it's the quote being sized, not extra exposure.
+        # Subtracting it makes the clamp oscillate 0<->N within `size`
+        # lots of the cap, churning place/cancel at the same price.
+        # The size clamp alone guarantees position + bid <= max_position.
+        available_capacity = max(self.max_position - max(self.position, 0), 0)
         return min(int(requested_size), available_capacity)
 
     def _get_ask_size(self, requested_size) -> int:
-        # effective_short = current short + resting ask (would add to short)
-        resting = self.resting_ask.size if self.resting_ask else 0
-        effective_short = max(-self.position, 0) + resting
-        available_capacity =  max(self.max_position - effective_short, 0)
+        # Mirror of _get_bid_size on the short side.
+        available_capacity = max(self.max_position - max(-self.position, 0), 0)
         return min(int(requested_size), available_capacity)
 
     def _handle_cancel_bid(self):
