@@ -16,6 +16,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from utility import load_trades, load_theo, fetch_settlements_from_api
 
 
+'''
+Graph daily pnl mean by edge to see which is visually optimal
+'''
+def edge_test(tt):
+    #now iterate through many edge levels and graph the mean pnl results 
+    results = []
+    for i in np.arange(-0.1, 0.2, .01):
+        needed_edge = i
+        tt_edge_check = tt[tt['edge'] >= needed_edge].copy() 
+        tt_edge_check['moneyness'] = tt_edge_check['yes_price'] - tt_edge_check['outcome']
+
+        #split by day since we can assume the days are independent
+        tt_edge_check['date'] = pd.to_datetime(tt_edge_check['ts'], utc=True).dt.date
+        tt_day_check = tt_edge_check.groupby('date').agg(day_pnl=('moneyness', 'sum'), c_per_fill=('moneyness', 'mean'), trades_count=('moneyness', 'count'))
+
+        c_per_fill_mean = tt_day_check['c_per_fill'].mean()
+        daily_trade_count_mean = tt_day_check['trades_count'].mean()
+        results.append((i, c_per_fill_mean, daily_trade_count_mean))
+
+
+    d = results
+    edges    = [d[0] for d in results]
+    mean_pnl = [d[1] for d in results]
+    counts   = [d[2] for d in results]
+
+    plt.scatter(edges, mean_pnl)
+    for x, y, c in zip(edges, mean_pnl, counts):
+        plt.annotate(f"{c:,.0f}", (x, y),
+                    textcoords="offset points", xytext=(0, 6),
+                    ha='center', fontsize=8)
+
+    plt.xlabel('Edge level')
+    plt.ylabel('c/fill PnL')
+    plt.title('Mean PnL by edge threshold (label = trade count)')
+    plt.tight_layout()
+    plt.show()
+
+
+
 if Path('./longshot_results.csv').exists():
     tt = pd.read_csv('./longshot_results.csv')
 else:
@@ -42,7 +81,7 @@ else:
 
 print(tt.columns)
 #calculate the trades I would have wanted to be apart of
-needed_edge = 0.03
+needed_edge = 0.06
 tt_edge = tt[tt['edge'] >= needed_edge]
 tt_edge['moneyness'] = tt_edge['yes_price'] - tt_edge['outcome']
 
@@ -68,20 +107,15 @@ day_mean = tt_day['day_pnl'].mean()
 c_per_fill_mean = tt_day['c_per_fill'].mean()
 print('Day T-Stat:', t_day, ' p-value:', p_day, ' daily_pnl_mean:', day_mean, ' c_per_fill_mean:', c_per_fill_mean)
 
-
-
+#edge_test(tt)
 
 # start with edge level of 0.04 and regress to see if its just noise or there's edge
-print(tt_edge.head())
-print(tt_edge.columns)
-
 tt_edge ['ts'] = pd.to_datetime(tt_edge['ts'], utc=True)
 at8 = (tt_edge[tt_edge['ts'].dt.hour >= 8]
         .sort_values('ts')
         .groupby('date', as_index=False)
         .first())
 
-print(at8.head())
 at8['log_ret'] = np.log(at8['spot']).diff()   # log(today_8am) − log(yesterday_8am)
 
 #add in the log returns
@@ -109,41 +143,3 @@ plt.ylabel('Day PnL')
 plt.title(f"intercept={m.params['Intercept']:.1f} (p={m.pvalues['Intercept']:.3f}), "
         f"slope={m.params['log_ret']:.0f}")
 plt.show()
-
-
-'''
-Graph daily pnl mean by edge to see which is visually optimal
-'''
-def edge_test(tt):
-    #now iterate through many edge levels and graph the mean pnl results 
-    results = []
-    for i in np.arange(-0.1, 0.2, .01):
-        needed_edge = i
-        tt_edge_check = tt[tt['edge'] >= needed_edge].copy() 
-        tt_edge_check['moneyness'] = tt_edge_check['yes_price'] - tt_edge_check['outcome']
-
-        #split by day since we can assume the days are independent
-        tt_edge_check['date'] = pd.to_datetime(tt_edge_check['ts'], utc=True).dt.date
-        tt_day_check = tt_edge_check.groupby('date').agg(day_pnl=('moneyness', 'sum'), c_per_fill=('moneyness', 'mean'), trades_count=('moneyness', 'count'))
-
-        day_mean = tt_day_check['day_pnl'].mean()
-        daily_trade_count_mean = tt_day_check['trades_count'].mean()
-        results.append((i, day_mean, daily_trade_count_mean))
-
-
-    d = results
-    edges    = [d[0] for d in results]
-    mean_pnl = [d[1] for d in results]
-    counts   = [d[2] for d in results]
-
-    plt.scatter(edges, mean_pnl)
-    for x, y, c in zip(edges, mean_pnl, counts):
-        plt.annotate(f"{c:,.0f}", (x, y),
-                    textcoords="offset points", xytext=(0, 6),
-                    ha='center', fontsize=8)
-
-    plt.xlabel('Edge level')
-    plt.ylabel('Mean PnL')
-    plt.title('Mean PnL by edge threshold (label = trade count)')
-    plt.tight_layout()
-    plt.show()

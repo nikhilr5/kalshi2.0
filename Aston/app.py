@@ -37,26 +37,6 @@ from osm import OSM
 
 SETTINGS_PATH = Path(__file__).resolve().parent / "settings" / "aston_settings.json"
 
-# Inventory-skew preview (DISPLAY ONLY — does not affect quoting).
-# Avellaneda-Stoikov lean: skew = -gamma * sigma^2 * (secs/yr) * position,
-# capped at +/- SKEW_CAP.  Shown under the POSITION card so the would-be
-# lean can be eyeballed live before the skew is ever wired into quotes.
-# gamma~350 calibrated on 27d/2342mkt history (few-cent lean on a deep
-# short mid-window, decaying to ~0 by close, inside the 7c bid cushion).
-SKEW_GAMMA = 350.0
-SKEW_CAP = 0.06
-_SKEW_YEAR_SECS = 365.25 * 24 * 3600
-
-
-def inventory_skew(sigma, secs, position):
-    """Signed lean in dollars the AS rule would apply (display preview).
-    Positive => quotes slide up (helps cover a short).  None if inputs
-    aren't ready."""
-    if sigma is None or secs is None or position == 0:
-        return 0.0
-    s = -SKEW_GAMMA * (sigma ** 2) * (max(secs, 0.0) / _SKEW_YEAR_SECS) * position
-    return max(-SKEW_CAP, min(SKEW_CAP, s))
-
 
 def _load_settings() -> dict:
     try:
@@ -503,11 +483,6 @@ class AstonApp(QMainWindow):
             "color:#5a6270;font-size:10px;background:transparent;border:none;")
         self.theo_card.layout().addWidget(self.theo_rate_label)
         self.position_card = self._make_metric("POSITION", "0", "#c8cdd5")
-        # Would-be inventory skew (display only — not wired into quoting).
-        self.skew_label = QLabel("skew --")
-        self.skew_label.setStyleSheet(
-            "color:#5a6270;font-size:10px;background:transparent;border:none;")
-        self.position_card.layout().addWidget(self.skew_label)
         for w in (self.bid_card, self.ask_card,
                   self.theo_card, self.position_card):
             quotes.addWidget(w, 1)
@@ -1176,12 +1151,6 @@ class AstonApp(QMainWindow):
         self._last_theo = theo
         self._last_sigma = sigma
 
-        # Inventory-skew preview (display only — not applied to quotes).
-        skew = inventory_skew(sigma, secs, self._position)
-        if self._position == 0 or sigma is None:
-            self.skew_label.setText("skew --")
-        else:
-            self.skew_label.setText(f"skew {skew * 100:+.2f}¢  (γ={SKEW_GAMMA:.0f})")
         if self.strategy and theo is not None:
             self.strategy.update_bbo((self.yes_bid, self.yes_ask))
             self.strategy.update_theo(theo)
