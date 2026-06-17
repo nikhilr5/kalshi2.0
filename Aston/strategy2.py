@@ -6,13 +6,26 @@ class Strategy2:
     def __init__(self, ticker,
                  strike, edge_bid,
                  edge_ask, size_bid,
-                 size_ask, osm):
+                 size_ask, osm,
+                 bid_enabled=True, ask_enabled=True,
+                 range_min_bid=0.0, range_max_bid=1.0,
+                 range_min_ask=0.0, range_max_ask=1.0):
         self.ticker = ticker
         self.strike = strike
         self.edge_bid = edge_bid
         self.edge_ask = edge_ask
         self.size_bid = size_bid
         self.size_ask = size_ask
+        # Per-side enable + price-range gates.  A side only quotes when
+        # it's enabled AND its quote price (theo ± edge) is within
+        # [range_min, range_max] for that side.  Defaults reproduce the
+        # always-on, full-range [0,1] behavior.
+        self.bid_enabled = bid_enabled
+        self.ask_enabled = ask_enabled
+        self.range_min_bid = range_min_bid
+        self.range_max_bid = range_max_bid
+        self.range_min_ask = range_min_ask
+        self.range_max_ask = range_max_ask
         self.queue = queue.Queue()
         self.running = False
         # OSM owns position + max_position + capacity clamping.
@@ -49,12 +62,18 @@ class Strategy2:
         self.queue.put(('THEO', theo))
 
     def update_params(self, edge_bid, edge_ask, size_bid, size_ask,
-                    max_position, tolerance=0.01, dwell_s=1.0):
+                    max_position, tolerance=0.01, dwell_s=1.0,
+                    bid_enabled=True, ask_enabled=True,
+                    range_min_bid=0.0, range_max_bid=1.0,
+                    range_min_ask=0.0, range_max_ask=1.0):
       self.queue.put(('SETTINGS', {
           "edge_bid": edge_bid, "edge_ask": edge_ask,
           "size_bid": size_bid, "size_ask": size_ask,
           "max_position": max_position, "tolerance": tolerance,
           "dwell_s": dwell_s,
+          "bid_enabled": bid_enabled, "ask_enabled": ask_enabled,
+          "range_min_bid": range_min_bid, "range_max_bid": range_max_bid,
+          "range_min_ask": range_min_ask, "range_max_ask": range_max_ask,
       }))
 
     def update_bbo(self, bbo: tuple):
@@ -111,19 +130,32 @@ class Strategy2:
         desired_bid = min(self.theo - self.edge_bid, self.best_bid)
         desired_ask = max(self.theo + self.edge_ask, self.best_ask)
 
+        # ---- Per-side enable + range gate ------------------------
+        # Quote price for the gate is the un-clamped theo ± edge (what
+        # the user dials in), NOT the BBO-clamped desired price.  A side
+        # is gated off when disabled OR when its quote price falls
+        # outside [range_min, range_max] for that side; gated-off means
+        # pull any resting order on that side (same as the risk guards).
+        ask_quote = self.theo + self.edge_ask
+        bid_quote = self.theo - self.edge_bid
+        ask_gated = (not self.ask_enabled
+                     or not (self.range_min_ask <= ask_quote <= self.range_max_ask))
+        bid_gated = (not self.bid_enabled
+                     or not (self.range_min_bid <= bid_quote <= self.range_max_bid))
+
         # ---- Ask-side guards ------------------------------------
         # Tail-market: yes_bid ≥ 98¢ means the contract is virtually
         # certain to settle YES.  Adverse-selection bait — no edge to
         # extract by selling near-certain YES.  Pull instead.
         # Fair-range: a sell at ≥ $1 will be rejected by Kalshi
         # post-only anyway; cancel instead of churning the API.
-        if self.best_bid >= 0.98 or desired_ask >= 1.0:
+        if ask_gated or self.best_bid >= 0.98 or desired_ask >= 1.0:
             self.osm.cancel_ask()
         else:
             self.osm.ensure_ask(desired_ask, self.size_ask)
 
         # ---- Bid-side guards (mirror) ----------------------------
-        if self.best_ask <= 0.02 or desired_bid <= 0.0:
+        if bid_gated or self.best_ask <= 0.02 or desired_bid <= 0.0:
             self.osm.cancel_bid()
         else:
             self.osm.ensure_bid(desired_bid, self.size_bid)
@@ -133,7 +165,18 @@ class Strategy2:
       self.edge_ask     = payload["edge_ask"]
       self.size_bid     = payload["size_bid"]
       self.size_ask     = payload["size_ask"]
+      self.bid_enabled    = payload.get("bid_enabled", True)
+      self.ask_enabled    = payload.get("ask_enabled", True)
+      self.range_min_bid  = payload.get("range_min_bid", 0.0)
+      self.range_max_bid  = payload.get("range_max_bid", 1.0)
+      self.range_min_ask  = payload.get("range_min_ask", 0.0)
+      self.range_max_ask  = payload.get("range_max_ask", 1.0)
       # tolerance + max_position live in OSM — forward via its queue.
       self.osm.update_tolerance(payload["tolerance"])
       self.osm.update_max_position(payload["max_position"])
       self.osm.update_dwell(payload.get("dwell_s", 1.0))
+      # Gate may have flipped a side on/off or moved its range — re-run
+      # the quoting decision so the change takes effect without waiting
+      # for the next theo/BBO tick.
+      if self.theo > 0:
+          self._repost()

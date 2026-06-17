@@ -17,9 +17,9 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QMainWindow, QMenu, QSpinBox, QTableWidget,
-    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout,
+    QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QSpinBox,
+    QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from kalshi_api import KalshiAPI
@@ -36,6 +36,19 @@ from osm import OSM
 
 
 SETTINGS_PATH = Path(__file__).resolve().parent / "settings" / "aston_settings.json"
+
+
+class _GridCell(QWidget):
+    """Thin wrapper so a label-less spinbox can be dropped into a grid
+    cell and grayed out as a unit.  Exposes `.spin` for value access,
+    matching the `.spin` attribute the compact-spin layouts expose."""
+
+    def __init__(self, spin):
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(spin)
+        self.spin = spin
 
 
 def _load_settings() -> dict:
@@ -543,9 +556,9 @@ class AstonApp(QMainWindow):
 
         self.settings_panel = QFrame()
         self.settings_panel.setObjectName("settingsPanel")
-        sp = QHBoxLayout(self.settings_panel)
+        sp = QVBoxLayout(self.settings_panel)
         sp.setContentsMargins(12, 10, 12, 10)
-        sp.setSpacing(10)
+        sp.setSpacing(12)
 
         # Edge inputs are now in CENTS (display + storage).  Old saved
         # values were in dollars (< 1.0); migrate by ×100 on load so
@@ -556,15 +569,73 @@ class AstonApp(QMainWindow):
             ebid *= 100
         if eask < 1.0:
             eask *= 100
+
+        # ---- Per-side grid: BID | ASK columns, one row per sided
+        # setting.  Column 0 is the row label; column 1 = BID, 2 = ASK.
+        # Top row of each side column is an enable checkbox that grays
+        # out that column's inputs when unchecked.  Ranges are stored in
+        # DOLLARS [0,1] (matching theo); shown here as dollars too so
+        # the gate math is transparent against the THEO card (cents).
+        bid_grid = QGridLayout()
+        bid_grid.setHorizontalSpacing(14)
+        bid_grid.setVerticalSpacing(6)
+
+        col_bid_title = QLabel("BID")
+        col_bid_title.setObjectName("settingTitle")
+        col_ask_title = QLabel("ASK")
+        col_ask_title.setObjectName("settingTitle")
+        bid_grid.addWidget(col_bid_title, 0, 1)
+        bid_grid.addWidget(col_ask_title, 0, 2)
+
+        self.bid_enable_chk = QCheckBox("Bid on")
+        self.bid_enable_chk.setChecked(bool(self.settings.get("bid_enabled", True)))
+        self.ask_enable_chk = QCheckBox("Ask on")
+        self.ask_enable_chk.setChecked(bool(self.settings.get("ask_enabled", True)))
+        bid_grid.addWidget(self.bid_enable_chk, 1, 1)
+        bid_grid.addWidget(self.ask_enable_chk, 1, 2)
+
         # Spec: cent values, tenth-of-cent precision, half-cent stepper.
-        self.edge_bid_input = self._make_compact_double_spin(
-            "Edge Bid (¢)", ebid, 0.0, 50.0, 0.5, decimals=1)
-        self.edge_ask_input = self._make_compact_double_spin(
-            "Edge Ask (¢)", eask, 0.0, 50.0, 0.5, decimals=1)
-        self.size_bid_input = self._make_compact_int_spin(
-            "Size Bid", int(self.settings.get("size_bid", 10)), 1, 10000)
-        self.size_ask_input = self._make_compact_int_spin(
-            "Size Ask", int(self.settings.get("size_ask", 10)), 1, 10000)
+        self.edge_bid_input = self._make_bare_double_spin(
+            ebid, 0.0, 50.0, 0.5, decimals=1)
+        self.edge_ask_input = self._make_bare_double_spin(
+            eask, 0.0, 50.0, 0.5, decimals=1)
+        self.size_bid_input = self._make_bare_int_spin(
+            int(self.settings.get("size_bid", 10)), 1, 10000)
+        self.size_ask_input = self._make_bare_int_spin(
+            int(self.settings.get("size_ask", 10)), 1, 10000)
+        # Range gate (dollars [0,1]) — a side is only quoted when its
+        # quote price (theo ± edge) lands in [range_min, range_max].
+        # Defaults 0.0 / 1.0 admit every price → no behavior change.
+        self.range_min_bid_input = self._make_bare_double_spin(
+            float(self.settings.get("range_min_bid", 0.0)), 0.0, 1.0, 0.01, decimals=2)
+        self.range_max_bid_input = self._make_bare_double_spin(
+            float(self.settings.get("range_max_bid", 1.0)), 0.0, 1.0, 0.01, decimals=2)
+        self.range_min_ask_input = self._make_bare_double_spin(
+            float(self.settings.get("range_min_ask", 0.0)), 0.0, 1.0, 0.01, decimals=2)
+        self.range_max_ask_input = self._make_bare_double_spin(
+            float(self.settings.get("range_max_ask", 1.0)), 0.0, 1.0, 0.01, decimals=2)
+
+        def _row(r, label, bid_spin, ask_spin):
+            t = QLabel(label)
+            t.setObjectName("settingTitle")
+            bid_grid.addWidget(t, r, 0)
+            bid_grid.addWidget(bid_spin, r, 1)
+            bid_grid.addWidget(ask_spin, r, 2)
+
+        _row(2, "Edge (¢)", self.edge_bid_input, self.edge_ask_input)
+        _row(3, "Size", self.size_bid_input, self.size_ask_input)
+        _row(4, "Range min ($)", self.range_min_bid_input, self.range_min_ask_input)
+        _row(5, "Range max ($)", self.range_max_bid_input, self.range_max_ask_input)
+
+        # Track which spins belong to each side so the enable checkbox
+        # can gray the whole column out.
+        self._bid_side_spins = [self.edge_bid_input, self.size_bid_input,
+                                self.range_min_bid_input, self.range_max_bid_input]
+        self._ask_side_spins = [self.edge_ask_input, self.size_ask_input,
+                                self.range_min_ask_input, self.range_max_ask_input]
+        sp.addLayout(bid_grid)
+
+        # ---- Non-sided settings — outside the grid.
         self.max_pos_input = self._make_compact_int_spin(
             "Max Pos", int(self.settings.get("max_position", 50)), 1, 10000)
         # Repricing tolerance — in CENTS for the UI, stored as dollars
@@ -585,18 +656,24 @@ class AstonApp(QMainWindow):
             "Dwell (s)", float(self.settings.get("dwell_s", 1.0)),
             0.0, 10.0, 0.1, decimals=1)
 
-        for w in (self.edge_bid_input, self.edge_ask_input,
-                  self.size_bid_input, self.size_ask_input,
-                  self.max_pos_input, self.tolerance_input,
-                  self.dwell_input):
-            sp.addLayout(w)
-        sp.addStretch()
+        global_row = QHBoxLayout()
+        global_row.setSpacing(10)
+        for w in (self.max_pos_input, self.tolerance_input, self.dwell_input):
+            global_row.addLayout(w)
+        global_row.addStretch()
+        sp.addLayout(global_row)
 
         for spin in (self.edge_bid_input.spin, self.edge_ask_input.spin,
                      self.size_bid_input.spin, self.size_ask_input.spin,
+                     self.range_min_bid_input.spin, self.range_max_bid_input.spin,
+                     self.range_min_ask_input.spin, self.range_max_ask_input.spin,
                      self.max_pos_input.spin, self.tolerance_input.spin,
                      self.dwell_input.spin):
             spin.valueChanged.connect(self._on_param_changed)
+        self.bid_enable_chk.toggled.connect(self._on_side_enable_changed)
+        self.ask_enable_chk.toggled.connect(self._on_side_enable_changed)
+        # Apply the initial enabled/disabled visual state from settings.
+        self._apply_side_enable_state()
 
         self.settings_panel.setVisible(False)
         outer.addWidget(self.settings_panel)
@@ -612,6 +689,21 @@ class AstonApp(QMainWindow):
         on = self.settings_toggle.isChecked()
         self.settings_panel.setVisible(on)
         self.settings_toggle.setText("▼  Settings" if on else "▶  Settings")
+
+    def _apply_side_enable_state(self):
+        """Gray out (disable) a side's grid inputs when its enable
+        checkbox is unchecked.  Pure visual/edit gating — the actual
+        quoting suppression is enforced in Strategy2._repost."""
+        bid_on = self.bid_enable_chk.isChecked()
+        ask_on = self.ask_enable_chk.isChecked()
+        for cell in self._bid_side_spins:
+            cell.setEnabled(bid_on)
+        for cell in self._ask_side_spins:
+            cell.setEnabled(ask_on)
+
+    def _on_side_enable_changed(self, _checked):
+        self._apply_side_enable_state()
+        self._on_param_changed(None)
 
     def _make_metric(self, title: str, initial: str, color: str) -> QWidget:
         """Title-over-value card.  All metric cards share size so the row
@@ -698,6 +790,26 @@ class AstonApp(QMainWindow):
         v.addWidget(sb)
         v.spin = sb
         return v
+
+    def _make_bare_double_spin(self, initial: float, minv: float,
+                               maxv: float, step: float, decimals: int = 2):
+        """Label-less double spin for the per-side grid (the row label
+        lives in column 0).  Returned object exposes `.spin` and `.widget`
+        — `.widget` is what gets added to the grid + grayed out."""
+        sb = QDoubleSpinBox()
+        sb.setRange(minv, maxv)
+        sb.setSingleStep(step)
+        sb.setDecimals(decimals)
+        sb.setValue(float(initial))
+        sb.setMaximumWidth(90)
+        return _GridCell(sb)
+
+    def _make_bare_int_spin(self, initial: int, minv: int, maxv: int):
+        sb = QSpinBox()
+        sb.setRange(minv, maxv)
+        sb.setValue(int(initial))
+        sb.setMaximumWidth(90)
+        return _GridCell(sb)
 
     def _apply_toggle_style(self, on: bool):
         """Style the MM toggle button (QToolButton with menu popup)."""
@@ -854,6 +966,13 @@ class AstonApp(QMainWindow):
         QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover,
         QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover{
             background:#2d3a4d;}
+        QDoubleSpinBox:disabled, QSpinBox:disabled{
+            background:#10141d;color:#3a424f;border:1px solid #161c28;}
+        QCheckBox{color:#c8cdd5;font-size:11px;font-weight:bold;
+                  background:transparent;spacing:6px;}
+        QCheckBox::indicator{width:14px;height:14px;border-radius:3px;
+                  border:1px solid #2d3a4d;background:#161c28;}
+        QCheckBox::indicator:checked{background:#16a34a;border:1px solid #16a34a;}
         QTableWidget{background:#0e1320;color:#c8cdd5;
                      gridline-color:#1e2736;border:1px solid #1e2736;
                      border-radius:6px;}
@@ -1189,6 +1308,12 @@ class AstonApp(QMainWindow):
                 size_bid=self.size_bid_input.spin.value(),
                 size_ask=self.size_ask_input.spin.value(),
                 osm=self.osm,
+                bid_enabled=self.bid_enable_chk.isChecked(),
+                ask_enabled=self.ask_enable_chk.isChecked(),
+                range_min_bid=self.range_min_bid_input.spin.value(),
+                range_max_bid=self.range_max_bid_input.spin.value(),
+                range_min_ask=self.range_min_ask_input.spin.value(),
+                range_max_ask=self.range_max_ask_input.spin.value(),
             )
             self.osm.strategy_queue = self.strategy.queue
             self.osm.start()
@@ -1218,6 +1343,12 @@ class AstonApp(QMainWindow):
                 max_position=self.max_pos_input.spin.value(),
                 tolerance=self.tolerance_input.spin.value() / 100.0,
                 dwell_s=self.dwell_input.spin.value(),
+                bid_enabled=self.bid_enable_chk.isChecked(),
+                ask_enabled=self.ask_enable_chk.isChecked(),
+                range_min_bid=self.range_min_bid_input.spin.value(),
+                range_max_bid=self.range_max_bid_input.spin.value(),
+                range_min_ask=self.range_min_ask_input.spin.value(),
+                range_max_ask=self.range_max_ask_input.spin.value(),
             )
 
     def _save_current_params(self):
@@ -1228,6 +1359,12 @@ class AstonApp(QMainWindow):
         self.settings["max_position"] = self.max_pos_input.spin.value()
         self.settings["tolerance"] = self.tolerance_input.spin.value()
         self.settings["dwell_s"] = self.dwell_input.spin.value()
+        self.settings["bid_enabled"] = self.bid_enable_chk.isChecked()
+        self.settings["ask_enabled"] = self.ask_enable_chk.isChecked()
+        self.settings["range_min_bid"] = self.range_min_bid_input.spin.value()
+        self.settings["range_max_bid"] = self.range_max_bid_input.spin.value()
+        self.settings["range_min_ask"] = self.range_min_ask_input.spin.value()
+        self.settings["range_max_ask"] = self.range_max_ask_input.spin.value()
         _save_settings(self.settings)
 
     # ------------------------------------------------------------------

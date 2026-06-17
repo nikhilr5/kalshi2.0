@@ -201,6 +201,16 @@ CF_CHANGE_DAY   = day_to_suffix(CF_CHANGE_D)
 CF_CHANGE_DATE  = CF_CHANGE_D.isoformat()
 CF_CHANGE_LABEL = "CF index"
 
+# Sell-only longshot-fade config: quote the ask only when the price sits in
+# ~0.10-0.35, fading retail's overpriced cheap YES.  Moneyness + Markout tabs
+# scope to fills on/after this point; the P&L tab marks it with the green line.
+# UPDATE the date to the actual restart instant when you flip the live app
+# into the longshot config (it's a placeholder until then).
+LONGSHOT_CHANGE_DATE  = "2026-06-17"          # placeholder — set to the real flip date
+LONGSHOT_CHANGE_DAY   = "26JUN17"
+LONGSHOT_CHANGE_D     = parse_day_suffix(LONGSHOT_CHANGE_DAY)
+LONGSHOT_CHANGE_LABEL = "Longshot fade · sell 0.10–0.35"
+
 
 def pnl_figure(fills):
     if fills.empty:
@@ -243,6 +253,8 @@ def pnl_figure(fills):
                       row=row, col=1)
         fig.add_vline(x=CF_CHANGE_DATE, line=dict(color='#38bdf8', width=2),
                       row=row, col=1)
+        fig.add_vline(x=LONGSHOT_CHANGE_DATE, line=dict(color='#4ade80', width=2),
+                      row=row, col=1)
     fig.add_annotation(x=CONFIG_CHANGE_DATE, y=1, yref='paper',
                        text=CONFIG_CHANGE_LABEL, showarrow=False,
                        font=dict(color='#facc15', size=11),
@@ -250,6 +262,10 @@ def pnl_figure(fills):
     fig.add_annotation(x=CF_CHANGE_DATE, y=1, yref='paper',
                        text=CF_CHANGE_LABEL, showarrow=False,
                        font=dict(color='#38bdf8', size=11),
+                       xanchor='left', yanchor='top')
+    fig.add_annotation(x=LONGSHOT_CHANGE_DATE, y=1, yref='paper',
+                       text=LONGSHOT_CHANGE_LABEL, showarrow=False,
+                       font=dict(color='#4ade80', size=11),
                        xanchor='left', yanchor='top')
     fig.update_yaxes(title_text='$', row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text='ETH spot', row=1, col=1, secondary_y=True,
@@ -276,15 +292,13 @@ def _post_change(fills: pd.DataFrame) -> pd.DataFrame:
     return fills[fills['date'] >= CONFIG_CHANGE_D]
 
 
-def _post_cf(fills: pd.DataFrame) -> pd.DataFrame:
-    """Restrict to the post-CF-index window.  Moneyness and markouts are
-    only valid against the correct (CF) theo, so they use this boundary —
-    not CONFIG_CHANGE_D.  Day-granularity; sourced from the shared
-    utility.CF_INDEX_CUTOVER so the filter and the dashboard vline can't
-    drift apart."""
+def _post_longshot(fills: pd.DataFrame) -> pd.DataFrame:
+    """Restrict to the post-longshot-fade window (>= LONGSHOT_CHANGE_D).
+    Moneyness and markouts scope here so they reflect only the sell-only
+    0.10-0.35 config; day-granularity, matched to the green dashboard vline."""
     if fills.empty or 'date' not in fills.columns:
         return fills
-    return fills[fills['date'] >= CF_CHANGE_D]
+    return fills[fills['date'] >= LONGSHOT_CHANGE_D]
 
 
 def moneyness_breakdown(fills: pd.DataFrame) -> pd.DataFrame:
@@ -292,7 +306,7 @@ def moneyness_breakdown(fills: pd.DataFrame) -> pd.DataFrame:
     fill price is the moneyness axis — low=OTM, high=ITM.  Scoped to the
     post-CF-index window so theo (the moneyness reference) is the correct
     CF index, not stale Coinbase-spot theo."""
-    fills = _post_cf(fills)
+    fills = _post_longshot(fills)
     if fills.empty:
         return pd.DataFrame()
     f = fills.copy()
@@ -330,7 +344,7 @@ def moneyness_figure(fills: pd.DataFrame):
     fig.update_yaxes(title_text='c/fill', row=1, col=1)
     fig.update_yaxes(title_text='fills', row=2, col=1)
     fig.update_xaxes(title_text='YES fill price (c) — OTM → ITM', row=2, col=1)
-    cf = _post_cf(fills)
+    cf = _post_longshot(fills)
     n = int(g['n'].sum())
     sub = _cf_subtitle(n, cf['date'].max() if not cf.empty else None)
     fig.update_layout(template='plotly_dark', height=770, barmode='group',
@@ -349,11 +363,11 @@ def _window_label(fills: pd.DataFrame) -> str:
 
 
 def _cf_subtitle(n: int, last_date=None) -> str:
-    """Post-CF scope line for the moneyness/markout tabs.  n is the fill
-    count in the filtered (post-CF) frame the caller already built."""
+    """Scope line for the moneyness/markout tabs (post-longshot-fade window).
+    n is the fill count in the filtered frame the caller already built."""
     if not n:
-        return f"post-CF ({CF_CHANGE_DATE}): no fills yet"
-    return f"post-CF: n={n:,} fills, {CF_CHANGE_DATE} → {last_date}"
+        return f"longshot fade ({LONGSHOT_CHANGE_DATE}): no fills yet"
+    return f"longshot fade: n={n:,} fills, {LONGSHOT_CHANGE_DATE} → {last_date}"
 
 
 def moneyness_panel(fills: pd.DataFrame):
@@ -361,7 +375,7 @@ def moneyness_panel(fills: pd.DataFrame):
     if g.empty:
         return html.Div("No fills yet in window.", style={"color": "#888"})
 
-    cf = _post_cf(fills)
+    cf = _post_longshot(fills)
     window = html.Div(
         _cf_subtitle(int(g['n'].sum()),
                      cf['date'].max() if not cf.empty else None),
@@ -462,10 +476,10 @@ def _day_cache_path(day: str) -> Path:
 
 
 def compute_markouts() -> pd.DataFrame:
-    # Post-CF only: markouts measure fills vs theo-driven mid, so they are
-    # only valid once the app is on the CF index.  Start the day-range at
-    # the CF cutover day (sourced from utility.CF_INDEX_CUTOVER).
-    days = day_range(CF_CHANGE_DAY, "today")
+    # Post-longshot-fade only: scope markouts to the sell-only 0.10-0.35
+    # config so they reflect that strategy.  Start the day-range at the
+    # longshot cutover day.
+    days = day_range(LONGSHOT_CHANGE_DAY, "today")
     today = days[-1] if days else None        # partial — never cached
     frames = []
     for day in days:
