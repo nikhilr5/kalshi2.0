@@ -179,9 +179,14 @@ class StateRecorder:
                 rv_15m REAL,
                 rv_30m REAL,
                 rv_4h REAL,
-                rv_24h REAL
+                rv_24h REAL,
+                index_source TEXT
             )
         """)
+        try:
+            conn.execute("ALTER TABLE theo_state ADD COLUMN index_source TEXT")
+        except Exception:
+            pass  # already present on existing-day DBs
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_ts ON theo_state(ts)")
 
         # order_attempts — populated by the recorder's JSONL tail-ingest
@@ -303,17 +308,18 @@ class StateRecorder:
                          seconds_to_expiry: float,
                          sigma: float | None, theo: float | None,
                          rv_15m: float | None, rv_30m: float | None,
-                         rv_4h: float | None, rv_24h: float | None):
+                         rv_4h: float | None, rv_24h: float | None,
+                         index_source: str | None = None):
         now = datetime.now(tz=timezone.utc).isoformat()
         with self._lock:
             conn = self._conn_now(series_ticker)
             conn.execute("""
                 INSERT INTO theo_state
                 (ts, ticker, spot, strike, seconds_to_expiry,
-                 sigma, theo, rv_15m, rv_30m, rv_4h, rv_24h)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 sigma, theo, rv_15m, rv_30m, rv_4h, rv_24h, index_source)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """, (now, ticker, spot, strike, seconds_to_expiry,
-                  sigma, theo, rv_15m, rv_30m, rv_4h, rv_24h))
+                  sigma, theo, rv_15m, rv_30m, rv_4h, rv_24h, index_source))
             conn.commit()
 
     def write_order_attempt(self, series_ticker: str, event: dict):
@@ -436,7 +442,7 @@ class StandaloneRecorder:
         # dependencies.
         from kalshi_api import KalshiAPI
         from feeds.ws_feed import KalshiWsFeed, UserOrdersWsFeed
-        from feeds.crypto_feed import CryptoPriceFeed
+        from feeds.cfbenchmarks_feed import CFBenchmarksFeed
         from pricing.har_rv import HARRVEstimator
         from feeds.market_discovery import get_active_market, parse_strike
 
@@ -471,7 +477,7 @@ class StandaloneRecorder:
         self.spot_ws = None
         self._KalshiWsFeed = KalshiWsFeed
         self._UserOrdersWsFeed = UserOrdersWsFeed
-        self._CryptoPriceFeed = CryptoPriceFeed
+        self._CFBenchmarksFeed = CFBenchmarksFeed
         self._get_active_market = get_active_market
         self._parse_strike = parse_strike
 
@@ -515,8 +521,8 @@ class StandaloneRecorder:
         self._roll_market()
 
         # Coinbase WS
-        self.spot_ws = self._CryptoPriceFeed(
-            self._on_spot_tick, self.product)
+        self.spot_ws = self._CFBenchmarksFeed(
+            self._on_spot_tick, self.product, self.api)
         self.spot_ws.start()
 
         # user_orders WS (account-scoped, no ticker filter)
@@ -889,7 +895,8 @@ class StandaloneRecorder:
                 self.spot, self.strike, secs,
                 sigma, theo,
                 b.get("rv_15m"), b.get("rv_30m"),
-                b.get("rv_4h"),  b.get("rv_24h"))
+                b.get("rv_4h"),  b.get("rv_24h"),
+                "cf_rti")
         except Exception as e:
             print(f"[Recorder] theo_state write failed: {e}")
 

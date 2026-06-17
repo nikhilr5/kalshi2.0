@@ -26,8 +26,9 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'analysis'))
 sys.path.insert(0, str(ROOT / 'Aston'))
 from utility import (
-    bootstrap_ci, day_range, fetch_settlements_from_api, list_eligible_dbs,
-    load_book, load_fills, parse_day_suffix,
+    CF_INDEX_CUTOVER, bootstrap_ci, day_range, day_to_suffix,
+    fetch_settlements_from_api, list_eligible_dbs, load_book, load_daily_spot,
+    load_fills, parse_day_suffix,
 )
 from kalshi_api import KalshiAPI
 
@@ -116,10 +117,10 @@ def pnl_stats(fills):
     today_pnl   = float(today['realized_c'].sum() / 100)
     today_fills = len(today)
     last_7 = daily.tail(7).sum()
-    # Post-change (v2 + 3-lot) window t-stat — current config only; the
-    # all-days t-stat above blends old + new config and isn't the one to
-    # judge the live strategy on.
-    pc = _post_change(fills)
+    # Current-config window t-stat — measured from the CF-index switch (the
+    # latest change).  The all-days t-stat above blends every config.
+    pc = (fills[fills['date'] >= CF_CHANGE_D]
+          if 'date' in fills.columns else fills.iloc[0:0])
     if not pc.empty:
         pc_daily = pc.groupby('date')['realized_c'].sum() / 100
         pc_n = len(pc_daily)
@@ -162,7 +163,7 @@ def pnl_stats(fills):
                                 if tstat == tstat else {}),
                       html.Span(f"  (n={n_days} days)",
                                 style={"color": "#888"})]),
-            html.Div([html.B(f"t-stat ({CONFIG_CHANGE_LABEL}): "),
+            html.Div([html.B(f"t-stat ({CF_CHANGE_LABEL}): "),
                       html.Span(f"{pc_t:+.2f}",
                                 style={"color": ("#22c55e" if pc_t > 2
                                                   else "#facc15" if pc_t > 1
@@ -188,6 +189,18 @@ CONFIG_CHANGE_DAY  = "26JUN09"             # suffix for day_range
 CONFIG_CHANGE_D    = parse_day_suffix(CONFIG_CHANGE_DAY)   # date for filtering
 CONFIG_CHANGE_LABEL = "v2 + 3-lot"
 
+# 2026-06-15: theo switched from Coinbase spot to the CF Benchmarks index
+# (ETHUSD_RTI) — the reference Kalshi actually settles on.  Second boundary;
+# the post-change t-stat is measured from here (the current config).
+# CF-index cutover — single source of truth is utility.CF_INDEX_CUTOVER
+# (a UTC instant; the live app's Coinbase->CF restart).  Derive the
+# day-granularity date used by the dashboard's filters and vline from it
+# so the analysis boundary and the visual marker can never disagree.
+CF_CHANGE_D     = CF_INDEX_CUTOVER.date()
+CF_CHANGE_DAY   = day_to_suffix(CF_CHANGE_D)
+CF_CHANGE_DATE  = CF_CHANGE_D.isoformat()
+CF_CHANGE_LABEL = "CF index"
+
 
 def pnl_figure(fills):
     if fills.empty:
@@ -199,12 +212,22 @@ def pnl_figure(fills):
     fills_per_day = fills.groupby('date').size()
     fig = make_subplots(
         rows=3, cols=1,
-        subplot_titles=("Cumulative realized P&L ($)", "Daily P&L ($)",
-                         "Fills per day"),
-        row_heights=[0.5, 0.3, 0.2], shared_xaxes=True, vertical_spacing=0.06)
+        subplot_titles=("Cumulative realized P&L ($)  ·  ETH spot overlay",
+                         "Daily P&L ($)", "Fills per day"),
+        row_heights=[0.5, 0.3, 0.2], shared_xaxes=True, vertical_spacing=0.06,
+        specs=[[{"secondary_y": True}], [{}], [{}]])
+    # ETH spot (faint, secondary axis) — drawn first so P&L sits on top.
+    spot = load_daily_spot(cumulative.index.min(), until=cumulative.index.max())
+    if not spot.empty:
+        fig.add_trace(go.Scatter(
+            x=spot['date'], y=spot['spot'], mode='lines', name='ETH spot',
+            line=dict(color='#94a3b8', width=1.5), opacity=0.35,
+            hovertemplate='ETH %{y:.0f}<extra></extra>'),
+            row=1, col=1, secondary_y=True)
     fig.add_trace(go.Scatter(
         x=cumulative.index, y=cumulative.values, mode='lines+markers',
-        line=dict(color='#22c55e', width=3), marker=dict(size=8)), row=1, col=1)
+        line=dict(color='#22c55e', width=3), marker=dict(size=8)),
+        row=1, col=1, secondary_y=False)
     fig.add_hline(y=0, line=dict(color='#666', dash='dot'), row=1, col=1)
     bar_colors = ['#22c55e' if v >= 0 else '#dc2626' for v in daily.values]
     fig.add_trace(go.Bar(
@@ -218,11 +241,19 @@ def pnl_figure(fills):
     for row in (1, 2, 3):
         fig.add_vline(x=CONFIG_CHANGE_DATE, line=dict(color='#facc15', width=2),
                       row=row, col=1)
+        fig.add_vline(x=CF_CHANGE_DATE, line=dict(color='#38bdf8', width=2),
+                      row=row, col=1)
     fig.add_annotation(x=CONFIG_CHANGE_DATE, y=1, yref='paper',
-                       text="v2 + 3-lot", showarrow=False,
+                       text=CONFIG_CHANGE_LABEL, showarrow=False,
                        font=dict(color='#facc15', size=11),
                        xanchor='left', yanchor='top')
-    fig.update_yaxes(title_text='$', row=1, col=1)
+    fig.add_annotation(x=CF_CHANGE_DATE, y=1, yref='paper',
+                       text=CF_CHANGE_LABEL, showarrow=False,
+                       font=dict(color='#38bdf8', size=11),
+                       xanchor='left', yanchor='top')
+    fig.update_yaxes(title_text='$', row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text='ETH spot', row=1, col=1, secondary_y=True,
+                     showgrid=False, color='#94a3b8')
     fig.update_yaxes(title_text='$', row=2, col=1)
     fig.update_yaxes(title_text='fills', row=3, col=1)
     fig.update_layout(template='plotly_dark', height=850, showlegend=False)
@@ -245,11 +276,23 @@ def _post_change(fills: pd.DataFrame) -> pd.DataFrame:
     return fills[fills['date'] >= CONFIG_CHANGE_D]
 
 
+def _post_cf(fills: pd.DataFrame) -> pd.DataFrame:
+    """Restrict to the post-CF-index window.  Moneyness and markouts are
+    only valid against the correct (CF) theo, so they use this boundary —
+    not CONFIG_CHANGE_D.  Day-granularity; sourced from the shared
+    utility.CF_INDEX_CUTOVER so the filter and the dashboard vline can't
+    drift apart."""
+    if fills.empty or 'date' not in fills.columns:
+        return fills
+    return fills[fills['date'] >= CF_CHANGE_D]
+
+
 def moneyness_breakdown(fills: pd.DataFrame) -> pd.DataFrame:
     """Per (price-bucket, side): mean c/fill, total $, fill count.  The YES
     fill price is the moneyness axis — low=OTM, high=ITM.  Scoped to the
-    post-change window so it reflects the current config, not old fills."""
-    fills = _post_change(fills)
+    post-CF-index window so theo (the moneyness reference) is the correct
+    CF index, not stale Coinbase-spot theo."""
+    fills = _post_cf(fills)
     if fills.empty:
         return pd.DataFrame()
     f = fills.copy()
@@ -287,8 +330,13 @@ def moneyness_figure(fills: pd.DataFrame):
     fig.update_yaxes(title_text='c/fill', row=1, col=1)
     fig.update_yaxes(title_text='fills', row=2, col=1)
     fig.update_xaxes(title_text='YES fill price (c) — OTM → ITM', row=2, col=1)
-    fig.update_layout(template='plotly_dark', height=750, barmode='group',
-                      legend=dict(orientation='h', y=1.06))
+    cf = _post_cf(fills)
+    n = int(g['n'].sum())
+    sub = _cf_subtitle(n, cf['date'].max() if not cf.empty else None)
+    fig.update_layout(template='plotly_dark', height=770, barmode='group',
+                      margin=dict(t=90), legend=dict(orientation='h', y=1.06),
+                      title=dict(text=sub, x=0.5, y=0.98, font=dict(size=13,
+                                 color='#38bdf8')))
     return fig
 
 
@@ -300,14 +348,25 @@ def _window_label(fills: pd.DataFrame) -> str:
             f"({CONFIG_CHANGE_LABEL})")
 
 
+def _cf_subtitle(n: int, last_date=None) -> str:
+    """Post-CF scope line for the moneyness/markout tabs.  n is the fill
+    count in the filtered (post-CF) frame the caller already built."""
+    if not n:
+        return f"post-CF ({CF_CHANGE_DATE}): no fills yet"
+    return f"post-CF: n={n:,} fills, {CF_CHANGE_DATE} → {last_date}"
+
+
 def moneyness_panel(fills: pd.DataFrame):
     g = moneyness_breakdown(fills)
     if g.empty:
         return html.Div("No fills yet in window.", style={"color": "#888"})
 
-    window = html.Div(f"Window: {_window_label(fills)}",
-                      style={"color": "#facc15", "marginBottom": "10px",
-                             "fontSize": "0.85em"})
+    cf = _post_cf(fills)
+    window = html.Div(
+        _cf_subtitle(int(g['n'].sum()),
+                     cf['date'].max() if not cf.empty else None),
+        style={"color": "#38bdf8", "marginBottom": "10px",
+               "fontSize": "0.85em"})
     summary = []
     for side in ('buy', 'sell'):
         s = g[g['action'] == side]
@@ -403,7 +462,10 @@ def _day_cache_path(day: str) -> Path:
 
 
 def compute_markouts() -> pd.DataFrame:
-    days = day_range(CONFIG_CHANGE_DAY, "today")
+    # Post-CF only: markouts measure fills vs theo-driven mid, so they are
+    # only valid once the app is on the CF index.  Start the day-range at
+    # the CF cutover day (sourced from utility.CF_INDEX_CUTOVER).
+    days = day_range(CF_CHANGE_DAY, "today")
     today = days[-1] if days else None        # partial — never cached
     frames = []
     for day in days:
@@ -450,19 +512,24 @@ def markout_figure(mk: pd.DataFrame):
     fig.add_hline(y=0, line=dict(color='#666', dash='dot'))
     fig.update_yaxes(title_text='mean markout (c/contract)')
     fig.update_xaxes(title_text='horizon after fill')
+    n = int(mk[f'mk{MARKOUT_HORIZONS[0]}'].notna().sum())
+    sub = _cf_subtitle(n, mk['date'].max())
     fig.update_layout(
-        template='plotly_dark', height=600, barmode='group',
-        title='Markout by side — positive = mid moved your way',
-        legend=dict(orientation='h', y=1.1))
+        template='plotly_dark', height=620, barmode='group', margin=dict(t=90),
+        title=dict(text='Markout by side — positive = mid moved your way'
+                        f'<br><span style="font-size:12px;color:#38bdf8">{sub}'
+                        '</span>', y=0.97),
+        legend=dict(orientation='h', y=1.12))
     return fig
 
 
 def markout_panel(mk: pd.DataFrame):
     if mk.empty:
         return html.Div("No markout data in window.", style={"color": "#888"})
+    n = int(mk[f'mk{MARKOUT_HORIZONS[0]}'].notna().sum())
     window = html.Div(
-        f"Window: {CONFIG_CHANGE_DATE} → {mk['date'].max()}  ({CONFIG_CHANGE_LABEL})",
-        style={"color": "#facc15", "marginBottom": "10px", "fontSize": "0.85em"})
+        _cf_subtitle(n, mk['date'].max()),
+        style={"color": "#38bdf8", "marginBottom": "10px", "fontSize": "0.85em"})
     head = html.Tr([html.Th(h, style={"textAlign": "right", "padding": "2px 8px"})
                     for h in ('Side', '30s', '60s', '120s', 'n')])
     rows = [head]

@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from kalshi_api import KalshiAPI
-from feeds.crypto_feed import CryptoPriceFeed
+from feeds.cfbenchmarks_feed import CFBenchmarksFeed
 from feeds.ws_feed import KalshiWsFeed
 from feeds.market_discovery import (
     SERIES_15M, get_active_market, parse_strike, seconds_to_close,
@@ -36,6 +36,26 @@ from osm import OSM
 
 
 SETTINGS_PATH = Path(__file__).resolve().parent / "settings" / "aston_settings.json"
+
+# Inventory-skew preview (DISPLAY ONLY — does not affect quoting).
+# Avellaneda-Stoikov lean: skew = -gamma * sigma^2 * (secs/yr) * position,
+# capped at +/- SKEW_CAP.  Shown under the POSITION card so the would-be
+# lean can be eyeballed live before the skew is ever wired into quotes.
+# gamma~350 calibrated on 27d/2342mkt history (few-cent lean on a deep
+# short mid-window, decaying to ~0 by close, inside the 7c bid cushion).
+SKEW_GAMMA = 350.0
+SKEW_CAP = 0.06
+_SKEW_YEAR_SECS = 365.25 * 24 * 3600
+
+
+def inventory_skew(sigma, secs, position):
+    """Signed lean in dollars the AS rule would apply (display preview).
+    Positive => quotes slide up (helps cover a short).  None if inputs
+    aren't ready."""
+    if sigma is None or secs is None or position == 0:
+        return 0.0
+    s = -SKEW_GAMMA * (sigma ** 2) * (max(secs, 0.0) / _SKEW_YEAR_SECS) * position
+    return max(-SKEW_CAP, min(SKEW_CAP, s))
 
 
 def _load_settings() -> dict:
@@ -241,7 +261,7 @@ class AstonApp(QMainWindow):
         # 15-minute market rolls.
         from order_gateway import OrderGateway
         self.gateway = OrderGateway(self.api)
-        self.price_feed: CryptoPriceFeed | None = None
+        self.price_feed: CFBenchmarksFeed | None = None
         self.ws_feed: KalshiWsFeed | None = None
         self.vol_est = RealizedVolEstimator(
             lookback_minutes=float(self.settings.get("vol_lookback_min", 30.0)),
@@ -444,7 +464,7 @@ class AstonApp(QMainWindow):
         # your spec — countdown on top, annualized T as a decimal below.
         stats = QHBoxLayout()
         stats.setSpacing(10)
-        self.spot_card = self._make_metric("SPOT", "--", "#facc15")
+        self.spot_card = self._make_metric("CF Index", "--", "#facc15")
         self.strike_card = self._make_metric("STRIKE", "--", "#c8cdd5")
         self.time_card = self._make_dual_metric(
             "TIME LEFT", "--:--", "#22c55e",
@@ -483,6 +503,11 @@ class AstonApp(QMainWindow):
             "color:#5a6270;font-size:10px;background:transparent;border:none;")
         self.theo_card.layout().addWidget(self.theo_rate_label)
         self.position_card = self._make_metric("POSITION", "0", "#c8cdd5")
+        # Would-be inventory skew (display only — not wired into quoting).
+        self.skew_label = QLabel("skew --")
+        self.skew_label.setStyleSheet(
+            "color:#5a6270;font-size:10px;background:transparent;border:none;")
+        self.position_card.layout().addWidget(self.skew_label)
         for w in (self.bid_card, self.ask_card,
                   self.theo_card, self.position_card):
             quotes.addWidget(w, 1)
@@ -897,7 +922,8 @@ class AstonApp(QMainWindow):
         self._har_seed_worker.finished_signal.connect(self._on_har_seed)
         self._har_seed_worker.start()
 
-        self.price_feed = CryptoPriceFeed(self._on_price, s["coinbase_product"])
+        self.price_feed = CFBenchmarksFeed(
+            self._on_price, s["coinbase_product"], self.api)
         self.price_feed.start()
         self._rediscover()
 
@@ -1149,6 +1175,13 @@ class AstonApp(QMainWindow):
         theo = compute_theo(self.spot, self.strike, sigma or 0.0, secs)
         self._last_theo = theo
         self._last_sigma = sigma
+
+        # Inventory-skew preview (display only — not applied to quotes).
+        skew = inventory_skew(sigma, secs, self._position)
+        if self._position == 0 or sigma is None:
+            self.skew_label.setText("skew --")
+        else:
+            self.skew_label.setText(f"skew {skew * 100:+.2f}¢  (γ={SKEW_GAMMA:.0f})")
         if self.strategy and theo is not None:
             self.strategy.update_bbo((self.yes_bid, self.yes_ask))
             self.strategy.update_theo(theo)
@@ -1241,9 +1274,18 @@ class AstonApp(QMainWindow):
         self.tokens_label.setStyleSheet(
             f"color:{color};background:transparent;border:none;")
 
-        # Spot / Strike
-        self.spot_card.value.setText(
-            f"${self.spot:,.2f}" if self.spot > 0 else "--")
+        # CF Index — raw value, plus the quarter-hour close average in the
+        # final minute (display only; theo still uses the raw value).
+        if self.spot > 0:
+            idx_text = f"${self.spot:,.2f}"
+            close = (self.price_feed.close_avg_if_fresh()
+                     if self.price_feed else None)
+            if close is not None:
+                idx_text += (f' <span style="font-size:13px;color:#38bdf8">'
+                             f'close ${close:,.2f}</span>')
+            self.spot_card.value.setText(idx_text)
+        else:
+            self.spot_card.value.setText("--")
         self.strike_card.value.setText(
             f"${self.strike:,.2f}" if self.strike > 0 else "--")
 

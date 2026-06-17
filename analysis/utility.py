@@ -29,6 +29,21 @@ DEFAULT_S3_BUCKET = "s3://kalshibtc/archive"
 _MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
 
+# Instant the live app's theo switched from Coinbase spot to the CF
+# Benchmarks ETHUSD_RTI index (the reference Kalshi settles on).  Moneyness
+# and markout analysis are only valid against the correct theo, so they
+# filter to ts >= this.  This is the *app* restart, not the recorder's.
+# Verified from the running process: app.py (on CFBenchmarksFeed) was saved
+# 20:42 CT and launched 20:43:24 CT Jun 14 = 01:43 UTC Jun 15.
+CF_INDEX_CUTOVER = datetime(2026, 6, 15, 1, 43, tzinfo=timezone.utc)
+
+
+def post_cf(df, ts_col: str = "ts"):
+    """Rows at/after the CF-index cutover.  Pass a df with a tz-aware
+    (or UTC ISO) `ts_col`; pre-fix rows (wrong theo) are dropped."""
+    ts = pd.to_datetime(df[ts_col], utc=True)
+    return df[ts >= CF_INDEX_CUTOVER]
+
 
 def parse_day_suffix(suffix: str):
     """`26MAY15` → `date(2026, 5, 15)`.  Returns None on bad format."""
@@ -317,6 +332,38 @@ def load_book(day, series_prefix: str = "KXETH15M", start=None, end=None,
     return df
 
 
+def load_daily_spot(day, until=None, series_prefix: str = "KXETH15M",
+                    local_dir: Path = DEFAULT_LOCAL_DIR,
+                    s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+                    s3_bucket: str = DEFAULT_S3_BUCKET) -> pd.DataFrame:
+    """One spot per UTC day — the last `theo_state.spot` of each day (a
+    daily-close analogue for overlaying on daily-granularity P&L).  Pulled
+    via a single MAX(ts) aggregation per DB, so no full tick-table load.
+
+    Returns columns [date, spot]; `date` is a python date.  Robust to
+    missing days the same way the other loaders are."""
+    days = day_range(day, until) if until is not None else [day_to_suffix(day)]
+    rows = []
+    for d in days:
+        suffix = day_to_suffix(d)
+        p = _resolve_day_db(series_prefix, suffix, "theo_state",
+                            local_dir, s3_cache_dir, s3_bucket)
+        if p is None:
+            continue
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            r = conn.execute(
+                "SELECT spot FROM theo_state WHERE spot IS NOT NULL "
+                "ORDER BY ts DESC LIMIT 1").fetchone()
+        except (sqlite3.DatabaseError, pd.errors.DatabaseError):
+            r = None
+        finally:
+            conn.close()
+        if r and r[0]:
+            rows.append({"date": parse_day_suffix(suffix), "spot": r[0]})
+    return pd.DataFrame(rows, columns=["date", "spot"])
+
+
 def load_fills(day, series_prefix: str = "KXETH15M", start=None, end=None,
                until=None,
                local_dir: Path = DEFAULT_LOCAL_DIR,
@@ -334,6 +381,31 @@ def load_fills(day, series_prefix: str = "KXETH15M", start=None, end=None,
         return _load_day_table(series_prefix, day, "fills", cols,
                                start, end, local_dir, s3_cache_dir, s3_bucket)
     parts = [_load_day_table(series_prefix, d, "fills", cols, start, end,
+                             local_dir, s3_cache_dir, s3_bucket)
+             for d in day_range(day, until)]
+    return pd.concat(parts, ignore_index=True)
+
+
+def load_orders(day, series_prefix: str = "KXETH15M", start=None, end=None,
+                until=None,
+                local_dir: Path = DEFAULT_LOCAL_DIR,
+                s3_cache_dir: Path = DEFAULT_S3_CACHE_DIR,
+                s3_bucket: str = DEFAULT_S3_BUCKET) -> pd.DataFrame:
+    """order_events rows (placed / cancelled / filled).  Same args /
+    robustness as load_fills, including `until` for a multi-day range.
+    `ts` parsed to UTC; `kalshi_ts` left as text.  Join to load_fills on
+    `client_order_id` to recover a fill's originating quote (e.g. quote age
+    = fill ts - first 'placed' ts for that client_order_id).
+
+        orders = load_orders("2026-06-10")
+        orders = load_orders("2026-06-10", until="today")
+    """
+    cols = ("ts,order_id,ticker,event_type,side,action,price,count,"
+            "remaining_count,status,client_order_id,kalshi_ts")
+    if until is None:
+        return _load_day_table(series_prefix, day, "order_events", cols,
+                               start, end, local_dir, s3_cache_dir, s3_bucket)
+    parts = [_load_day_table(series_prefix, d, "order_events", cols, start, end,
                              local_dir, s3_cache_dir, s3_bucket)
              for d in day_range(day, until)]
     return pd.concat(parts, ignore_index=True)
@@ -435,7 +507,17 @@ def realized_sigma_forward(spot: pd.DataFrame,
     return minute_bars
 
 
-def fetch_settlements_from_api(tickers, kalshi_api,
+def _default_kalshi_api():
+    """Build a KalshiAPI with Aston on sys.path, so callers don't have to."""
+    import sys
+    aston = str(Path(__file__).resolve().parent.parent / "Aston")
+    if aston not in sys.path:
+        sys.path.insert(0, aston)
+    from kalshi_api import KalshiAPI
+    return KalshiAPI()
+
+
+def fetch_settlements_from_api(tickers, kalshi_api=None,
                                  cache_path: Path | str | None = None
                                  ) -> dict[str, int]:
     """Pull authoritative settlement results from Kalshi.
@@ -449,6 +531,8 @@ def fetch_settlements_from_api(tickers, kalshi_api,
     API for tickers that haven't been seen.  Pass `cache_path=None`
     to disable caching entirely (always queries the API).
     """
+    if kalshi_api is None:
+        kalshi_api = _default_kalshi_api()
     cache: dict[str, int] = {}
     cache_p: Path | None = Path(cache_path) if cache_path else None
     if cache_p and cache_p.exists():
@@ -492,6 +576,77 @@ def fetch_settlements_from_api(tickers, kalshi_api,
     print(f"[settle] {len(out)} settled / {len(tickers)} tickers "
           f"({new_lookups} new lookups, {new_settled} newly settled)")
     return out
+
+
+def fetch_market_trades(ticker: str, kalshi_api, start=None, end=None) -> pd.DataFrame:
+    """All public trades for one market `ticker`, paginating Kalshi's cursor
+    (1000/page, the endpoint max) until exhausted.  `start`/`end` (date / ISO
+    string / datetime) bound the window via min_ts/max_ts; None = unbounded.
+
+    Returns a DataFrame of the raw trade rows with `ts` parsed to UTC (from
+    `created_time`).  Empty DataFrame if the market has no trades in range.
+
+        trades = fetch_market_trades("KXETH15M-26JUN042000-15", api,
+                                     start="2026-05-16")
+    """
+    base = {"ticker": ticker, "limit": 1000}
+    if start is not None:
+        base["min_ts"] = int(pd.to_datetime(start, utc=True).timestamp())
+    if end is not None:
+        base["max_ts"] = int(pd.to_datetime(end, utc=True).timestamp())
+
+    trades: list = []
+    cursor = None
+    while True:
+        params = dict(base)
+        if cursor:
+            params["cursor"] = cursor
+        data = kalshi_api._get("/markets/trades", params)
+        batch = data.get("trades", [])
+        trades.extend(batch)
+        cursor = data.get("cursor")
+        if not cursor or not batch:
+            break
+
+    df = pd.DataFrame(trades)
+    if not df.empty and "created_time" in df.columns:
+        df["ts"] = pd.to_datetime(df["created_time"], utc=True, format="ISO8601")
+    return df
+
+
+def load_trades(start, series_ticker: str = "KXETH15M", kalshi_api=None) -> pd.DataFrame:
+    """Every public trade across `series_ticker` markets that settled on/after
+    `start`, one clean row per trade.  Hits the Kalshi API (builds a default
+    KalshiAPI if none is passed) and pages each market's trades fully.
+
+    Returns [ts, ticker, yes_price, count, taker_side, outcome]: `ts` UTC,
+    `yes_price` in dollars (0-1), `outcome` = 1 if the market settled YES.
+
+        trades = load_trades("2026-05-16")
+    """
+    if kalshi_api is None:
+        kalshi_api = _default_kalshi_api()
+
+    start_ts = pd.to_datetime(start, utc=True)
+    markets = kalshi_api.get_markets(series_ticker=series_ticker, status="settled")
+    markets = [m for m in markets
+               if pd.to_datetime(m["close_time"], utc=True) >= start_ts]
+
+    frames = []
+    for m in markets:
+        t = fetch_market_trades(m["ticker"], kalshi_api)
+        if t.empty:
+            continue
+        t["outcome"] = 1 if m["result"] == "yes" else 0
+        frames.append(t)
+
+    cols = ["ts", "ticker", "yes_price", "count", "taker_side", "outcome"]
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    df = pd.concat(frames, ignore_index=True)
+    df["yes_price"] = df["yes_price_dollars"].astype(float)   # already dollars, but a string
+    df["count"] = df["count_fp"].astype(float)                # fractional, string
+    return df[cols]
 
 
 def compute_settlements(theo: pd.DataFrame, spot: pd.DataFrame,
