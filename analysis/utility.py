@@ -649,6 +649,21 @@ def load_trades(start, series_ticker: str = "KXETH15M", kalshi_api=None) -> pd.D
     return df[cols]
 
 
+def secs_to_expiry(ticker, ts) -> pd.Series:
+    """Seconds from `ts` to each market's close, vectorized over a ticker
+    Series + a UTC `ts` Series.  The ticker encodes the close time in ET
+    (e.g. KXETH15M-26JUN042000-15 -> JUN 04 20:00 ET); the ET->UTC convert
+    handles EDT/EST automatically.  Positive = time left, negative = past
+    close.  Use it to drop trades inside the settlement window, e.g.
+    `trades[secs_to_expiry(trades.ticker, trades.ts) >= 90]`.
+
+        trades['secs_to_exp'] = secs_to_expiry(trades['ticker'], trades['ts'])
+    """
+    close = (pd.to_datetime(ticker.str.split('-').str[1], format='%y%b%d%H%M')
+             .dt.tz_localize('America/New_York').dt.tz_convert('UTC'))
+    return (close - pd.to_datetime(ts, utc=True)).dt.total_seconds()
+
+
 def compute_settlements(theo: pd.DataFrame, spot: pd.DataFrame,
                           twap_window_s: int = 60,
                           min_ticks: int = 5) -> dict[str, int]:

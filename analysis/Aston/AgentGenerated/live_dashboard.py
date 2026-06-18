@@ -206,9 +206,14 @@ CF_CHANGE_LABEL = "CF index"
 # scope to fills on/after this point; the P&L tab marks it with the green line.
 # UPDATE the date to the actual restart instant when you flip the live app
 # into the longshot config (it's a placeholder until then).
-LONGSHOT_CHANGE_DATE  = "2026-06-17"          # placeholder — set to the real flip date
-LONGSHOT_CHANGE_DAY   = "26JUN17"
-LONGSHOT_CHANGE_D     = parse_day_suffix(LONGSHOT_CHANGE_DAY)
+# Single source of truth: the exact UTC INSTANT you flipped the live app into
+# the longshot config.  Moneyness + Markout tabs filter fills on `ts >= this`
+# (precise time, not whole days), so today's pre-flip fills are excluded.
+# SET THIS to the real flip time.
+LONGSHOT_CHANGE_TS    = datetime(2026, 6, 17, 16, 0, tzinfo=timezone.utc)  # placeholder
+LONGSHOT_CHANGE_D     = LONGSHOT_CHANGE_TS.date()
+LONGSHOT_CHANGE_DAY   = day_to_suffix(LONGSHOT_CHANGE_D)
+LONGSHOT_CHANGE_DATE  = LONGSHOT_CHANGE_D.isoformat()
 LONGSHOT_CHANGE_LABEL = "Longshot fade · sell 0.10–0.35"
 
 
@@ -279,9 +284,10 @@ def pnl_figure(fills):
 # =============================================================================
 # Moneyness tab — fill P&L by side, bucketed by entry price (OTM -> ITM)
 # =============================================================================
-PX_EDGES  = [0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-PX_LABELS = ['0-20', '20-30', '30-40', '40-50', '50-60',
-             '60-70', '70-80', '80-90', '90-100']
+# 0.05-wide buckets across the longshot band (0.10-0.35); fills outside
+# the band fall to NaN and drop out (the strategy only quotes here).
+PX_EDGES  = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35]
+PX_LABELS = ['10-15', '15-20', '20-25', '25-30', '30-35']
 SIDE_COLOR = {'buy': '#22c55e', 'sell': '#ef4444'}   # match app LIVE ORDERS
 
 
@@ -293,12 +299,13 @@ def _post_change(fills: pd.DataFrame) -> pd.DataFrame:
 
 
 def _post_longshot(fills: pd.DataFrame) -> pd.DataFrame:
-    """Restrict to the post-longshot-fade window (>= LONGSHOT_CHANGE_D).
-    Moneyness and markouts scope here so they reflect only the sell-only
-    0.10-0.35 config; day-granularity, matched to the green dashboard vline."""
-    if fills.empty or 'date' not in fills.columns:
+    """Restrict to the post-longshot-fade window (ts >= LONGSHOT_CHANGE_TS).
+    Filters on the precise flip INSTANT, not whole days, so this morning's
+    pre-flip fills are excluded.  Moneyness and markouts scope here so they
+    reflect only the sell-only 0.10-0.35 config."""
+    if fills.empty or 'ts' not in fills.columns:
         return fills
-    return fills[fills['date'] >= LONGSHOT_CHANGE_D]
+    return fills[fills['ts'] >= LONGSHOT_CHANGE_TS]
 
 
 def moneyness_breakdown(fills: pd.DataFrame) -> pd.DataFrame:
@@ -312,11 +319,13 @@ def moneyness_breakdown(fills: pd.DataFrame) -> pd.DataFrame:
     f = fills.copy()
     f['px_bin'] = pd.cut(f['price'], bins=PX_EDGES, labels=PX_LABELS,
                          include_lowest=True)
-    return (f.groupby(['px_bin', 'action'], observed=True)
-              .agg(cpf=('realized_c', 'mean'),
-                   total=('realized_c', lambda s: s.sum() / 100),
-                   n=('realized_c', 'count'))
-              .reset_index())
+    g = (f.groupby(['px_bin', 'action'], observed=True)
+           .agg(realized_sum=('realized_c', 'sum'),
+                n=('count', 'sum'))                  # n = total CONTRACTS, not fills
+           .reset_index())
+    g['cpf'] = g['realized_sum'] / g['n']            # cents per CONTRACT (size-weighted)
+    g['total'] = g['realized_sum'] / 100             # total $
+    return g[['px_bin', 'action', 'cpf', 'total', 'n']]
 
 
 def moneyness_figure(fills: pd.DataFrame):
@@ -328,8 +337,8 @@ def moneyness_figure(fills: pd.DataFrame):
                               showarrow=False)])
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        subplot_titles=("Realized edge per fill (c) by entry price & side",
-                        "Fill count (thin buckets are noisy)"))
+        subplot_titles=("Realized edge per contract (c) by entry price & side",
+                        "Contract count (thin buckets are noisy)"))
     for side in ('buy', 'sell'):
         s = g[g['action'] == side]
         fig.add_trace(go.Bar(
@@ -341,8 +350,8 @@ def moneyness_figure(fills: pd.DataFrame):
             x=s['px_bin'], y=s['n'], marker_color=SIDE_COLOR[side],
             showlegend=False), row=2, col=1)
     fig.add_hline(y=0, line=dict(color='#666', dash='dot'), row=1, col=1)
-    fig.update_yaxes(title_text='c/fill', row=1, col=1)
-    fig.update_yaxes(title_text='fills', row=2, col=1)
+    fig.update_yaxes(title_text='c/contract', row=1, col=1)
+    fig.update_yaxes(title_text='contracts', row=2, col=1)
     fig.update_xaxes(title_text='YES fill price (c) — OTM → ITM', row=2, col=1)
     cf = _post_longshot(fills)
     n = int(g['n'].sum())
@@ -389,12 +398,12 @@ def moneyness_panel(fills: pd.DataFrame):
         cpf = (tot * 100 / n) if n else 0.0
         summary.append(html.Div([
             html.B(side.upper(), style={"color": SIDE_COLOR[side]}),
-            html.Span(f"  ${tot:+.2f}  ·  {cpf:+.2f}c/fill  ·  {n} fills"),
+            html.Span(f"  ${tot:+.2f}  ·  {cpf:+.2f}c/contract  ·  {n} contracts"),
         ]))
 
     header = html.Tr([html.Th(h, style={"textAlign": "right",
                                         "padding": "2px 8px"})
-                      for h in ("Price", "Side", "c/fill", "Total $", "n")])
+                      for h in ("Price", "Side", "c/contract", "Total $", "contracts")])
     rows = [header]
     for _, r in g.iterrows():
         color = SIDE_COLOR[r['action']]
@@ -459,14 +468,14 @@ def _markouts_for_day(day: str) -> pd.DataFrame:
         j[f'mk{h}'] = j['sgn'] * (j['mid_h'] - j['entry_mid']) * 100
         res = res.merge(j[['fid', f'mk{h}']], on='fid', how='left')
     res['date'] = parse_day_suffix(day)
-    return res[['date', 'action', 'price'] + [f'mk{h}' for h in MARKOUT_HORIZONS]]
+    return res[['date', 'ts', 'action', 'price'] + [f'mk{h}' for h in MARKOUT_HORIZONS]]
 
 
 # Completed days never change, so their markouts are cached two ways:
 #   in-memory (hot, within a session) + on-disk (survives dashboard restarts).
 # Bump MARKOUT_VER if the markout computation ever changes — old files are
 # then ignored (stale by version) and can be deleted.
-MARKOUT_VER = "v1"
+MARKOUT_VER = "v2"   # per-day frame now keeps `ts` (for the precise longshot cutover)
 MARKOUT_CACHE_DIR = Path(__file__).resolve().parent / "_markout_cache"
 _MARKOUT_DAY_CACHE: dict = {}
 
@@ -505,7 +514,11 @@ def compute_markouts() -> pd.DataFrame:
                 pass                                        # cache is best-effort
         if not d.empty:
             frames.append(d)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    mk = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    # Drop pre-flip fills on the cutover day — scope to the exact flip instant.
+    if not mk.empty and 'ts' in mk.columns:
+        mk = mk[mk['ts'] >= LONGSHOT_CHANGE_TS]
+    return mk
 
 
 def markout_figure(mk: pd.DataFrame):
