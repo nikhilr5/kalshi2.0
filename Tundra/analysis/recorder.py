@@ -64,8 +64,7 @@ from ws_feed import KalshiWsFeed  # noqa: E402
 # Reuse weather_lib by file location (its own sys.path math only works
 # from its home dir, so we load it as a module from its absolute path
 # rather than importing by name).
-_WL_PATH = (Path(__file__).resolve().parents[2]
-            / "analysis" / "Aston" / "weather" / "weather_lib.py")
+_WL_PATH = Path(__file__).resolve().parent / "weather_lib.py"
 _spec = importlib.util.spec_from_file_location("weather_lib", _WL_PATH)
 wl = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wl)
