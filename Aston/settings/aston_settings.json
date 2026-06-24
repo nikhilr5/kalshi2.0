@@ -1,17 +1,17 @@
 {
-  "edge_bid": 7.0,
+  "edge_bid": 5.0,
   "edge_ask": 5.0,
-  "size_bid": 1,
-  "size_ask": 2,
-  "max_position": 20,
+  "size_bid": 3,
+  "size_ask": 3,
+  "max_position": 30,
   "sigma_scalar": 0.85,
   "tolerance": 1.0,
   "auto_mm_on": true,
   "dwell_s": 1.0,
-  "bid_enabled": false,
+  "bid_enabled": true,
   "ask_enabled": true,
   "range_min_bid": 0.0,
   "range_max_bid": 1.0,
-  "range_min_ask": 0.1,
-  "range_max_ask": 0.35
+  "range_min_ask": 0.0,
+  "range_max_ask": 1.0
 }
