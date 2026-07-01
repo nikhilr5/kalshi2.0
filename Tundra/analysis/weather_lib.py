@@ -146,6 +146,32 @@ def bucket_prob(lo, hi, mean, sigma):
     return float(phi - plo)
 
 
+def floored_bucket_prob(lo, hi, mean, sigma, running_max=None):
+    """P(high in [lo, hi]) under Normal(mean, sigma) with the running-max FLOOR:
+    the day's high cannot be below what's already been observed, so we condition
+    on high >= running_max (left-truncate at running_max and renormalize).
+
+    running_max=None -> no floor (same as bucket_prob). Use mean = the raw
+    forecast here, NOT max(running_max, forecast): the floor is applied by this
+    truncation, so flooring the mean too would double-count it."""
+    if running_max is None:
+        return bucket_prob(lo, hi, mean, sigma)
+    lo = max(lo, running_max)                       # dead mass below the floor
+    if lo >= hi:                                     # bucket entirely below floor
+        return 0.0
+    denom = 1.0 - norm.cdf(running_max, mean, sigma)  # P(high >= floor)
+    if denom <= 1e-9:                               # floor already past the forecast
+        return 0.0
+    return bucket_prob(lo, hi, mean, sigma) / denom
+
+
+def price_buckets(buckets, mean, sigma, running_max=None):
+    """Floor-adjusted fair prices for a set of buckets.
+    buckets = list of (lo, hi) on the continuous scale (from parse_bucket).
+    Returns a list of probs that sum to ~1 across buckets tiling [floor, inf)."""
+    return [floored_bucket_prob(lo, hi, mean, sigma, running_max) for lo, hi in buckets]
+
+
 def book_mid_spread(ob):
     """From get_orderbook(depth=1) dict -> (yes_mid, spread, best_yes_bid, best_no_bid).
     yes_mid = (best_yes_bid + (1 - best_no_bid))/2; spread = (1-best_no_bid) - best_yes_bid.
