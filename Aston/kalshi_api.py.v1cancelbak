@@ -405,7 +405,7 @@ class KalshiAPI:
         error_code: str | None = None
         error_msg: str | None = None
         try:
-            resp = self._delete(f"/portfolio/events/orders/{order_id}")
+            resp = self._delete(f"/portfolio/orders/{order_id}")
             http_status = resp['status_code']
             if http_status != 200:
                 error_code = http_status

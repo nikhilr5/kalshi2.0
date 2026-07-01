@@ -240,7 +240,7 @@ class KalshiAPI:
         resp = self.session.post(f"{self.BASE_URL}{path}", headers=headers, json=body)
         self._log_rtt("POST", path, t0)
         self._log_http_version(resp)
-        if resp.status_code >= 400:
+        if resp.status_code != 201:
             print(f"[API ERROR] {resp.status_code}: {resp.text}")
         try:
             payload = resp.json()
@@ -333,19 +333,15 @@ class KalshiAPI:
         """
         prefix = f"{tag}_" if tag else ""
         client_order_id = f"{prefix}{uuid.uuid4()}"
-        # V2 single-book is YES-perspective: bid = buy YES, ask = sell YES.
-        if side == "yes":
-            v2_side = "bid" if action == "buy" else "ask"
-        else:  # buy NO == sell YES, sell NO == buy YES (only side="yes" used live)
-            v2_side = "ask" if action == "buy" else "bid"
         body = {
             "ticker": ticker,
-            "side": v2_side,
-            "price": price_dollars,
-            "count": str(count),
+            "side": side,
+            "action": action,
+            "yes_price_dollars": price_dollars,
+            "count": count,
             "client_order_id": client_order_id,
+            "type": "limit",
             "time_in_force": time_in_force,
-            "self_trade_prevention_type": "taker_at_cross",
         }
         if post_only:
             body["post_only"] = True
@@ -357,18 +353,18 @@ class KalshiAPI:
         error_msg: str | None = None
         server_order_id: str | None = None
         try:
-            resp = self._post("/portfolio/events/orders", body)
+            resp = self._post("/portfolio/orders", body)
             http_status = int(resp['status_code'])
 
             #look at status code to determine if success placed post
-            if http_status not in (200, 201):
+            if http_status != 201:
                 error_code = http_status
                 error_msg = json.dumps(resp or {"code": resp.get("code"), "message": resp.get("message")})[:500]
                 success = 0
             else: 
                 success = 1
                 if isinstance(resp, dict):
-                    server_order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id")
+                    server_order_id = (resp.get("order") or {}).get("order_id")
             return resp
         except Exception as e:
             error_code = 0
@@ -405,7 +401,7 @@ class KalshiAPI:
         error_code: str | None = None
         error_msg: str | None = None
         try:
-            resp = self._delete(f"/portfolio/events/orders/{order_id}")
+            resp = self._delete(f"/portfolio/orders/{order_id}")
             http_status = resp['status_code']
             if http_status != 200:
                 error_code = http_status

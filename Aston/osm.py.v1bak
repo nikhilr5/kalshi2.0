@@ -196,7 +196,7 @@ class OSM:
             for fut in done:
                 try:
                     resp = fut.result()
-                    oid = resp.get("order_id") or (resp.get("order") or {}).get("order_id")
+                    oid = (resp.get("order", {}) or {}).get("order_id")
                     if oid:
                         ids_to_cancel.append(oid)
                 except Exception:
@@ -460,11 +460,9 @@ class OSM:
 
     def _handle_api_success(self, op: PendingOp, response: dict):
         if op.kind == "place":
-            order = response.get("order") or response   # v2 response is flat
+            order = response.get("order", {})
             order_id = order.get("order_id")
-            remaining = int(float(
-                order.get("remaining_count",
-                          order.get("remaining_count_fp", 0)) or 0))
+            remaining = int(float(order.get("remaining_count_fp", 0) or 0))
             if remaining > 0:
                 q = Quote(order_id=order_id, price=op.price, size=remaining,
                           placed_at=time.time())

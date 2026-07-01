@@ -17,3 +17,4 @@ analysis/Aston/AgentGenerated/_markout_cache/
 analysis/Aston/ML/data
 Tundra/analysis/data/
 Tundra/analysis/cache/
+.venv/
