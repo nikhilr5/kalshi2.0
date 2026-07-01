@@ -1,6 +1,6 @@
 {
-  "edge_bid": 5.0,
-  "edge_ask": 5.0,
+  "edge_bid": 7.0,
+  "edge_ask": 7.0,
   "size_bid": 3,
   "size_ask": 3,
   "max_position": 30,
